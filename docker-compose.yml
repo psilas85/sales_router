@@ -1,0 +1,81 @@
+version: "3.9"
+
+services:
+  base_image:
+    build:
+      context: .
+      dockerfile: Dockerfile.base
+    image: psilas85/sales_router-base:latest
+
+  preprocessing_service:
+    image: psilas85/sales_router-base:latest
+    container_name: preprocessing_service
+    command: python src/data_preprocessing/main_preprocessing.py
+    volumes:
+      - .:/app
+    depends_on:
+      - postgres
+    networks:
+      - sales_router_net
+
+  clustering_service:
+    image: psilas85/sales_router-base:latest
+    container_name: clustering_service
+    command: python src/clustering/main_clusterization.py
+    volumes:
+      - .:/app
+    depends_on:
+      - postgres
+    networks:
+      - sales_router_net
+
+  routing_service:
+    image: psilas85/sales_router-base:latest
+    container_name: routing_service
+    command: python src/routing/main_routing.py
+    volumes:
+      - .:/app
+    depends_on:
+      - postgres
+    networks:
+      - sales_router_net
+
+  sales_routing_service:
+    image: psilas85/sales_router-base:latest
+    container_name: sales_routing_service
+    command: python src/sales_routing/main_sales_routing.py
+    volumes:
+      - .:/app
+    depends_on:
+      - postgres
+    networks:
+      - sales_router_net
+
+  postgres:
+    image: postgis/postgis:17-3.4
+    container_name: sales_router_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: sales_routing_db
+    ports:
+      - "5434:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - sales_router_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    networks:
+      - sales_router_net
+
+volumes:
+  pg_data:
+
+networks:
+  sales_router_net:
+    driver: bridge

@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+
+# VSCode
+.vscode/
+
+# Docker / volumes
+*.log
+.env
+*.pid
+docker-data/
+exports/
+volumes/
+
+# System
+.DS_Store
+Thumbs.db

@@ -1,0 +1,20 @@
+# Core
+pandas
+numpy
+scikit-learn
+sqlalchemy
+psycopg2-binary
+python-dotenv
+requests
+
+# Geo
+geopy
+folium
+
+# Utils
+tqdm
+plotly
+redis
+
+bcrypt
+PyJWT

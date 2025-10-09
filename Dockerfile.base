@@ -1,0 +1,25 @@
+FROM python:3.11-slim
+
+# Evita prompt interativo
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Atualiza pacotes e instala dependências básicas
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential gcc g++ \
+    && pip install --upgrade pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Define diretório padrão de trabalho
+WORKDIR /app
+
+# Copia dependências
+COPY requirements.txt .
+
+# Instala dependências
+RUN pip install -r requirements.txt
+
+# Copia código-fonte
+COPY . .
+
+# Comando padrão — cada container definirá o seu
+CMD ["bash"]
