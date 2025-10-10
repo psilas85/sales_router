@@ -18,3 +18,11 @@ redis
 
 bcrypt
 PyJWT
+
+fastapi
+uvicorn
+psycopg2-binary
+sqlalchemy
+bcrypt
+PyJWT
+python-dotenv

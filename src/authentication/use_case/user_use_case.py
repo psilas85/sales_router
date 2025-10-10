@@ -13,7 +13,7 @@ class UserUseCase:
         self.repo.create_table()
 
     def create_admin_user(self, tenant_id):
-        senha_hash = self.auth.hash_password("admin123")
+        senha_hash = self.auth.hash_password("Psilas@85")
         user = User(
             tenant_id=tenant_id,
             nome="Administrador Master",

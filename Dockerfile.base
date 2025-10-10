@@ -1,25 +1,47 @@
+# ======================
+# Imagem base - Sales Router
+# ======================
 FROM python:3.11-slim
 
-# Evita prompt interativo
+# Evita prompts interativos
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Atualiza pacotes e instala dependências básicas
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential gcc g++ \
-    && pip install --upgrade pip \
-    && rm -rf /var/lib/apt/lists/*
-
-# Define diretório padrão de trabalho
+# Define diretório de trabalho
 WORKDIR /app
 
-# Copia dependências
-COPY requirements.txt .
+# ======================
+# Instala dependências de sistema
+# ======================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    g++ \
+    libpq-dev \
+    curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-# Instala dependências
-RUN pip install -r requirements.txt
+# ======================
+# Copia dependências Python
+# ======================
+COPY requirements.txt /app/requirements.txt
 
-# Copia código-fonte
-COPY . .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r /app/requirements.txt
 
-# Comando padrão — cada container definirá o seu
+# ======================
+# Copia o código-fonte
+# ======================
+COPY . /app
+
+# ======================
+# Configura ambiente
+# ======================
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app/src
+
+# ======================
+# Comando padrão (interativo)
+# ======================
 CMD ["bash"]

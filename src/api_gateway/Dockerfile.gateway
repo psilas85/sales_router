@@ -1,0 +1,16 @@
+# =========================
+# SalesRouter API Gateway
+# =========================
+
+FROM nginx:latest
+
+# Remove configuração padrão
+RUN rm /etc/nginx/conf.d/default.conf
+
+# Copia a configuração customizada
+COPY ./src/api_gateway/nginx.conf /etc/nginx/conf.d/default.conf
+
+# Expondo portas HTTP e HTTPS
+EXPOSE 80 443
+
+CMD ["nginx", "-g", "daemon off;"]

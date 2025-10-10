@@ -1,56 +1,94 @@
-version: "3.9"
+#sales_router/docker-compose.yml
 
 services:
+  # ======================
+  # Imagem base reutilizável
+  # ======================
   base_image:
     build:
       context: .
       dockerfile: Dockerfile.base
     image: psilas85/sales_router-base:latest
 
+  # ======================
+  # Autenticação (FastAPI)
+  # ======================
+  authentication_service:
+    build:
+      context: .
+      dockerfile: ./src/authentication/Dockerfile.authentication
+    container_name: authentication_service
+    ports:
+      - "8001:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/sales_routing_db
+      - JWT_SECRET_KEY=supersecretkey
+      - JWT_ALGORITHM=HS256
+    depends_on:
+      - postgres
+    networks:
+      - sales_router_net
+    restart: always
+
+  # ======================
+  # Pré-processamento
+  # ======================
   preprocessing_service:
     image: psilas85/sales_router-base:latest
     container_name: preprocessing_service
     command: python src/data_preprocessing/main_preprocessing.py
     volumes:
-      - .:/app
+      - ./src:/app
     depends_on:
       - postgres
     networks:
       - sales_router_net
 
+  # ======================
+  # Clusterização
+  # ======================
   clustering_service:
     image: psilas85/sales_router-base:latest
     container_name: clustering_service
     command: python src/clustering/main_clusterization.py
     volumes:
-      - .:/app
+      - ./src:/app
     depends_on:
       - postgres
     networks:
       - sales_router_net
 
+  # ======================
+  # Roteirização Last-Mile
+  # ======================
   routing_service:
     image: psilas85/sales_router-base:latest
     container_name: routing_service
     command: python src/routing/main_routing.py
     volumes:
-      - .:/app
+      - ./src:/app
     depends_on:
       - postgres
     networks:
       - sales_router_net
 
+  # ======================
+  # Roteirização de Vendas
+  # ======================
   sales_routing_service:
     image: psilas85/sales_router-base:latest
     container_name: sales_routing_service
     command: python src/sales_routing/main_sales_routing.py
     volumes:
-      - .:/app
+      - ./src:/app
     depends_on:
       - postgres
     networks:
       - sales_router_net
 
+  # ======================
+  # Banco de Dados (PostgreSQL + PostGIS)
+  # ======================
   postgres:
     image: postgis/postgis:17-3.4
     container_name: sales_router_db
@@ -65,6 +103,9 @@ services:
     networks:
       - sales_router_net
 
+  # ======================
+  # Redis (Cache / Fila)
+  # ======================
   redis:
     image: redis:7-alpine
     container_name: redis
@@ -73,9 +114,37 @@ services:
     networks:
       - sales_router_net
 
+  # ======================
+  # API Gateway (Nginx)
+  # ======================
+  api_gateway:
+    build:
+      context: .
+      dockerfile: ./src/api_gateway/Dockerfile.gateway
+    container_name: api_gateway
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - authentication_service
+      - routing_service
+      - sales_routing_service
+    networks:
+      - sales_router_net
+    restart: always
+
+
+
+# ======================
+# Volumes persistentes
+# ======================
 volumes:
   pg_data:
 
+# ======================
+# Rede compartilhada
+# ======================
 networks:
   sales_router_net:
+    name: sales_router_net   
     driver: bridge

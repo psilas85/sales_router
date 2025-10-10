@@ -1,0 +1,48 @@
+#sales_router/src/authentication/Dockerfile.authentication
+
+# =========================
+# 1. Imagem base (versão estável)
+# =========================
+FROM python:3.11-bullseye
+
+# =========================
+# 2. Diretório de trabalho
+# =========================
+WORKDIR /app/authentication
+
+# =========================
+# 3. Variáveis de ambiente
+# =========================
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+
+# =========================
+# 4. Instalar dependências do sistema
+# =========================
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libpq-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# =========================
+# 5. Copiar dependências e instalar
+# =========================
+COPY ./requirements.txt /app/
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# =========================
+# 6. Copiar módulos necessários
+# =========================
+COPY ./src/authentication /app/authentication
+COPY ./src/database /app/database
+
+
+# =========================
+# 7. Expor porta e comando
+# =========================
+EXPOSE 8000
+CMD ["uvicorn", "api.authentication_api:app", "--host", "0.0.0.0", "--port", "8000"]
+
+
