@@ -1,4 +1,4 @@
-#sales_router/src/authentication/use_case/tenant_use_case.py
+# sales_router/src/authentication/use_case/tenant_use_case.py
 
 from authentication.entities.tenant import Tenant
 from authentication.infrastructure.tenant_repository import TenantRepository
@@ -19,3 +19,16 @@ class TenantUseCase:
             is_master=True
         )
         return self.repo.create(tenant)
+
+    def create_tenant(self, razao_social, nome_fantasia, cnpj, email_adm):
+        tenant = Tenant(
+            razao_social=razao_social,
+            nome_fantasia=nome_fantasia or razao_social,
+            cnpj=cnpj,
+            email_adm=email_adm,
+            is_master=False
+        )
+        return self.repo.create(tenant)
+
+    def list_tenants(self):
+        return self.repo.list_all()

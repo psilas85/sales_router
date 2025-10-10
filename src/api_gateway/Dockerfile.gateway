@@ -1,14 +1,12 @@
-# =========================
-# SalesRouter API Gateway
-# =========================
+#sales_router/src/api_gateway/Dockerfile.gateway
 
 FROM nginx:latest
 
 # Remove configuração padrão
 RUN rm /etc/nginx/conf.d/default.conf
 
-# Copia a configuração customizada
-COPY ./src/api_gateway/nginx.conf /etc/nginx/conf.d/default.conf
+# Copia a configuração customizada (ajuste o caminho se necessário)
+COPY ./src/api_gateway/nginx.conf /etc/nginx/conf.d/sales_router.conf
 
 # Expondo portas HTTP e HTTPS
 EXPOSE 80 443

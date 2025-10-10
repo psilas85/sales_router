@@ -1,4 +1,4 @@
-#sales_router/src/authentication/main_authentication.py
+# sales_router/src/authentication/main_authentication.py
 
 import sys, os, argparse
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -12,14 +12,10 @@ from authentication.entities.user import User
 def main():
     parser = argparse.ArgumentParser(description="Módulo de Autenticação - SalesRouter")
 
-    parser.add_argument(
-        "--action",
-        required=True,
-        choices=["init", "create_tenant", "create_user", "login"],
-        help="Ação a ser executada."
-    )
+    parser.add_argument("--action", required=True,
+                        choices=["init", "create_tenant", "create_user", "login"],
+                        help="Ação a ser executada.")
 
-    # Argumentos opcionais para criação e login
     parser.add_argument("--razao", help="Razão social do tenant")
     parser.add_argument("--fantasia", help="Nome fantasia do tenant")
     parser.add_argument("--cnpj", help="CNPJ do tenant")
@@ -27,9 +23,9 @@ def main():
     parser.add_argument("--senha", help="Senha do usuário")
     parser.add_argument("--tenant_id", type=int, help="ID do tenant (para criar usuário)")
     parser.add_argument("--nome", help="Nome do usuário")
+    parser.add_argument("--role", choices=["tenant_adm", "tenant_operacional"], help="Tipo de usuário a criar")
 
     args = parser.parse_args()
-
     tenant_uc = TenantUseCase()
     user_uc = UserUseCase()
 
@@ -41,8 +37,8 @@ def main():
         tenant = tenant_uc.create_master_tenant()
         print(f"🏢 Tenant Master criado com ID: {tenant.id}")
 
-        user = user_uc.create_admin_user(tenant.id)
-        print(f"👤 Usuário admin criado com ID: {user.id}")
+        user = user_uc.create_sales_router_admin(tenant.id)
+        print(f"👤 Usuário SalesRouter Admin criado com ID: {user.id}")
 
         token = user_uc.login("admin@salesrouter.com", "admin123")
         print(f"🔐 Token JWT: {token}")
@@ -51,7 +47,6 @@ def main():
         if not all([args.razao, args.cnpj, args.email]):
             print("❌ Faltam parâmetros obrigatórios: --razao, --cnpj, --email")
             return
-
         tenant = Tenant(
             razao_social=args.razao,
             nome_fantasia=args.fantasia or args.razao,
@@ -63,33 +58,25 @@ def main():
         print(f"✅ Tenant '{tenant.nome_fantasia}' criado com ID: {tenant.id}")
 
     elif args.action == "create_user":
-        if not all([args.tenant_id, args.nome, args.email, args.senha]):
-            print("❌ Faltam parâmetros obrigatórios: --tenant_id, --nome, --email, --senha")
+        if not all([args.tenant_id, args.nome, args.email, args.senha, args.role]):
+            print("❌ Faltam parâmetros obrigatórios: --tenant_id, --nome, --email, --senha, --role")
             return
 
-        senha_hash = user_uc.auth.hash_password(args.senha)
-        user = User(
-            tenant_id=args.tenant_id,
-            nome=args.nome,
-            email=args.email,
-            senha_hash=senha_hash,
-            role="operacional",
-            ativo=True
-        )
-        user = user_uc.repo.create(user)
-        print(f"✅ Usuário '{user.nome}' criado com ID: {user.id}")
+        if args.role == "tenant_adm":
+            user = user_uc.create_tenant_admin(args.tenant_id, args.nome, args.email, args.senha)
+        else:
+            user = user_uc.create_tenant_operacional(args.tenant_id, args.nome, args.email, args.senha)
+        print(f"✅ Usuário '{user.nome}' ({user.role}) criado com ID: {user.id}")
 
     elif args.action == "login":
         if not all([args.email, args.senha]):
             print("❌ Faltam parâmetros obrigatórios: --email, --senha")
             return
-
         token = user_uc.login(args.email, args.senha)
         if token:
             print(f"🔐 Login bem-sucedido. Token JWT: {token}")
         else:
             print("❌ Falha no login: credenciais inválidas.")
-
 
 if __name__ == "__main__":
     main()

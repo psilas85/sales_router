@@ -1,8 +1,8 @@
-#sales_router/src/authentication/use_case/user_use_case.py
+# sales_router/src/authentication/use_case/user_use_case.py
 
-from authentication.entities.user import User
-from authentication.infrastructure.user_repository import UserRepository
 from authentication.domain.auth_service import AuthService
+from authentication.infrastructure.user_repository import UserRepository
+from authentication.entities.user import User
 
 class UserUseCase:
     def __init__(self):
@@ -12,24 +12,65 @@ class UserUseCase:
     def setup_table(self):
         self.repo.create_table()
 
-    def create_admin_user(self, tenant_id):
-        senha_hash = self.auth.hash_password("Psilas@85")
+    # =====================================================
+    # CRIAÇÕES
+    # =====================================================
+
+    def create_sales_router_admin(self, tenant_id):
+        senha_hash = self.auth.hash_password("admin123")
         user = User(
             tenant_id=tenant_id,
-            nome="Administrador Master",
+            nome="Administrador SalesRouter",
             email="admin@salesrouter.com",
             senha_hash=senha_hash,
-            role="admin",
+            role="sales_router_adm",
             ativo=True
         )
         return self.repo.create(user)
 
+    def create_tenant_admin(self, tenant_id, nome, email, senha):
+        senha_hash = self.auth.hash_password(senha)
+        user = User(
+            tenant_id=tenant_id,
+            nome=nome,
+            email=email,
+            senha_hash=senha_hash,
+            role="tenant_adm",
+            ativo=True
+        )
+        return self.repo.create(user)
+
+    def create_tenant_operacional(self, tenant_id, nome, email, senha):
+        senha_hash = self.auth.hash_password(senha)
+        user = User(
+            tenant_id=tenant_id,
+            nome=nome,
+            email=email,
+            senha_hash=senha_hash,
+            role="tenant_operacional",
+            ativo=True
+        )
+        return self.repo.create(user)
+
+    # =====================================================
+    # LOGIN
+    # =====================================================
+
     def login(self, email, senha):
-        row = self.repo.find_by_email(email)
-        if not row:
+        user = self.repo.get_by_email(email)
+        if not user or not self.auth.verify_password(senha, user.senha_hash):
             return None
-        id, tenant_id, nome, email, senha_hash, role, ativo = row
-        if not self.auth.verify_password(senha, senha_hash):
-            return None
-        token = self.auth.generate_token(id, tenant_id, role)
-        return token
+        return self.auth.generate_token(user.id, user.tenant_id, user.role)
+
+    # =====================================================
+    # LISTAGEM / ADMIN
+    # =====================================================
+
+    def list_users(self):
+        return self.repo.list_all()
+
+    def list_users_by_tenant(self, tenant_id):
+        return self.repo.list_by_tenant(tenant_id)
+
+    def deactivate_user(self, user_id):
+        return self.repo.deactivate(user_id)

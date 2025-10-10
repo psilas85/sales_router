@@ -1,9 +1,9 @@
-#sales_router/src/authentication/Dockerfile.authentication
+# sales_router/src/authentication/Dockerfile.authentication
 
 # =========================
-# 1. Imagem base (versão estável)
+# 1. Imagem base (leve e estável)
 # =========================
-FROM python:3.11-bullseye
+FROM python:3.11-slim-bullseye
 
 # =========================
 # 2. Diretório de trabalho
@@ -16,33 +16,35 @@ WORKDIR /app/authentication
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
+ENV TZ=America/Sao_Paulo
 
 # =========================
-# 4. Instalar dependências do sistema
+# 4. Dependências do sistema
 # =========================
 RUN apt-get update && apt-get install -y \
     build-essential \
     libpq-dev \
     curl \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # =========================
-# 5. Copiar dependências e instalar
+# 5. Copiar e instalar dependências Python
 # =========================
 COPY ./requirements.txt /app/
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
+# Garante libs críticas para autenticação
+RUN pip install --no-cache-dir bcrypt PyJWT fastapi uvicorn psycopg2-binary
+
 # =========================
-# 6. Copiar módulos necessários
+# 6. Copiar módulos da aplicação
 # =========================
 COPY ./src/authentication /app/authentication
 COPY ./src/database /app/database
 
-
 # =========================
-# 7. Expor porta e comando
+# 7. Expor porta e comando inicial
 # =========================
 EXPOSE 8000
-CMD ["uvicorn", "api.authentication_api:app", "--host", "0.0.0.0", "--port", "8000"]
-
-
+CMD ["uvicorn", "authentication.api.authentication_api:app", "--host", "0.0.0.0", "--port", "8000"]

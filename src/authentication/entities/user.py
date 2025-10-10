@@ -1,16 +1,14 @@
-#sales_router/src/authentication/entities/user.py
+# sales_router/src/authentication/entities/user.py
 
 from dataclasses import dataclass
-from datetime import datetime
+from typing import Optional, Literal
 
 @dataclass
 class User:
-    id: int = None
-    tenant_id: int = None
+    id: Optional[int] = None
+    tenant_id: int = 0
     nome: str = ""
     email: str = ""
     senha_hash: str = ""
-    role: str = "operacional"
+    role: Literal["sales_router_adm", "tenant_adm", "tenant_operacional"] = "tenant_operacional"
     ativo: bool = True
-    criado_em: datetime = datetime.now()
-
