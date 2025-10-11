@@ -1,0 +1,32 @@
+# ============================
+# Dockerfile.pdv_preprocessing
+# ============================
+
+# Usa imagem base já criada (com Python, dependências e utilitários)
+FROM psilas85/sales_router-base:latest
+
+# Define diretório de trabalho padrão
+WORKDIR /app
+
+# Copia o módulo PDV
+COPY ./src/pdv_preprocessing /app/src/pdv_preprocessing
+
+# Copia dependências globais (caso imagem base seja mais enxuta)
+COPY ./requirements.txt /app/requirements.txt
+
+# Instala pacotes faltantes (a maioria já vem da imagem base)
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Copia variáveis de ambiente (se .env existir na raiz)
+COPY .env /app/.env
+
+# Define variáveis padrão de ambiente
+ENV PYTHONPATH=/app/src \
+    ENV=development \
+    TZ=America/Sao_Paulo
+
+# Exibe versão Python e dependências na inicialização (debug friendly)
+RUN python --version && pip list | grep -E "pandas|geopy|psycopg2|requests|python-dotenv"
+
+# Comando de inicialização padrão (interativo)
+CMD ["python", "src/pdv_preprocessing/main_pdv_preprocessing.py", "--help"]

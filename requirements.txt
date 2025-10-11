@@ -9,6 +9,7 @@
 # - routing_service
 # - transfer_routing_service
 # - costs_services
+# - pdv_preprocessing_service
 # ============================================
 
 
@@ -35,10 +36,13 @@ pandas==2.2.3
 numpy==1.26.4
 scikit-learn==1.5.2
 
-# ===== Geoprocessamento e Mapas (Routing / Clusterization) =====
+# ===== Geoprocessamento e Mapas (Routing / Clusterization / PDV) =====
 geopy==2.4.1
 folium==0.17.0
 plotly==5.23.0
 
 # ===== Logging e Observabilidade =====
 loguru==0.7.2
+
+# ===== Utilidades adicionais =====
+pytz==2024.1

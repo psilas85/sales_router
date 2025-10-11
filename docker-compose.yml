@@ -34,6 +34,29 @@ services:
       - sales_router_net
     restart: always
 
+  # ======================
+  # Pré-processamento de PDVs
+  # ======================
+  pdv_preprocessing:
+    build:
+      context: .
+      dockerfile: ./src/pdv_preprocessing/Dockerfile.pdv_preprocessing
+    container_name: pdv_preprocessing
+    env_file:
+      - .env
+    depends_on:
+      - sales_router_db
+      - redis
+    volumes:
+      - ./src/pdv_preprocessing:/app/src/pdv_preprocessing   # código vivo
+      - ./data:/app/data                                     # acesso ao CSV
+    networks:
+      - sales_router_net
+    restart: always
+    command: >
+      tail -f /dev/null
+
+
 
   # ======================
   # Banco de Dados (PostgreSQL + PostGIS)
