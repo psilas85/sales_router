@@ -1,4 +1,4 @@
-# sales_router/src/authentication/domain/auth_service.py
+# src/authentication/domain/auth_service.py
 
 import bcrypt
 import jwt
@@ -7,8 +7,13 @@ from datetime import datetime, timedelta
 from functools import wraps
 from fastapi import HTTPException, Request, status
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "salesrouter-secret-key")
-ALGORITHM = "HS256"
+# ==============================
+# 🔐 Configurações JWT centralizadas
+# ==============================
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "salesrouter-secret-key")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_EXP_HOURS = int(os.getenv("JWT_EXP_HOURS", 8))
+
 
 class AuthService:
     def hash_password(self, senha):
@@ -22,13 +27,13 @@ class AuthService:
             "user_id": user_id,
             "tenant_id": tenant_id,
             "role": role,
-            "exp": datetime.utcnow() + timedelta(hours=8)
+            "exp": datetime.utcnow() + timedelta(hours=JWT_EXP_HOURS),
         }
-        return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+        return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
     def decode_token(self, token: str):
         try:
-            return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            return jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
         except jwt.ExpiredSignatureError:
             raise HTTPException(status_code=401, detail="Token expirado")
         except jwt.InvalidTokenError:
@@ -58,21 +63,17 @@ def role_required(roles: list[str]):
                     detail="Acesso negado: privilégio insuficiente"
                 )
 
-            # ✅ Injeta usuário decodificado no estado da requisição
             request.state.user = {
                 "user_id": payload.get("user_id"),
                 "tenant_id": payload.get("tenant_id"),
-                "role": payload.get("role")
+                "role": payload.get("role"),
             }
 
-            # ✅ Compatibilidade com rotas síncronas e assíncronas
-            if callable(func):
-                if hasattr(func, "__call__"):
-                    import inspect
-                    if inspect.iscoroutinefunction(func):
-                        return await func(request, *args, **kwargs)
-                    else:
-                        return func(request, *args, **kwargs)
-            raise HTTPException(status_code=500, detail="Erro interno ao processar função protegida")
+            import inspect
+            if inspect.iscoroutinefunction(func):
+                return await func(request, *args, **kwargs)
+            else:
+                return func(request, *args, **kwargs)
+
         return wrapper
     return decorator

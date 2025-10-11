@@ -48,14 +48,33 @@ services:
       - sales_router_db
       - redis
     volumes:
-      - ./src/pdv_preprocessing:/app/src/pdv_preprocessing   # código vivo
-      - ./data:/app/data                                     # acesso ao CSV
+      - ./src/pdv_preprocessing:/app/src/pdv_preprocessing
+      - ./data:/app/data
     networks:
       - sales_router_net
     restart: always
-    command: >
-      tail -f /dev/null
 
+
+  # ======================
+  # PDV Jobs Worker (RQ)
+  # ======================
+  pdv_jobs_worker:
+    build:
+      context: .
+      dockerfile: ./src/pdv_preprocessing/Dockerfile.worker
+    container_name: pdv_jobs_worker
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - sales_router_db
+    volumes:
+      - ./src/pdv_preprocessing:/app/src/pdv_preprocessing
+      - ./src/database:/app/src/database
+      - ./data:/app/data
+    networks:
+      - sales_router_net
+    restart: always
 
 
   # ======================

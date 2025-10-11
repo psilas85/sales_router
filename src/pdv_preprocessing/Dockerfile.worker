@@ -1,0 +1,29 @@
+# ============================
+# Dockerfile.worker (PDV Jobs)
+# ============================
+
+FROM psilas85/sales_router-base:latest
+
+WORKDIR /app
+
+# Copia módulos necessários
+COPY ./src/pdv_preprocessing /app/src/pdv_preprocessing
+COPY ./src/database /app/src/database
+
+# Copia dependências globais e instala
+COPY ./requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# ✅ Adiciona dependências do worker (não estão na base)
+RUN pip install --no-cache-dir rq==1.16.2 redis==5.0.7
+
+# Define variáveis padrão
+ENV PYTHONPATH=/app/src \
+    TZ=America/Sao_Paulo \
+    ENV=production
+
+# Exibe dependências críticas para debug
+RUN python --version && pip list | grep -E "rq|redis|psycopg2|pandas"
+
+# Comando principal: worker escutando fila "pdv_jobs"
+CMD ["rq", "worker", "--url", "redis://redis:6379", "pdv_jobs"]

@@ -2,31 +2,26 @@
 # Dockerfile.pdv_preprocessing
 # ============================
 
-# Usa imagem base já criada (com Python, dependências e utilitários)
+# Usa imagem base compartilhada
 FROM psilas85/sales_router-base:latest
 
-# Define diretório de trabalho padrão
+# Define o diretório de trabalho principal
 WORKDIR /app
 
-# Copia o módulo PDV
+# Copia o módulo PDV completo
 COPY ./src/pdv_preprocessing /app/src/pdv_preprocessing
 
-# Copia dependências globais (caso imagem base seja mais enxuta)
+# Copia dependências globais e instala (a maioria já na base)
 COPY ./requirements.txt /app/requirements.txt
-
-# Instala pacotes faltantes (a maioria já vem da imagem base)
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copia variáveis de ambiente (se .env existir na raiz)
-COPY .env /app/.env
-
-# Define variáveis padrão de ambiente
+# Variáveis de ambiente padrão
 ENV PYTHONPATH=/app/src \
-    ENV=development \
-    TZ=America/Sao_Paulo
+    TZ=America/Sao_Paulo \
+    ENV=production
 
-# Exibe versão Python e dependências na inicialização (debug friendly)
-RUN python --version && pip list | grep -E "pandas|geopy|psycopg2|requests|python-dotenv"
+# Exibe informações básicas de debug
+RUN python --version && pip list | grep -E "fastapi|pandas|psycopg2|rq|redis"
 
-# Comando de inicialização padrão (interativo)
-CMD ["python", "src/pdv_preprocessing/main_pdv_preprocessing.py", "--help"]
+# 🔥 Comando padrão (executa a API FastAPI)
+CMD ["uvicorn", "src.pdv_preprocessing.api.pdv_preprocessing_api:app", "--host", "0.0.0.0", "--port", "8000"]

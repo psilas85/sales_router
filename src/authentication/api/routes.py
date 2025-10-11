@@ -1,9 +1,16 @@
-# sales_router/src/authentication/api/routes.py
-
 from fastapi import APIRouter, HTTPException, Request
 from authentication.use_case.tenant_use_case import TenantUseCase
 from authentication.use_case.user_use_case import UserUseCase
 from authentication.domain.auth_service import AuthService, role_required
+import jwt
+import os
+from datetime import datetime
+
+# =====================================================
+# 🔐 Configurações JWT centralizadas via .env
+# =====================================================
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "salesrouter-secret-key")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 
 router = APIRouter()
 
@@ -102,3 +109,35 @@ def login(email: str, senha: str):
 def get_me(request: Request):
     """Retorna as informações do usuário autenticado."""
     return {"user": request.state.user}
+
+
+# =====================================================
+# 🔎 VERIFICAÇÃO DE TOKEN
+# =====================================================
+
+@router.post("/auth/verify-token", tags=["Autenticação"])
+def verify_token(payload: dict):
+    """
+    Valida o token JWT emitido pelo Authentication Service.
+    Retorna os dados do usuário se o token for válido.
+    """
+    token = payload.get("token")
+    if not token:
+        raise HTTPException(status_code=400, detail="Token não informado.")
+
+    try:
+        decoded = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        exp = decoded.get("exp")
+        if exp and datetime.utcnow().timestamp() > exp:
+            raise HTTPException(status_code=401, detail="Token expirado.")
+
+        return {
+            "user_id": decoded.get("user_id"),
+            "tenant_id": decoded.get("tenant_id"),
+            "role": decoded.get("role"),
+        }
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expirado.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token inválido ou expirado.")
