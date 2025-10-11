@@ -1,5 +1,6 @@
 # sales_router/src/authentication/use_case/user_use_case.py
 
+import os
 from authentication.domain.auth_service import AuthService
 from authentication.infrastructure.user_repository import UserRepository
 from authentication.entities.user import User
@@ -17,11 +18,17 @@ class UserUseCase:
     # =====================================================
 
     def create_sales_router_admin(self, tenant_id):
-        senha_hash = self.auth.hash_password("admin123")
+        """
+        Cria o administrador master do SalesRouter.
+        Usa senha vinda de variável de ambiente ADMIN_PASSWORD para maior segurança.
+        """
+        admin_password = os.getenv("ADMIN_PASSWORD", "Psilas@85")  # fallback para dev
+        senha_hash = self.auth.hash_password(admin_password)
+
         user = User(
             tenant_id=tenant_id,
-            nome="Administrador SalesRouter",
-            email="admin@salesrouter.com",
+            nome="Paulo Silas",
+            email="paulo.silas@igotech.com.br",
             senha_hash=senha_hash,
             role="sales_router_adm",
             ativo=True
@@ -57,10 +64,11 @@ class UserUseCase:
     # =====================================================
 
     def login(self, email, senha):
-        user = self.repo.get_by_email(email)
+        user = self.repo.find_by_email(email)
         if not user or not self.auth.verify_password(senha, user.senha_hash):
             return None
         return self.auth.generate_token(user.id, user.tenant_id, user.role)
+
 
     # =====================================================
     # LISTAGEM / ADMIN

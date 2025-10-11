@@ -1,8 +1,13 @@
-#sales_router/src/authentication/infrastructure/tenant_repository.py
+# sales_router/src/authentication/infrastructure/tenant_repository.py
 
 from database.db_connection import get_connection
+from authentication.entities.tenant import Tenant
+
 
 class TenantRepository:
+    # =====================================================
+    # 🧩 Estrutura da Tabela
+    # =====================================================
     def create_table(self):
         conn = get_connection()
         cur = conn.cursor()
@@ -21,7 +26,10 @@ class TenantRepository:
         cur.close()
         conn.close()
 
-    def create(self, tenant):
+    # =====================================================
+    # 🧩 CRUD
+    # =====================================================
+    def create(self, tenant: Tenant):
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("""
@@ -34,3 +42,53 @@ class TenantRepository:
         cur.close()
         conn.close()
         return tenant
+
+    def list_all(self):
+        """Retorna todos os tenants como entidades Tenant."""
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, razao_social, nome_fantasia, cnpj, email_adm, is_master
+            FROM tenant
+            ORDER BY id;
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        return [
+            Tenant(
+                id=row[0],
+                razao_social=row[1],
+                nome_fantasia=row[2],
+                cnpj=row[3],
+                email_adm=row[4],
+                is_master=row[5]
+            )
+            for row in rows
+        ]
+
+    def get_by_cnpj(self, cnpj: str):
+        """Busca um tenant específico pelo CNPJ."""
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, razao_social, nome_fantasia, cnpj, email_adm, is_master
+            FROM tenant
+            WHERE cnpj = %s;
+        """, (cnpj,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not row:
+            return None
+
+        return Tenant(
+            id=row[0],
+            razao_social=row[1],
+            nome_fantasia=row[2],
+            cnpj=row[3],
+            email_adm=row[4],
+            is_master=row[5]
+        )

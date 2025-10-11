@@ -21,26 +21,19 @@ services:
       dockerfile: ./src/authentication/Dockerfile.authentication
     container_name: authentication_service
     expose:
-      - "8000"                       
+      - "8000"
     ports:
-      - "8001:8000"               
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@sales_router_db:5432/sales_routing_db
-      - JWT_SECRET_KEY=supersecretkey
-      - JWT_ALGORITHM=HS256
-      - TZ=America/Sao_Paulo
+      - "8001:8000"
+    env_file:
+      - .env              # ✅ carrega todas as variáveis do .env global
     depends_on:
       - sales_router_db
     volumes:
       - ./src/authentication:/app/authentication
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
-      interval: 20s
-      timeout: 5s
-      retries: 3
     networks:
       - sales_router_net
     restart: always
+
 
   # ======================
   # Banco de Dados (PostgreSQL + PostGIS)

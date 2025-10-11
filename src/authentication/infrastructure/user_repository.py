@@ -1,8 +1,13 @@
-#sales_router/src/authentication/infrastructure/user_respository.py
+# sales_router/src/authentication/infrastructure/user_repository.py
 
 from database.db_connection import get_connection
+from authentication.entities.user import User
+
 
 class UserRepository:
+    # =====================================================
+    # 🔧 Estrutura da Tabela
+    # =====================================================
     def create_table(self):
         conn = get_connection()
         cur = conn.cursor()
@@ -22,7 +27,10 @@ class UserRepository:
         cur.close()
         conn.close()
 
-    def create(self, user):
+    # =====================================================
+    # 🧩 CRUD
+    # =====================================================
+    def create(self, user: User):
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("""
@@ -36,12 +44,110 @@ class UserRepository:
         conn.close()
         return user
 
-    def find_by_email(self, email):
+    def find_by_email(self, email: str):
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id, tenant_id, nome, email, senha_hash, role, ativo FROM usuario WHERE email = %s", (email,))
+        cur.execute("""
+            SELECT id, tenant_id, nome, email, senha_hash, role, ativo
+            FROM usuario
+            WHERE email = %s;
+        """, (email,))
         row = cur.fetchone()
         cur.close()
         conn.close()
-        return row
 
+        if not row:
+            return None
+
+        return User(
+            id=row[0],
+            tenant_id=row[1],
+            nome=row[2],
+            email=row[3],
+            senha_hash=row[4],
+            role=row[5],
+            ativo=row[6]
+        )
+
+    def list_all(self):
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id, tenant_id, nome, email, senha_hash, role, ativo FROM usuario;")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [
+            User(
+                id=row[0],
+                tenant_id=row[1],
+                nome=row[2],
+                email=row[3],
+                senha_hash=row[4],
+                role=row[5],
+                ativo=row[6]
+            )
+            for row in rows
+        ]
+
+    def list_by_tenant(self, tenant_id: int):
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, tenant_id, nome, email, senha_hash, role, ativo
+            FROM usuario WHERE tenant_id = %s;
+        """, (tenant_id,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [
+            User(
+                id=row[0],
+                tenant_id=row[1],
+                nome=row[2],
+                email=row[3],
+                senha_hash=row[4],
+                role=row[5],
+                ativo=row[6]
+            )
+            for row in rows
+        ]
+
+    def deactivate(self, user_id: int):
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE usuario SET ativo = FALSE WHERE id = %s RETURNING id, nome, email, role, ativo;", (user_id,))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        if not row:
+            return None
+
+        return User(
+            id=row[0],
+            nome=row[1],
+            email=row[2],
+            role=row[3],
+            ativo=row[4],
+            tenant_id=None,
+            senha_hash=None
+        )
+
+    def update(self, user: User):
+        """Atualiza todos os campos editáveis do usuário (ex: senha)."""
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE usuario
+            SET nome = %s,
+                email = %s,
+                senha_hash = %s,
+                role = %s,
+                ativo = %s
+            WHERE id = %s;
+        """, (user.nome, user.email, user.senha_hash, user.role, user.ativo, user.id))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return user

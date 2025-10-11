@@ -46,15 +46,33 @@ def role_required(roles: list[str]):
 
             token = auth_header.split(" ")[1]
             auth = AuthService()
-            payload = auth.decode_token(token)
 
-            if payload["role"] not in roles:
+            try:
+                payload = auth.decode_token(token)
+            except HTTPException as e:
+                raise e
+
+            if payload.get("role") not in roles:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Acesso negado: privilégio insuficiente"
                 )
 
-            request.state.user = payload
-            return await func(request, *args, **kwargs)
+            # ✅ Injeta usuário decodificado no estado da requisição
+            request.state.user = {
+                "user_id": payload.get("user_id"),
+                "tenant_id": payload.get("tenant_id"),
+                "role": payload.get("role")
+            }
+
+            # ✅ Compatibilidade com rotas síncronas e assíncronas
+            if callable(func):
+                if hasattr(func, "__call__"):
+                    import inspect
+                    if inspect.iscoroutinefunction(func):
+                        return await func(request, *args, **kwargs)
+                    else:
+                        return func(request, *args, **kwargs)
+            raise HTTPException(status_code=500, detail="Erro interno ao processar função protegida")
         return wrapper
     return decorator
