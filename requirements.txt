@@ -46,3 +46,12 @@ loguru==0.7.2
 
 # ===== Utilidades adicionais =====
 pytz==2024.1
+
+# Sales Clusterization - Requisitos específicos
+fastapi
+uvicorn
+psycopg2-binary
+scikit-learn
+numpy
+pandas
+geopy

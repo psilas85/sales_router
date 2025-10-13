@@ -76,6 +76,27 @@ services:
       - sales_router_net
     restart: always
 
+  # ======================
+  # Clusterização de PDVs (Sales Clusterization)
+  # ======================
+  sales_clusterization:
+    build:
+      context: .
+      dockerfile: ./src/sales_clusterization/Dockerfile.clusterization
+    container_name: sales_clusterization
+    env_file:
+      - .env
+    depends_on:
+      - sales_router_db
+      - redis
+    volumes:
+      - ./src/sales_clusterization:/app/src/sales_clusterization
+      - ./src/database:/app/src/database
+      - ./data:/app/data
+    networks:
+      - sales_router_net
+    restart: always
+
 
   # ======================
   # Banco de Dados (PostgreSQL + PostGIS)
