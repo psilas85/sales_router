@@ -113,6 +113,105 @@ class SalesRoutingDatabaseReader:
             """, (uf, cidade))
             row = cur.fetchone()
             return dict(row) if row else None
+    # Dentro de SalesRoutingDatabaseReader
+
+    def list_snapshots(self, tenant_id, uf=None, cidade=None):
+        cur = self.conn.cursor()
+        query = """
+            SELECT id, nome, descricao, criado_em, tags, uf, cidade
+            FROM sales_routing_snapshot
+            WHERE tenant_id = %s
+        """
+        params = [tenant_id]
+
+        if uf:
+            query += " AND uf = %s"
+            params.append(uf)
+        if cidade:
+            query += " AND cidade = %s"
+            params.append(cidade)
+
+        query += " ORDER BY criado_em DESC;"
+        cur.execute(query, tuple(params))
+        rows = cur.fetchall()
+        cur.close()
+
+        return [
+            {
+                "id": r[0],
+                "nome": r[1],
+                "descricao": r[2],
+                "criado_em": r[3],
+                "tags": r[4],
+                "uf": r[5],
+                "cidade": r[6],
+            }
+            for r in rows
+        ]
+
+
+    def get_snapshot_by_name(self, tenant_id, nome):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT id, nome, descricao, uf, cidade
+            FROM sales_routing_snapshot
+            WHERE tenant_id = %s AND nome = %s
+            ORDER BY criado_em DESC
+            LIMIT 1;
+        """, (tenant_id, nome))
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "nome": row[1],
+            "descricao": row[2],
+            "uf": row[3],
+            "cidade": row[4],
+        }
+
+
+    def get_snapshot_subclusters(self, snapshot_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT cluster_id, subcluster_seq, k_final, tempo_total_min, dist_total_km, n_pdvs
+            FROM sales_routing_snapshot_subcluster
+            WHERE snapshot_id = %s;
+        """, (snapshot_id,))
+        rows = cur.fetchall()
+        cur.close()
+        return [
+            {
+                "cluster_id": r[0],
+                "subcluster_seq": r[1],
+                "k_final": r[2],
+                "tempo_total_min": r[3],
+                "dist_total_km": r[4],
+                "n_pdvs": r[5],
+            }
+            for r in rows
+        ]
+
+
+    def get_snapshot_pdvs(self, snapshot_id):
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT cluster_id, subcluster_seq, pdv_id, sequencia_ordem
+            FROM sales_routing_snapshot_pdv
+            WHERE snapshot_id = %s;
+        """, (snapshot_id,))
+        rows = cur.fetchall()
+        cur.close()
+        return [
+            {
+                "cluster_id": r[0],
+                "subcluster_seq": r[1],
+                "pdv_id": r[2],
+                "sequencia_ordem": r[3],
+            }
+            for r in rows
+        ]
 
 
     # -------------------------------------------------------------------------
