@@ -5,6 +5,7 @@ import numpy as np
 from sklearn.cluster import KMeans
 from typing import List, Dict, Any
 from src.sales_routing.domain.entities.cluster_data_entity import ClusterData, PDVData
+from src.sales_routing.application.route_optimizer import RouteOptimizer
 
 
 def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -17,28 +18,6 @@ def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
     return 2 * R * math.asin(math.sqrt(h))
 
 
-def tempo_total_estimado(pdvs: List[PDVData], service_min: int, v_kmh: float, alpha: float) -> tuple[float, float]:
-    """Calcula o tempo total e distância total aproximada para uma rota (min, km)."""
-    if len(pdvs) <= 1:
-        return service_min, 0.0
-
-    total_dist = 0.0
-    for i in range(len(pdvs) - 1):
-        total_dist += haversine_km(
-            (pdvs[i].lat, pdvs[i].lon),
-            (pdvs[i + 1].lat, pdvs[i + 1].lon)
-        )
-
-    # Corrige distâncias para tortuosidade de vias
-    total_dist *= alpha
-
-    tempo_viagem_min = (total_dist / v_kmh) * 60
-    tempo_servico_min = len(pdvs) * service_min
-    tempo_total = tempo_viagem_min + tempo_servico_min
-
-    return tempo_total, total_dist
-
-
 def dividir_cluster_em_subclusters(
     cluster: ClusterData,
     pdvs_cluster: List[PDVData],
@@ -46,19 +25,20 @@ def dividir_cluster_em_subclusters(
     route_km_max: float,
     service_min: int,
     v_kmh: float,
-    alpha_path: float
+    alpha_path: float,
+    aplicar_two_opt: bool = False
 ) -> Dict[str, Any]:
     """
     Divide adaptativamente um cluster em subclusters até que o tempo máximo e distância sejam respeitados.
+    Usa heurísticas de roteirização para avaliar a viabilidade de cada subcluster.
     """
 
-    # Ponto de partida: tenta com K=1
     k = 1
     convergiu = False
     resultados_iter = []
+    optimizer = RouteOptimizer(v_kmh=v_kmh, service_min=service_min, alpha_path=alpha_path)
 
     while not convergiu:
-        # Aplica KMeans para subdividir PDVs em K subclusters
         coords = np.array([[p.lat, p.lon] for p in pdvs_cluster])
         kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto").fit(coords)
         labels = kmeans.labels_
@@ -72,17 +52,23 @@ def dividir_cluster_em_subclusters(
             if not pdvs_sub:
                 continue
 
-            t_total, d_total = tempo_total_estimado(pdvs_sub, service_min, v_kmh, alpha_path)
+            # Constrói lista simples de dicts para o otimizador
+            pdvs_dict = [{"pdv_id": p.pdv_id, "lat": p.lat, "lon": p.lon} for p in pdvs_sub]
+            centro = {"lat": cluster.centro_lat, "lon": cluster.centro_lon}
+
+            # Calcula rota otimizada
+            rota = optimizer.calcular_rota(centro, pdvs_dict, aplicar_two_opt)
+
             subclusters.append({
                 "subcluster_id": subcluster_id + 1,
                 "n_pdvs": len(pdvs_sub),
-                "tempo_total_min": round(t_total, 1),
-                "dist_total_km": round(d_total, 2),
-                "pdvs": [p.pdv_id for p in pdvs_sub]
+                "tempo_total_min": rota["tempo_total_min"],
+                "dist_total_km": rota["distancia_total_km"],
+                "pdvs": [p["pdv_id"] for p in rota["sequencia"]],
             })
 
-            max_tempo = max(max_tempo, t_total)
-            max_dist = max(max_dist, d_total)
+            max_tempo = max(max_tempo, rota["tempo_total_min"])
+            max_dist = max(max_dist, rota["distancia_total_km"])
 
         resultados_iter.append((k, max_tempo, max_dist))
 
@@ -91,9 +77,11 @@ def dividir_cluster_em_subclusters(
         else:
             k += 1
             if k > len(pdvs_cluster):
-                # Evita loop infinito
-                print(f"⚠️ Cluster {cluster.cluster_id}: número de PDVs insuficiente para satisfazer restrições.")
+                print(f"⚠️ Cluster {cluster.cluster_id}: não convergiu — limite de PDVs atingido ({len(pdvs_cluster)}).")
                 break
+
+    print(f"  ✅ K_final={k}, MáxTempo={max_tempo:.1f} min, MáxDist={max_dist:.1f} km")
+    print(f"  🧩 Iterações: {[f'K={k_},T={t:.1f}m,D={d:.1f}km' for k_, t, d in resultados_iter]}")
 
     return {
         "cluster_id": cluster.cluster_id,
@@ -113,7 +101,8 @@ def gerar_subclusters_adaptativo(
     route_km_max: float,
     service_min: int,
     v_kmh: float,
-    alpha_path: float
+    alpha_path: float,
+    aplicar_two_opt: bool = False
 ) -> List[Dict[str, Any]]:
     """
     Gera subclusters adaptativamente para todos os clusters.
@@ -134,11 +123,9 @@ def gerar_subclusters_adaptativo(
             route_km_max,
             service_min,
             v_kmh,
-            alpha_path
+            alpha_path,
+            aplicar_two_opt
         )
-
-        print(f"  ✅ K_final={resultado['k_final']}, MáxTempo={resultado['max_tempo']:.1f} min, MáxDist={resultado['max_dist']:.1f} km")
-        print(f"  🧩 Iterações: {[f'K={k},T={t:.1f}m,D={d:.1f}km' for k,t,d in resultado['iteracoes']]}")
 
         resultados.append(resultado)
 
