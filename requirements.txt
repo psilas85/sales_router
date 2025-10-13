@@ -1,16 +1,4 @@
-# ============================================
-# SalesRouter - Requisitos Globais (Root)
-# ============================================
-# Este arquivo é usado por todos os serviços Docker
-# Estrutura de microserviços:
-# - authentication_service
-# - api_gateway
-# - clusterization_service
-# - routing_service
-# - transfer_routing_service
-# - costs_services
-# - pdv_preprocessing_service
-# ============================================
+#requirements
 
 
 # ===== Core =====
@@ -55,3 +43,8 @@ scikit-learn
 numpy
 pandas
 geopy
+
+# ===== Routing e Distância (Sales Routing) =====
+networkx==3.3
+ortools==9.10.4067
+shapely==2.0.4

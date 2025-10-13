@@ -97,6 +97,26 @@ services:
       - sales_router_net
     restart: always
 
+  # ======================
+  # Roteirização de Vendas (Sales Routing)
+  # ======================
+  sales_routing:
+    build:
+      context: .
+      dockerfile: ./src/sales_routing/Dockerfile.routing
+    container_name: sales_routing
+    env_file:
+      - .env
+    depends_on:
+      - sales_router_db
+      - redis
+    volumes:
+      - ./src/sales_routing:/app/src/sales_routing
+      - ./src/database:/app/src/database
+      - ./src/cli:/app/src/cli
+    networks:
+      - sales_router_net
+    restart: always
 
   # ======================
   # Banco de Dados (PostgreSQL + PostGIS)
