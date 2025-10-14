@@ -89,14 +89,16 @@ services:
     depends_on:
       - sales_router_db
       - redis
+    user: "${UID:-1000}:${GID:-1000}"      # 👈 adicionado
     volumes:
       - ./src/sales_clusterization:/app/src/sales_clusterization
       - ./src/database:/app/src/database
       - ./data:/app/data
-      - ./output:/app/output     
+      - ./output:/app/output
     networks:
       - sales_router_net
     restart: always
+
 
   # ======================
   # Roteirização de Vendas (Sales Routing)
@@ -111,6 +113,7 @@ services:
     depends_on:
       - sales_router_db
       - redis
+    user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - ./src/sales_routing:/app/src/sales_routing
       - ./src/database:/app/src/database

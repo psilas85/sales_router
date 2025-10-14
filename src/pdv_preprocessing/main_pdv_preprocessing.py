@@ -1,5 +1,3 @@
-# src/pdv_preprocessing/main_pdv_preprocessing.py
-
 import os
 import argparse
 import logging
@@ -14,34 +12,25 @@ from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
 from database.db_connection import get_connection
 
 
-# ------------------------------------------------------------
-# Configuração de logging e ambiente
-# ------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 load_dotenv()
 
 
 def detectar_separador(path: str) -> str:
-    """Detecta automaticamente o separador CSV (',' ou ';')."""
     with open(path, "r", encoding="utf-8-sig") as f:
         linha = f.readline()
         return ";" if ";" in linha else ","
 
 
 def salvar_invalidos(df_invalidos, pasta_base: str, job_id: str):
-    """Salva registros inválidos em CSV na pasta /data/invalidos/."""
     try:
         if df_invalidos is None or df_invalidos.empty:
             return None
-
         pasta_invalidos = os.path.join(pasta_base, "invalidos")
         os.makedirs(pasta_invalidos, exist_ok=True)
-
         nome_arquivo = f"pdvs_invalidos_{job_id}.csv"
         caminho_saida = os.path.join(pasta_invalidos, nome_arquivo)
-
         df_invalidos.to_csv(caminho_saida, index=False, sep=";", encoding="utf-8-sig")
-
         logging.warning(f"⚠️ {len(df_invalidos)} registro(s) inválido(s) salvo(s) em: {caminho_saida}")
         return caminho_saida
     except Exception as e:
@@ -50,18 +39,16 @@ def salvar_invalidos(df_invalidos, pasta_base: str, job_id: str):
 
 
 def main():
-    # ------------------------------------------------------------
-    # Argumentos CLI
-    # ------------------------------------------------------------
-    parser = argparse.ArgumentParser(description="Pré-processamento de PDVs (SalesRouter)")
-    parser.add_argument("--tenant", help="Tenant ID (ou usa TENANT_ID do .env)")
+    parser = argparse.ArgumentParser(description="Pré-processamento de PDVs (SalesRouter multi-tenant)")
+    parser.add_argument("--tenant", required=True, help="Tenant ID (inteiro ou variável TENANT_ID do .env)")
     parser.add_argument("--arquivo", required=True, help="Caminho do CSV de entrada (ex: /app/data/pdvs_enderecos.csv)")
-    parser.add_argument("--modo_forcar", action="store_true", help="Força reprocessamento mesmo se já existir cache")
+    parser.add_argument("--modo_forcar", action="store_true", help="Força reprocessamento e limpa PDVs anteriores")
     args = parser.parse_args()
 
-    tenant_id = args.tenant or os.getenv("TENANT_ID")
-    if not tenant_id:
-        logging.error("❌ Tenant ID não informado via argumento ou variável de ambiente TENANT_ID.")
+    try:
+        tenant_id = int(args.tenant or os.getenv("TENANT_ID"))
+    except (TypeError, ValueError):
+        logging.error("❌ Tenant ID inválido ou ausente. Informe um número inteiro.")
         return
 
     input_path = args.arquivo
@@ -73,12 +60,9 @@ def main():
     job_id = str(uuid.uuid4())
     inicio_execucao = time.time()
 
-    logging.info(f"🚀 Iniciando pré-processamento de PDVs - Job {job_id}")
+    logging.info(f"🚀 Iniciando pré-processamento de PDVs (tenant_id={tenant_id}) - Job {job_id}")
     logging.info(f"📂 Lendo arquivo de entrada: {input_path} | Separador detectado: '{sep}'")
 
-    # ------------------------------------------------------------
-    # Conexão com o banco
-    # ------------------------------------------------------------
     try:
         conn = get_connection()
         db_reader = DatabaseReader(conn)
@@ -87,9 +71,20 @@ def main():
         logging.error(f"❌ Falha ao conectar ao banco de dados: {e}")
         return
 
-    # ------------------------------------------------------------
-    # Execução do pipeline
-    # ------------------------------------------------------------
+    # ============================================================
+    # 🧹 LIMPEZA AUTOMÁTICA SE modo_forcar = True
+    # ============================================================
+    if args.modo_forcar:
+        logging.warning(f"🧹 Modo forçar ativado — limpando PDVs existentes do tenant_id={tenant_id} ...")
+        try:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM pdvs WHERE tenant_id = %s;", (tenant_id,))
+                conn.commit()
+            logging.info(f"✅ Todos os PDVs anteriores do tenant_id={tenant_id} foram removidos.")
+        except Exception as e:
+            logging.error(f"❌ Erro ao limpar PDVs do tenant_id={tenant_id}: {e}")
+            return
+
     try:
         use_case = PDVPreprocessingUseCase(db_reader, db_writer, tenant_id)
         df_validos, df_invalidos = use_case.execute(input_path, sep)
@@ -97,22 +92,28 @@ def main():
         total_validos = len(df_validos) if df_validos is not None else 0
         total_invalidos = len(df_invalidos) if df_invalidos is not None else 0
         total = total_validos + total_invalidos
-
-        # ------------------------------------------------------------
-        # Salva inválidos (se houver)
-        # ------------------------------------------------------------
         arquivo_invalidos = salvar_invalidos(df_invalidos, os.path.dirname(input_path), job_id)
 
         duracao = time.time() - inicio_execucao
         logging.info(f"✅ Processamento concluído com {total_validos} PDVs válidos.")
-        logging.info(f"💾 Dados gravados no banco com sucesso.")
+        logging.info(f"💾 Dados gravados no banco para tenant_id={tenant_id}.")
         logging.info(f"⏱️ Duração total: {duracao:.2f}s")
-        logging.info("🏁 Fim do processamento.")
 
-        # ------------------------------------------------------------
-        # 📊 Saída JSON para integração via API Gateway
-        # ------------------------------------------------------------
+        # ============================================================
+        # 📊 CONTAGEM FINAL DE PDVS NO BANCO
+        # ============================================================
+        try:
+            with get_connection() as conn_final:
+                with conn_final.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM pdvs WHERE tenant_id = %s;", (tenant_id,))
+                    total_final = cur.fetchone()[0]
+            logging.info(f"💾 Total final no banco para tenant_id={tenant_id}: {total_final} PDVs.")
+        except Exception as e:
+            logging.error(f"❌ Erro ao consultar total final de PDVs: {e}")
+            total_final = None
+
         print(json.dumps({
+            "status": "done",
             "job_id": job_id,
             "tenant_id": tenant_id,
             "arquivo": os.path.basename(input_path),
@@ -121,11 +122,11 @@ def main():
             "invalidos": total_invalidos,
             "arquivo_invalidos": arquivo_invalidos,
             "duracao_segundos": round(duracao, 2),
-            "status": "done"
+            "total_final_banco": total_final
         }))
 
     except Exception as e:
-        logging.error(f"❌ Erro inesperado durante o pré-processamento: {e}", exc_info=True)
+        logging.error(f"❌ Erro inesperado: {e}", exc_info=True)
         print(json.dumps({
             "status": "error",
             "erro": str(e),

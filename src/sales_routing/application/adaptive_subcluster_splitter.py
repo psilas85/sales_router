@@ -4,6 +4,7 @@ import math
 import numpy as np
 from sklearn.cluster import KMeans
 from typing import List, Dict, Any
+from loguru import logger
 from src.sales_routing.domain.entities.cluster_data_entity import ClusterData, PDVData
 from src.sales_routing.application.route_optimizer import RouteOptimizer
 
@@ -59,12 +60,21 @@ def dividir_cluster_em_subclusters(
             # Calcula rota otimizada
             rota = optimizer.calcular_rota(centro, pdvs_dict, aplicar_two_opt)
 
+            # Log detalhado da rota
+            logger.debug(
+                f"📍 Cluster {cluster.cluster_id} / Subcluster {subcluster_id + 1} "
+                f"→ {len(pdvs_sub)} PDVs, {len(rota.get('rota_coord', []))} pontos de rota, "
+                f"{rota['distancia_total_km']:.2f} km / {rota['tempo_total_min']:.1f} min"
+            )
+
+            # Adiciona subcluster completo (agora incluindo rota_coord)
             subclusters.append({
                 "subcluster_id": subcluster_id + 1,
                 "n_pdvs": len(pdvs_sub),
                 "tempo_total_min": rota["tempo_total_min"],
                 "dist_total_km": rota["distancia_total_km"],
                 "pdvs": rota["sequencia"],
+                "rota_coord": rota.get("rota_coord", []),   # ✅ incluído campo de rota real
             })
 
             max_tempo = max(max_tempo, rota["tempo_total_min"])
@@ -72,16 +82,23 @@ def dividir_cluster_em_subclusters(
 
         resultados_iter.append((k, max_tempo, max_dist))
 
+        # Critério de convergência
         if max_tempo <= workday_min and max_dist <= route_km_max:
             convergiu = True
         else:
             k += 1
             if k > len(pdvs_cluster):
-                print(f"⚠️ Cluster {cluster.cluster_id}: não convergiu — limite de PDVs atingido ({len(pdvs_cluster)}).")
+                logger.warning(
+                    f"⚠️ Cluster {cluster.cluster_id}: não convergiu — limite de PDVs atingido ({len(pdvs_cluster)})."
+                )
                 break
 
-    print(f"  ✅ K_final={k}, MáxTempo={max_tempo:.1f} min, MáxDist={max_dist:.1f} km")
-    print(f"  🧩 Iterações: {[f'K={k_},T={t:.1f}m,D={d:.1f}km' for k_, t, d in resultados_iter]}")
+    logger.info(
+        f"✅ Cluster {cluster.cluster_id}: K_final={k}, MáxTempo={max_tempo:.1f} min, MáxDist={max_dist:.1f} km"
+    )
+    logger.debug(
+        f"🧩 Iterações: {[f'K={k_},T={t:.1f}m,D={d:.1f}km' for k_, t, d in resultados_iter]}"
+    )
 
     return {
         "cluster_id": cluster.cluster_id,
@@ -115,7 +132,7 @@ def gerar_subclusters_adaptativo(
         if not pdvs_cluster:
             continue
 
-        print(f"\n🧭 Cluster {cluster.cluster_id} → {len(pdvs_cluster)} PDVs")
+        logger.info(f"\n🧭 Cluster {cluster.cluster_id} → {len(pdvs_cluster)} PDVs")
         resultado = dividir_cluster_em_subclusters(
             cluster,
             pdvs_cluster,

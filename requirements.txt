@@ -34,6 +34,7 @@ loguru==0.7.2
 
 # ===== Utilidades adicionais =====
 pytz==2024.1
+loguru
 
 # Sales Clusterization - Requisitos específicos
 fastapi
@@ -45,6 +46,7 @@ pandas
 geopy
 
 # ===== Routing e Distância (Sales Routing) =====
+matplotlib==3.9.2
 networkx==3.3
 ortools==9.10.4067
 shapely==2.0.4

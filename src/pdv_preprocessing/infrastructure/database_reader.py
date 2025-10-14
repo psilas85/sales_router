@@ -102,3 +102,13 @@ class DatabaseReader:
         except Exception as e:
             logging.warning(f"⚠️ [PDV_DB] Erro ao listar PDVs do tenant {tenant_id}: {e}")
             return pd.DataFrame()
+
+    def buscar_cnpjs_existentes(self, tenant_id: int) -> list[str]:
+        """
+        Retorna todos os CNPJs já cadastrados para o tenant no banco.
+        """
+        cur = self.conn.cursor()
+        cur.execute("SELECT cnpj FROM pdvs WHERE tenant_id = %s;", (tenant_id,))
+        cnpjs = [row[0] for row in cur.fetchall()]
+        cur.close()
+        return cnpjs

@@ -1,4 +1,4 @@
-# sales_router/src/cli/list_snapshots.py
+# sales_router/src/sales_routing/cli/list_snapshots.py
 
 import argparse
 from loguru import logger
