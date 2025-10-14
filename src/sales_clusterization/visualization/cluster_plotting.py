@@ -2,68 +2,71 @@
 
 import folium
 import argparse
+import webbrowser
 from pathlib import Path
 from loguru import logger
 from src.database.db_connection import get_connection
 
 
 # =========================================================
-# 1. BUSCAS DE DADOS
+# 1️⃣ BUSCAS DE DADOS
 # =========================================================
 
-def buscar_clusters(run_id: int):
+def buscar_clusters(tenant_id: int, run_id: int):
     """
-    Busca clusters (setores) e seus PDVs vinculados.
+    Busca clusters (setores) e seus PDVs vinculados ao tenant e run_id.
     """
     sql = """
         SELECT cs.cluster_label, cs.centro_lat, cs.centro_lon,
                csp.lat, csp.lon, csp.cidade, csp.uf
         FROM cluster_setor cs
         JOIN cluster_setor_pdv csp ON csp.cluster_id = cs.id
-        WHERE cs.run_id = %s;
+        WHERE cs.run_id = %s AND cs.tenant_id = %s AND csp.tenant_id = %s;
     """
     conn = get_connection()
     with conn.cursor() as cur:
-        cur.execute(sql, (run_id,))
+        cur.execute(sql, (run_id, tenant_id, tenant_id))
         rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def buscar_ultimo_run():
+def buscar_ultimo_run(tenant_id: int):
     """
-    Busca o último run finalizado na tabela cluster_run.
+    Busca o último run finalizado do tenant informado.
     """
     sql = """
         SELECT id FROM cluster_run
-        WHERE status = 'done'
+        WHERE tenant_id = %s AND status = 'done'
         ORDER BY finished_at DESC
         LIMIT 1;
     """
     conn = get_connection()
     with conn.cursor() as cur:
-        cur.execute(sql)
+        cur.execute(sql, (tenant_id,))
         row = cur.fetchone()
     conn.close()
     return row[0] if row else None
 
 
 # =========================================================
-# 2. FUNÇÃO DE PLOTAGEM
+# 2️⃣ FUNÇÃO DE PLOTAGEM
 # =========================================================
 
 def gerar_mapa_clusters(dados, output_path: Path):
     """
     Gera mapa HTML com clusters (macrosetores) e PDVs, colorindo por cluster_label.
     """
-    if output_path.exists():
-        output_path.unlink()  # sempre sobrescreve
-
     if not dados:
         logger.warning("❌ Nenhum dado de clusterização encontrado.")
         return
 
-    m = folium.Map(location=[-3.73, -38.52], zoom_start=10)  # Centraliza em Fortaleza
+    # Centraliza o mapa com base nos PDVs
+    latitudes = [row[3] for row in dados if row[3]]
+    longitudes = [row[4] for row in dados if row[4]]
+    lat_centro = sum(latitudes) / len(latitudes) if latitudes else -3.73
+    lon_centro = sum(longitudes) / len(longitudes) if longitudes else -38.52
+    m = folium.Map(location=[lat_centro, lon_centro], zoom_start=9)
 
     # Agrupar por cluster_label
     clusters = {}
@@ -72,7 +75,7 @@ def gerar_mapa_clusters(dados, output_path: Path):
         clusters.setdefault(label, {"pdvs": [], "centro": (centro_lat, centro_lon)})
         clusters[label]["pdvs"].append((lat, lon, cidade, uf))
 
-    # Gerar cores fixas e legíveis
+    # Paleta de cores legível
     import random
     random.seed(42)
     palette = [
@@ -84,7 +87,7 @@ def gerar_mapa_clusters(dados, output_path: Path):
         cor = palette[i % len(palette)]
         centro_lat, centro_lon = info["centro"]
 
-        # Centro do cluster
+        # Marcador do centro
         folium.Marker(
             location=(centro_lat, centro_lon),
             icon=folium.Icon(color="blue", icon="home"),
@@ -102,58 +105,64 @@ def gerar_mapa_clusters(dados, output_path: Path):
                 popup=f"Cluster {label} - {cidade}/{uf}"
             ).add_to(m)
 
-    # Adiciona legenda simples
+    # Legenda
     legend_html = """
     <div style="
-        position: fixed; 
-        bottom: 50px; left: 50px; width: 180px; height: auto; 
+        position: fixed; bottom: 50px; left: 50px; width: 180px;
         z-index:9999; font-size:14px; background-color:white;
         border:2px solid grey; border-radius:8px; padding:10px;">
-        <b>Clusters</b><br>
-        {}
+        <b>Clusters</b><br>{}
     </div>
-    """.format("<br>".join([f"<span style='color:{palette[i % len(palette)]}'>●</span> Cluster {label}"
-                            for i, label in enumerate(sorted(clusters.keys()))]))
+    """.format("<br>".join([
+        f"<span style='color:{palette[i % len(palette)]}'>●</span> Cluster {label}"
+        for i, label in enumerate(sorted(clusters.keys()))
+    ]))
 
     m.get_root().html.add_child(folium.Element(legend_html))
+
+    # 🔁 Sempre sobrescreve o arquivo existente
+    if output_path.exists():
+        output_path.unlink()
+
     m.save(output_path)
     logger.success(f"✅ Mapa de clusterização salvo em {output_path}")
 
 
-
 # =========================================================
-# 3. MAIN CLI
+# 3️⃣ MAIN CLI
 # =========================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Gerar mapa de clusterização de PDVs")
+    parser = argparse.ArgumentParser(description="Gerar mapa de clusterização de PDVs (multi-tenant)")
     parser.add_argument("--tenant_id", type=int, required=True, help="ID do tenant")
-    parser.add_argument("--run_id", type=int, help="ID da execução de clusterização (opcional)")
+    parser.add_argument("--run_id", type=int, help="ID da execução (opcional, busca último se omitido)")
+    parser.add_argument("--modo_interativo", action="store_true", help="Abre o mapa no navegador (somente fora do Docker)")
     args = parser.parse_args()
 
-    run_id = args.run_id or buscar_ultimo_run()
+    run_id = args.run_id or buscar_ultimo_run(args.tenant_id)
     if not run_id:
-        logger.error("❌ Nenhum run_id encontrado (nenhuma execução finalizada).")
+        logger.error(f"❌ Nenhum run_id encontrado para tenant_id={args.tenant_id}.")
         return
 
-    logger.info(f"🗺️ Gerando mapa de clusterização para run_id={run_id} ...")
+    logger.info(f"🗺️ Gerando mapa de clusterização | tenant_id={args.tenant_id} | run_id={run_id}")
 
     output_dir = Path(f"output/maps/{args.tenant_id}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 🔁 Arquivo fixo para sobrescrever sempre o último mapa
+    # 🧩 Sobrescreve sempre o mesmo nome de arquivo
     mapa_html = output_dir / "clusterization_atual.html"
 
-    # Opcional: remover todos os anteriores para manter a pasta limpa
-    for antigo in output_dir.glob("clusterization_*.html"):
-        try:
-            antigo.unlink()
-        except Exception as e:
-            logger.warning(f"Não foi possível remover {antigo}: {e}")
-
-    dados = buscar_clusters(run_id)
+    dados = buscar_clusters(args.tenant_id, run_id)
     gerar_mapa_clusters(dados, mapa_html)
 
+    # 🌐 Abre automaticamente (funciona apenas fora do container)
+    if args.modo_interativo:
+        if "DISPLAY" not in str(Path.home()):  # simples proteção contra ambiente sem GUI
+            logger.info(f"🌐 Mapa disponível em: {mapa_html.resolve()}")
+        try:
+            webbrowser.open_new_tab(mapa_html.resolve().as_uri())
+        except Exception as e:
+            logger.warning(f"⚠️ Não foi possível abrir o navegador automaticamente: {e}")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-# sales_router/src/cli/restore_snapshot.py
+#sales_router/src/sales_routing/cli/restore_snapshot.py
 
 import argparse
 from loguru import logger
@@ -33,7 +33,7 @@ def main():
         return
 
     # Sobrescreve dados operacionais
-    db_writer.restore_snapshot_operacional(args.tenant, subclusters, pdvs)
+    db_writer.restore_snapshot_operacional(args.tenant, subclusters, pdvs, run_id=0)
 
     logger.success(f"✅ Snapshot '{args.nome}' restaurado com sucesso para modo operacional.")
     db_reader.close()
