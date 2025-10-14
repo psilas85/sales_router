@@ -20,7 +20,8 @@ class SalesRoutingDatabaseWriter:
     def salvar_operacional(self, resultados, tenant_id: int, run_id: int):
         """
         Substitui a simulação operacional atual do tenant (última execução).
-        Inclui gravação do campo rota_coord com rota real via OSRM (multi-stop).
+        Inclui gravação do campo rota_coord com rota real via OSRM (multi-stop),
+        ajustando o tempo total com tempos de parada e descarregamento.
         """
         from src.sales_routing.application.route_distance_service import RouteDistanceService
 
@@ -37,7 +38,7 @@ class SalesRoutingDatabaseWriter:
             subcluster_rows = []
             pdv_rows = []
 
-            # 🔹 Instancia o serviço de cálculo de rota (OSRM)
+            # Instancia o serviço de cálculo de rota (OSRM)
             distance_service = RouteDistanceService()
 
             for r in resultados:
@@ -54,17 +55,36 @@ class SalesRoutingDatabaseWriter:
                     ]
 
                     # ============================================================
-                    # 2️⃣ Calcula rota completa via OSRM (todas as entregas)
+                    # 2️⃣ Calcula rota completa via OSRM
                     # ============================================================
                     try:
                         rota_final = distance_service.get_full_route(pdv_coords)
                         rota_coord = rota_final["rota_coord"]
                         dist_km = rota_final["distancia_km"]
                         tempo_min = rota_final["tempo_min"]
+
+                        # ============================================================
+                        # 3️⃣ Ajusta tempo com paradas e descarregamento
+                        # ============================================================
+                        n_pdvs = sub["n_pdvs"]
+                        peso_total = sum(p.get("cte_peso", 0) or 0 for p in sub["pdvs"])
+                        volumes_total = sum(p.get("cte_volumes", 0) or 0 for p in sub["pdvs"])
+
+                        # Tempo de parada por PDV
+                        if peso_total > 200:
+                            tempo_min += n_pdvs * 20  # minutos
+                        else:
+                            tempo_min += n_pdvs * 10
+
+                        # Tempo de descarregamento por volume
+                        tempo_min += volumes_total * 0.4
+
                         logger.debug(
                             f"🗺️ Cluster {cluster_id} / Sub {sub['subcluster_id']}: "
-                            f"{len(rota_coord)} pts / {dist_km:.2f} km / {tempo_min:.1f} min"
+                            f"{len(rota_coord)} pts / {dist_km:.2f} km / {tempo_min:.1f} min "
+                            f"(ajustado com {n_pdvs} PDVs, {peso_total:.1f} kg, {volumes_total} vol)"
                         )
+
                     except Exception as e:
                         # fallback mínimo
                         logger.warning(f"⚠️ Falha ao gerar rota OSRM completa: {e}")
@@ -75,7 +95,7 @@ class SalesRoutingDatabaseWriter:
                     rota_coord_json = json.dumps(rota_coord, ensure_ascii=False)
 
                     # ============================================================
-                    # 3️⃣ Adiciona registro do subcluster
+                    # 4️⃣ Adiciona registro do subcluster
                     # ============================================================
                     subcluster_rows.append((
                         tenant_id,
@@ -91,7 +111,7 @@ class SalesRoutingDatabaseWriter:
                     ))
 
                     # ============================================================
-                    # 4️⃣ Adiciona PDVs da rota (em ordem)
+                    # 5️⃣ Adiciona PDVs da rota (em ordem)
                     # ============================================================
                     for seq, pdv in enumerate(sub["pdvs"], start=1):
                         pdv_rows.append((
@@ -106,9 +126,9 @@ class SalesRoutingDatabaseWriter:
                             datetime.now()
                         ))
 
-            # ---------------------------------------------------------
-            # 5️⃣ Inserções em batch
-            # ---------------------------------------------------------
+            # ============================================================
+            # 6️⃣ Inserções em batch
+            # ============================================================
             if subcluster_rows:
                 execute_values(cur, """
                     INSERT INTO sales_subcluster (
@@ -141,9 +161,8 @@ class SalesRoutingDatabaseWriter:
             cur.close()
             conn.close()
 
-
     # =========================================================
-    # 2. Cria snapshot / carteira nomeada
+    # 2️⃣ Cria snapshot / carteira nomeada
     # =========================================================
     def salvar_snapshot(self, resultados, tenant_id, nome, descricao, criado_por=None, tags=None):
         conn = get_connection()
@@ -219,7 +238,6 @@ class SalesRoutingDatabaseWriter:
         finally:
             cur.close()
             conn.close()
-
     # =========================================================
     # 3. Excluir snapshot
     # =========================================================

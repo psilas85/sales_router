@@ -8,8 +8,9 @@ FROM psilas85/sales_router-base:latest
 # Define o diretório de trabalho principal
 WORKDIR /app
 
-# Copia o módulo PDV completo
-COPY ./src/pdv_preprocessing /app/src/pdv_preprocessing
+# Copia todo o diretório src (inclui database, pdv_preprocessing, etc.)
+COPY ./src /app/src
+
 
 # Copia dependências globais e instala (a maioria já na base)
 COPY ./requirements.txt /app/requirements.txt

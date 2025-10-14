@@ -107,34 +107,46 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
         attr="© OpenStreetMap contributors"
     )
 
+    # ============================================================
+    # Cores e legenda por rota (subcluster)
+    # ============================================================
     random.seed(42)
     cores = [f"#{random.randint(0, 0xFFFFFF):06x}" for _ in range(len(rotas))]
 
-    # Legenda (estilo HubRouter)
+    # Mapeia cada rota (Cluster/Sub) → cor
+    legenda_rotas = {}
+    for idx, (rota_id) in enumerate(rotas.keys()):
+        cluster_id, sub_seq = rota_id
+        cor = cores[idx % len(cores)]
+        legenda_rotas[f"Cluster {cluster_id} / Sub {sub_seq}"] = cor
+
+    # === Legenda HTML por rota (subcluster) ===
     legenda_html = """
     {% macro html(this, kwargs) %}
     <div style="
         position: fixed;
         bottom: 40px;
         right: 40px;
-        z-index:9999;
+        z-index: 9999;
         background-color: white;
         padding: 10px;
-        border:2px solid grey;
-        border-radius:6px;
+        border: 2px solid grey;
+        border-radius: 6px;
         box-shadow: 2px 2px 6px rgba(0,0,0,0.3);
-        ">
-    <h4 style="margin-top: 0;">Legenda - Clusters</h4>
+    ">
+    <h4 style="margin-top: 0;">Legenda - Rotas</h4>
     <ul style="list-style: none; padding: 0; margin: 0;">
     """
-    for (cluster_id, _), cor in zip(rotas.keys(), cores):
+
+    for nome, cor in legenda_rotas.items():
         legenda_html += f"""
         <li>
             <span style="background:{cor};width:12px;height:12px;display:inline-block;
             border-radius:50%;margin-right:6px;border:1px solid black;"></span>
-            Cluster {cluster_id}
+            {nome}
         </li>
         """
+
     legenda_html += """
     </ul>
     </div>
@@ -144,6 +156,7 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
     legenda = MacroElement()
     legenda._template = Template(legenda_html)
     mapa.get_root().add_child(legenda)
+
 
     # === Desenha rotas ===
     for idx, ((cluster_id, sub_seq), info) in enumerate(rotas.items()):

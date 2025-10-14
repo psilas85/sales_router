@@ -3,6 +3,7 @@
 import argparse
 from datetime import datetime
 from loguru import logger
+from src.database.cleanup_service import limpar_dados_operacionais
 from src.sales_routing.infrastructure.database_reader import SalesRoutingDatabaseReader
 from src.sales_routing.infrastructure.database_writer import SalesRoutingDatabaseWriter
 from src.sales_routing.application.adaptive_subcluster_splitter import gerar_subclusters_adaptativo
@@ -38,10 +39,24 @@ def main():
     parser.add_argument("--salvar", type=str, help="Nome da carteira/snapshot (opcional)")
     parser.add_argument("--descricao", type=str, help="Descrição da carteira (opcional)")
     parser.add_argument("--usuario", type=str, default="cli", help="Usuário responsável pela execução")
-    parser.add_argument("--tenant", type=int, default=1, help="Tenant ID (padrão = 1)")
+    parser.add_argument("--tenant", type=int, required=True, help="Tenant ID (obrigatório)")
 
     args = parser.parse_args()
+    tenant_id = args.tenant
 
+    # ======================================================
+    # 🧹 LIMPEZA AUTOMÁTICA DE SIMULAÇÕES OPERACIONAIS
+    # ======================================================
+    logger.info(f"🧹 Limpando simulações operacionais do tenant_id={tenant_id} antes da nova roteirização...")
+    try:
+        limpar_dados_operacionais("routing", tenant_id=tenant_id)
+    except Exception as e:
+        logger.error(f"❌ Falha na limpeza automática: {e}")
+        return
+
+    # ======================================================
+    # 🔧 Inicialização dos serviços de banco de dados
+    # ======================================================
     db_reader = SalesRoutingDatabaseReader()
     db_writer = SalesRoutingDatabaseWriter()
 
@@ -49,8 +64,8 @@ def main():
     # 1️⃣ LISTAR SNAPSHOTS
     # ======================================================
     if args.listar:
-        logger.info(f"📂 Listando snapshots para tenant={args.tenant}...")
-        snapshots = db_reader.list_snapshots(args.tenant, args.uf, args.cidade)
+        logger.info(f"📂 Listando snapshots para tenant={tenant_id}...")
+        snapshots = db_reader.list_snapshots(tenant_id, args.uf, args.cidade)
         if not snapshots:
             print("❌ Nenhum snapshot encontrado.")
         else:
@@ -70,8 +85,8 @@ def main():
     # ======================================================
     if args.restaurar:
         nome = args.restaurar.strip()
-        logger.info(f"🔍 Buscando snapshot '{nome}' para tenant {args.tenant}...")
-        snapshot = db_reader.get_snapshot_by_name(args.tenant, nome)
+        logger.info(f"🔍 Buscando snapshot '{nome}' para tenant {tenant_id}...")
+        snapshot = db_reader.get_snapshot_by_name(tenant_id, nome)
 
         if not snapshot:
             print(f"❌ Nenhum snapshot encontrado com nome '{nome}'.")
@@ -86,8 +101,8 @@ def main():
             db_reader.close()
             return
 
-        db_writer.restore_snapshot_operacional(args.tenant, subclusters, pdvs)
-        logger.success(f"✅ Snapshot '{nome}' restaurado com sucesso para tenant {args.tenant}")
+        db_writer.restore_snapshot_operacional(tenant_id, subclusters, pdvs)
+        logger.success(f"✅ Snapshot '{nome}' restaurado com sucesso para tenant {tenant_id}")
         db_reader.close()
         return
 
@@ -96,8 +111,8 @@ def main():
     # ======================================================
     if args.excluir:
         nome = args.excluir.strip()
-        logger.info(f"🗑️ Solicitada exclusão do snapshot '{nome}' (tenant {args.tenant})...")
-        snapshot = db_reader.get_snapshot_by_name(args.tenant, nome)
+        logger.info(f"🗑️ Solicitada exclusão do snapshot '{nome}' (tenant {tenant_id})...")
+        snapshot = db_reader.get_snapshot_by_name(tenant_id, nome)
 
         if not snapshot:
             print(f"❌ Nenhum snapshot encontrado com nome '{nome}'.")
@@ -116,7 +131,7 @@ def main():
         return
 
     # ======================================================
-    # 4️⃣ EXECUTAR NOVA SIMULAÇÃO
+    # 4️⃣ EXECUTAR NOVA SIMULAÇÃO DE ROTAS
     # ======================================================
     if not args.uf or not args.cidade:
         print("❌ É necessário informar --uf e --cidade para executar uma simulação.")
@@ -131,7 +146,6 @@ def main():
         print(f"❌ Nenhum run concluído encontrado para {args.cidade}/{args.uf}.")
         return
 
-    tenant_id = args.tenant
     run_id = run["id"]
 
     print(f"✅ Run encontrado: ID={run_id} (K={run['k_final']})")
