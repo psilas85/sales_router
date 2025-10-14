@@ -49,14 +49,16 @@ class SalesRoutingDatabaseWriter:
                         datetime.now()
                     ))
 
-                    for seq, pdv_id in enumerate(sub["pdvs"], start=1):
+                    for seq, pdv in enumerate(sub["pdvs"], start=1):
                         pdv_rows.append((
                             tenant_id,
                             run_id,
                             cluster_id,
                             sub["subcluster_id"],
-                            pdv_id,
+                            pdv["pdv_id"],
                             seq,
+                            pdv["lat"],
+                            pdv["lon"],
                             datetime.now()
                         ))
 
@@ -72,9 +74,10 @@ class SalesRoutingDatabaseWriter:
                 execute_values(cur, """
                     INSERT INTO sales_subcluster_pdv (
                         tenant_id, run_id, cluster_id, subcluster_seq,
-                        pdv_id, sequencia_ordem, criado_em
+                        pdv_id, sequencia_ordem, lat, lon, criado_em
                     ) VALUES %s
                 """, pdv_rows)
+
 
             conn.commit()
             logger.success(f"✅ Simulação operacional salva com sucesso para tenant {tenant_id}")
@@ -127,14 +130,23 @@ class SalesRoutingDatabaseWriter:
                         sub["tempo_total_min"], sub["dist_total_km"], sub["n_pdvs"]))
 
                     # Salva PDVs do subcluster
-                    for ordem, pid in enumerate(sub["pdvs"], start=1):
+                    for ordem, p in enumerate(sub["pdvs"], start=1):
                         cur.execute("""
                             INSERT INTO sales_routing_snapshot_pdv (
                                 snapshot_id, cluster_id, subcluster_seq,
-                                pdv_id, sequencia_ordem
+                                pdv_id, sequencia_ordem, lat, lon
                             )
-                            VALUES (%s, %s, %s, %s, %s);
-                        """, (snapshot_id, r["cluster_id"], sub["subcluster_id"], pid, ordem))
+                            VALUES (%s, %s, %s, %s, %s, %s, %s);
+                        """, (
+                            snapshot_id,
+                            r["cluster_id"],
+                            sub["subcluster_id"],
+                            p["pdv_id"],
+                            ordem,
+                            p["lat"],
+                            p["lon"]
+                        ))
+
 
             conn.commit()
             logger.success(f"✅ Snapshot '{nome}' salvo com sucesso (ID={snapshot_id})")

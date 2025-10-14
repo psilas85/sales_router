@@ -48,3 +48,4 @@ geopy
 networkx==3.3
 ortools==9.10.4067
 shapely==2.0.4
+folium==0.17.0
