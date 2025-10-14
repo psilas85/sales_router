@@ -1,3 +1,4 @@
+#sales_router/src/pdv_preprocessing/main_pdv_preprocessing.py
 import os
 import argparse
 import logging
@@ -10,7 +11,7 @@ from pdv_preprocessing.application.pdv_preprocessing_use_case import PDVPreproce
 from pdv_preprocessing.infrastructure.database_reader import DatabaseReader
 from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
 from database.db_connection import get_connection
-
+from src.database.cleanup_service import limpar_dados_operacionais
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 load_dotenv()
@@ -49,6 +50,16 @@ def main():
         tenant_id = int(args.tenant or os.getenv("TENANT_ID"))
     except (TypeError, ValueError):
         logging.error("❌ Tenant ID inválido ou ausente. Informe um número inteiro.")
+        return
+
+    # ============================================================
+    # 🧹 LIMPEZA AUTOMÁTICA DE SIMULAÇÕES (sempre que há novo preprocessing)
+    # ============================================================
+    logging.info(f"🧹 Limpando simulações operacionais do tenant_id={tenant_id} antes do novo pré-processamento...")
+    try:
+        limpar_dados_operacionais("preprocessing", tenant_id=tenant_id)
+    except Exception as e:
+        logging.error(f"❌ Falha na limpeza automática: {e}")
         return
 
     input_path = args.arquivo

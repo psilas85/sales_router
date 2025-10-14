@@ -1,7 +1,8 @@
-# src/sales_clusterization/cli/run_cluster.py
+#sales_router/src/sales_clusterization/cli/run_cluster.py
 
 import argparse
 from loguru import logger
+from src.database.cleanup_service import limpar_dados_operacionais
 from src.sales_clusterization.application.cluster_use_case import executar_clusterizacao
 
 
@@ -27,6 +28,12 @@ def main():
     args = parser.parse_args()
 
     logger.info(f"🚀 Iniciando clusterização para tenant_id={args.tenant_id} | {args.uf}-{args.cidade} | algoritmo={args.algo}")
+
+    # ============================================================
+    # 🧹 LIMPEZA AUTOMÁTICA DE SIMULAÇÕES OPERACIONAIS
+    # ============================================================
+    limpar_dados_operacionais("clusterization", tenant_id=args.tenant_id)
+
 
     # =============================
     # Execução principal
