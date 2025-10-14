@@ -114,7 +114,7 @@ class PDVPreprocessingUseCase:
         df = df[colunas_presentes].copy()
         return df
 
-    # ============================================================
+        # ============================================================
     # 🔹 Execução principal
     # ============================================================
     def execute(self, input_path: str, sep=";"):
@@ -126,21 +126,34 @@ class PDVPreprocessingUseCase:
         df = self.limpar_valores(df)
         df = self.filtrar_colunas(df)
 
-        # Verifica colunas obrigatórias
-        colunas_esperadas = ["cnpj", "logradouro", "numero", "bairro", "cidade", "uf", "cep"]
+        # ✅ Ajuste: 'bairro' agora é opcional
+        colunas_esperadas = ["cnpj", "logradouro", "numero", "cidade", "uf", "cep"]
         faltantes = [col for col in colunas_esperadas if col not in df.columns]
         if faltantes:
             raise ValueError(f"❌ Colunas obrigatórias ausentes: {', '.join(faltantes)}")
 
-        # Concatena endereço completo
-        df["pdv_endereco_completo"] = (
-            df["logradouro"].astype(str).str.strip() + ", " +
-            df["numero"].astype(str).str.strip() + ", " +
-            df["bairro"].astype(str).str.strip() + ", " +
-            df["cidade"].astype(str).str.strip() + " - " +
-            df["uf"].astype(str).str.strip() + ", " +
-            df["cep"].astype(str).str.strip()
-        )
+        # ℹ️ Log de auditoria sobre o campo 'bairro'
+        if "bairro" in df.columns:
+            total_sem_bairro = df["bairro"].eq("").sum()
+            logging.info(f"ℹ️ {total_sem_bairro} PDV(s) sem bairro informado.")
+        else:
+            logging.info("ℹ️ Coluna 'bairro' não presente no arquivo (tratada como opcional).")
+
+        # ============================================================
+        # 🧩 Concatenação do endereço completo (bairro opcional)
+        # ============================================================
+        def montar_endereco(row):
+            partes = [
+                f"{row['logradouro'].strip()}, {row['numero'].strip()}",
+            ]
+            # Adiciona o bairro apenas se existir e não estiver vazio
+            if 'bairro' in row and str(row['bairro']).strip():
+                partes.append(row['bairro'].strip())
+            partes.append(f"{row['cidade'].strip()} - {row['uf'].strip()}")
+            partes.append(row["cep"].strip())
+            return ", ".join(partes)
+
+        df["pdv_endereco_completo"] = df.apply(montar_endereco, axis=1)
 
         # Validação de campos obrigatórios e duplicados
         df_validos, df_invalidos = self.validator.validar_dados(df, tenant_id=self.tenant_id)

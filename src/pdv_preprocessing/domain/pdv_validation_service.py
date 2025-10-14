@@ -10,7 +10,7 @@ class PDVValidationService:
     """
     Serviço de validação de PDVs.
     - Limpa e valida CNPJ/CEP.
-    - Detecta campos obrigatórios ausentes.
+    - Detecta campos obrigatórios ausentes (exceto 'bairro', que é opcional).
     - Evita duplicados no CSV e no banco para o mesmo tenant.
     """
 
@@ -48,10 +48,19 @@ class PDVValidationService:
         Valida campos obrigatórios e duplicidades (CSV + banco).
         Retorna dois DataFrames: válidos e inválidos (com motivo).
         """
-        campos_obrigatorios = ["cnpj", "logradouro", "numero", "bairro", "cidade", "uf", "cep"]
+
+        # ⚙️ 'bairro' agora é opcional
+        campos_obrigatorios = ["cnpj", "logradouro", "numero", "cidade", "uf", "cep"]
 
         # 🔹 Normaliza strings vazias
         df[campos_obrigatorios] = df[campos_obrigatorios].replace("", np.nan)
+
+        # ℹ️ Log de auditoria: quantos PDVs estão sem bairro
+        if "bairro" in df.columns:
+            total_sem_bairro = df["bairro"].eq("").sum()
+            logging.info(f"ℹ️ [{tenant_id}] {total_sem_bairro} PDV(s) sem bairro informado.")
+        else:
+            logging.info(f"ℹ️ [{tenant_id}] Coluna 'bairro' não presente no arquivo (tratada como opcional).")
 
         # 🔹 Registros com campos obrigatórios faltando
         registros_invalidos = df[df[campos_obrigatorios].isna().any(axis=1)].copy()
