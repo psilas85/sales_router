@@ -3,27 +3,24 @@
 from geopy.distance import geodesic
 import math
 
+from src.sales_routing.application.route_distance_service import RouteDistanceService
 
 class RouteOptimizer:
-    """
-    Classe responsável por otimizar a sequência de visitas (roteirização) dentro de um subcluster.
-    Implementa heurísticas leves (Nearest Neighbor + 2-Opt opcional).
-    """
-
     def __init__(self, v_kmh: float = 40.0, service_min: int = 15, alpha_path: float = 1.3):
         self.v_kmh = v_kmh
         self.service_min = service_min
         self.alpha_path = alpha_path
+        self.distance_service = RouteDistanceService()
 
-    # -----------------------------
-    # Distância entre dois pontos
-    # -----------------------------
     def _dist_km(self, p1, p2):
-        """Calcula distância geodésica entre dois PDVs (ou centro)."""
-        return geodesic(
-            (p1["lat"], p1["lon"]),
-            (p2["lat"], p2["lon"])
-        ).km * self.alpha_path
+        """Calcula distância real entre dois PDVs (ou centro) com cache e fallback."""
+        try:
+            result = self.distance_service.get_distance_time((p1["lat"], p1["lon"]), (p2["lat"], p2["lon"]))
+            return result["distancia_km"]
+        except Exception:
+            # fallback final — Haversine puro
+            return geodesic((p1["lat"], p1["lon"]), (p2["lat"], p2["lon"])).km * self.alpha_path
+
 
     # -----------------------------
     # Cálculo de tempo de viagem (min)

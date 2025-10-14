@@ -64,7 +64,7 @@ def dividir_cluster_em_subclusters(
                 "n_pdvs": len(pdvs_sub),
                 "tempo_total_min": rota["tempo_total_min"],
                 "dist_total_km": rota["distancia_total_km"],
-                "pdvs": [p["pdv_id"] for p in rota["sequencia"]],
+                "pdvs": rota["sequencia"],
             })
 
             max_tempo = max(max_tempo, rota["tempo_total_min"])
