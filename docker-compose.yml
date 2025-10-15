@@ -174,7 +174,7 @@ services:
       - sales_router_net
     restart: always
 
-    # ======================
+  # ======================
   # OSRM - Servidor de rotas Sudeste (RJ, SP, MG, ES)
   # ======================
   osrm:
@@ -185,6 +185,71 @@ services:
       - "5000:5000"
     volumes:
       - ./osrm-data:/data
+    networks:
+      - sales_router_net
+    restart: always
+
+  # ======================
+  # Worker de Pipeline Completo (Assíncrono)
+  # ======================
+  pipeline_worker:
+    build:
+      context: .
+      dockerfile: ./src/jobs/Dockerfile.pipeline_worker
+    container_name: pipeline_worker
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - sales_router_db
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./output:/app/output
+    networks:
+      - sales_router_net
+    restart: always
+
+  # ======================
+  # Routing Jobs Worker (RQ)
+  # ======================
+  routing_jobs_worker:
+    build:
+      context: .
+      dockerfile: ./src/jobs/Dockerfile.routing_worker
+    container_name: routing_jobs_worker
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - sales_router_db
+      - sales_routing
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./output:/app/output
+    networks:
+      - sales_router_net
+    restart: always
+
+  # ======================
+  # Clusterization Jobs Worker (RQ)
+  # ======================
+  clusterization_jobs_worker:
+    build:
+      context: .
+      dockerfile: ./src/jobs/Dockerfile.clusterization_worker
+    container_name: clusterization_jobs_worker
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - sales_router_db
+      - sales_clusterization
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./output:/app/output
     networks:
       - sales_router_net
     restart: always
