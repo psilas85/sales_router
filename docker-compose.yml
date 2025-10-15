@@ -118,10 +118,12 @@ services:
       - ./src/sales_routing:/app/src/sales_routing
       - ./src/database:/app/src/database
       - ./src/cli:/app/src/cli
-      - ./output:/app/output     
+      - ./output:/app/output
+      - ./data:/app/data          # ✅ Pasta completa, não só /logs
     networks:
       - sales_router_net
     restart: always
+
 
   # ======================
   # Banco de Dados (PostgreSQL + PostGIS)
@@ -172,20 +174,21 @@ services:
       - sales_router_net
     restart: always
 
-  # ======================
-  # OSRM - Servidor de rotas local (Brasil)
+    # ======================
+  # OSRM - Servidor de rotas Sudeste (RJ, SP, MG, ES)
   # ======================
   osrm:
     image: osrm/osrm-backend
     container_name: osrm
-    command: osrm-routed --algorithm mld /data/ceara-extracted.osrm
+    command: osrm-routed --algorithm mld /data/sudeste-latest.osrm
     ports:
       - "5000:5000"
     volumes:
       - ./osrm-data:/data
-    restart: always
     networks:
       - sales_router_net
+    restart: always
+
 
 
 # ======================

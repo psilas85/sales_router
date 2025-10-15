@@ -1,4 +1,6 @@
-#sales_router/src/sales_routing/application/route_distance_service.py
+# src/sales_routing/application/route_distance_service.py
+
+# src/sales_routing/application/route_distance_service.py
 
 import os
 import math
@@ -16,7 +18,7 @@ class RouteDistanceService:
       1️⃣ OSRM local/remoto (com rota real)
       2️⃣ Google Maps Directions API
       3️⃣ Haversine geodésico
-    Com cache persistente no banco (tabela route_cache).
+    Inclui cache persistente (tabela route_cache) e agregação de estatísticas.
     """
 
     def __init__(self):
@@ -42,13 +44,13 @@ class RouteDistanceService:
         self.req_haversine = 0
 
     # ============================================================
-    # Função principal
+    # Função principal (par a par)
     # ============================================================
     def get_distance_time(self, a: tuple[float, float], b: tuple[float, float]) -> dict:
         """
         Retorna dict com distância (km), tempo (min), rota_coord e fonte.
+        Usa cache quando disponível. Caso contrário, aplica fallback em cascata.
         """
-
         fonte = None
         dist_km, tempo_min, rota_coord = None, None, []
 
@@ -57,11 +59,9 @@ class RouteDistanceService:
         if cached:
             fonte = "cache"
             dist_km, tempo_min = cached["distancia_km"], cached["tempo_min"]
-            # ✅ tenta recuperar rota_coord se existir no cache
-            rota_coord = cached.get("rota_coord", [])
-            if not rota_coord:
-                # fallback mínimo se o cache antigo não tiver rota
-                rota_coord = [{"lat": a[0], "lon": a[1]}, {"lat": b[0], "lon": b[1]}]
+            rota_coord = cached.get("rota_coord") or [
+                {"lat": a[0], "lon": a[1]}, {"lat": b[0], "lon": b[1]}
+            ]
             self.req_cache += 1
 
         else:
@@ -72,19 +72,23 @@ class RouteDistanceService:
                 self.req_osrm += 1
             except Exception as e:
                 logger.warning(f"⚠️ OSRM falhou ({e}). Tentando Google Maps...")
+
                 # 3️⃣ Google
                 if self.google_api_key:
                     try:
                         dist_km, tempo_min, rota_coord = self._from_google(a, b)
                         fonte = "google"
                         self.req_google += 1
-                    except Exception as e:
-                        logger.warning(f"⚠️ Google falhou ({e}). Usando Haversine...")
+                    except Exception as e2:
+                        logger.warning(f"⚠️ Google falhou ({e2}). Usando Haversine...")
+
                 # 4️⃣ Haversine
                 if dist_km is None:
                     dist_km = self._haversine_km(a, b) * self.alpha_path
                     tempo_min = (dist_km / 40.0) * 60
-                    rota_coord = [{"lat": a[0], "lon": a[1]}, {"lat": b[0], "lon": b[1]}]
+                    rota_coord = [
+                        {"lat": a[0], "lon": a[1]}, {"lat": b[0], "lon": b[1]}
+                    ]
                     fonte = "haversine"
                     self.req_haversine += 1
 
@@ -104,34 +108,40 @@ class RouteDistanceService:
         }
 
     # ============================================================
-    # OSRM local (com geometria real)
+    # OSRM local (com geometria real e fallback seguro)
     # ============================================================
     def _from_osrm(self, a, b) -> tuple[float, float, list]:
         if None in a or None in b:
             raise ValueError(f"Coordenadas inválidas: {a}, {b}")
 
+        # OSRM espera ordem lon,lat
         url = f"{self.osrm_url}/route/v1/driving/{a[1]},{a[0]};{b[1]},{b[0]}?overview=full&geometries=geojson"
-        resp = requests.get(url, timeout=6)
-        data = resp.json()
+
+        try:
+            resp = requests.get(url, timeout=6)
+            data = resp.json()
+        except Exception as e:
+            raise Exception(f"Falha de conexão com OSRM ({e})")
 
         if data.get("code") != "Ok" or not data.get("routes"):
             raise Exception(f"Sem rota OSRM válida para {a} → {b}")
 
         route = data["routes"][0]
-        dist_km = route["distance"] / 1000
-        tempo_min = route["duration"] / 60
+        dist_km = route.get("distance", 0) / 1000
+        tempo_min = route.get("duration", 0) / 60
 
-        # ✅ converte corretamente de [lon, lat] para dicts {lat, lon}
-        coords = route["geometry"].get("coordinates", [])
-        rota_coord = [{"lat": lat, "lon": lon} for lon, lat in coords]
+        if dist_km < 0.05 or tempo_min < 0.05:
+            raise Exception(
+                f"OSRM retornou rota nula ({dist_km:.2f} km / {tempo_min:.1f} min) — provável fora da área do mapa."
+            )
 
-        logger.debug(f"📍 OSRM rota gerada: {len(rota_coord)} pontos / {dist_km:.2f} km / {tempo_min:.1f} min")
+        coords = [{"lat": lat, "lon": lon} for lon, lat in route["geometry"]["coordinates"]]
+        logger.debug(f"📍 OSRM rota: {len(coords)} pts / {dist_km:.2f} km / {tempo_min:.1f} min")
 
-        return dist_km, tempo_min, rota_coord
-
+        return dist_km, tempo_min, coords
 
     # ============================================================
-    # Google Maps Directions
+    # Google Maps Directions (fallback secundário)
     # ============================================================
     def _from_google(self, a, b) -> tuple[float, float, list]:
         base_url = "https://maps.googleapis.com/maps/api/directions/json"
@@ -142,17 +152,21 @@ class RouteDistanceService:
         }
         resp = requests.get(base_url, params=params, timeout=5)
         data = resp.json()
+
         if data.get("status") != "OK":
             raise Exception(data.get("status", "Erro Google"))
 
         leg = data["routes"][0]["legs"][0]
         dist_km = leg["distance"]["value"] / 1000
         tempo_min = leg["duration"]["value"] / 60
+
         coords = [{"lat": a[0], "lon": a[1]}, {"lat": b[0], "lon": b[1]}]
+
+        logger.debug(f"📍 Google rota: {dist_km:.2f} km / {tempo_min:.1f} min")
         return dist_km, tempo_min, coords
 
     # ============================================================
-    # Haversine final
+    # Haversine (último recurso)
     # ============================================================
     def _haversine_km(self, a, b) -> float:
         R = 6371.0
@@ -175,50 +189,94 @@ class RouteDistanceService:
             """, (a[0], a[1], b[0], b[1]))
             return cur.fetchone()
 
-
     def _gravar_cache(self, a, b, dist_km, tempo_min, fonte):
         with self.conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO route_cache (
                     origem_lat, origem_lon, destino_lat, destino_lon,
                     distancia_km, tempo_min, fonte, atualizado_em
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (origem_lat, origem_lon, destino_lat, destino_lon) DO NOTHING;
             """, (a[0], a[1], b[0], b[1], dist_km, tempo_min, fonte, datetime.now()))
         logger.debug(f"💾 Cache atualizado ({fonte}) {a} → {b}: {dist_km:.2f} km / {tempo_min:.1f} min")
 
     # ============================================================
-    # NOVO: cálculo de rota completa com múltiplos pontos
+    # Rota completa multi-stop (OSRM → Google → Haversine)
     # ============================================================
     def get_full_route(self, coords_list: list[tuple[float, float]]) -> dict:
-        """
-        Calcula rota completa passando por todos os pontos (multi-stop)
-        e retorna distância total (km), tempo total (min) e rota_coord real.
-        """
         if not coords_list or len(coords_list) < 2:
             raise ValueError("Lista de coordenadas insuficiente para rota completa.")
 
-        # Monta string de coordenadas para o OSRM
-        coords_str = ";".join([f"{lon},{lat}" for lat, lon in coords_list])
-        url = f"{self.osrm_url}/route/v1/driving/{coords_str}?overview=full&geometries=geojson"
-        resp = requests.get(url, timeout=12)
-        data = resp.json()
+        try:
+            coords_str = ";".join([f"{lon},{lat}" for (lat, lon) in coords_list])
+            url = f"{self.osrm_url}/route/v1/driving/{coords_str}?overview=full&geometries=geojson"
 
-        if data.get("code") != "Ok" or not data.get("routes"):
-            raise Exception("OSRM não retornou rota válida.")
+            resp = requests.get(url, timeout=12)
+            data = resp.json()
 
-        route = data["routes"][0]
-        dist_km = route["distance"] / 1000
-        tempo_min = route["duration"] / 60
+            if data.get("code") != "Ok" or not data.get("routes"):
+                raise Exception("OSRM não retornou rota válida.")
 
-        coords = [{"lat": lat, "lon": lon} for lon, lat in route["geometry"]["coordinates"]]
+            route = data["routes"][0]
+            dist_km = route["distance"] / 1000
+            tempo_min = route["duration"] / 60
+            coords = [{"lat": lat, "lon": lon} for lon, lat in route["geometry"]["coordinates"]]
 
-        logger.info(f"🗺️ Rota completa OSRM: {len(coords)} pontos / {dist_km:.2f} km / {tempo_min:.1f} min")
-        return {"distancia_km": dist_km, "tempo_min": tempo_min, "rota_coord": coords}
+            fonte = "osrm"
 
+        except Exception as e:
+            logger.warning(f"⚠️ Falha ao gerar rota completa via OSRM ({e}). Aplicando fallback...")
+
+            if self.google_api_key:
+                try:
+                    total_km, total_min, coords = 0.0, 0.0, []
+                    for i in range(len(coords_list) - 1):
+                        a, b = coords_list[i], coords_list[i + 1]
+                        dist_km, tempo_parcial, _ = self._from_google(a, b)
+                        total_km += dist_km
+                        total_min += tempo_parcial
+                        coords.append({"lat": a[0], "lon": a[1]})
+                    coords.append({"lat": coords_list[-1][0], "lon": coords_list[-1][1]})
+                    logger.info(f"🧭 Rota completa fallback gerada (google): {total_km:.2f} km / {total_min:.1f} min")
+                    return {"distancia_km": total_km, "tempo_min": total_min, "rota_coord": coords, "fonte": "google"}
+                except Exception as e2:
+                    logger.warning(f"⚠️ Falha também no Google ({e2}). Usando Haversine...")
+
+            total_km, total_min, coords = 0.0, 0.0, []
+            for i in range(len(coords_list) - 1):
+                a, b = coords_list[i], coords_list[i + 1]
+                dist_km = self._haversine_km(a, b) * self.alpha_path
+                tempo_parcial = (dist_km / 40.0) * 60
+                total_km += dist_km
+                total_min += tempo_parcial
+                coords.append({"lat": a[0], "lon": a[1]})
+            coords.append({"lat": coords_list[-1][0], "lon": coords_list[-1][1]})
+            fonte = "haversine"
+            logger.info(f"🧭 Rota completa fallback gerada (haversine): {total_km:.2f} km / {total_min:.1f} min")
+            return {"distancia_km": total_km, "tempo_min": total_min, "rota_coord": coords, "fonte": fonte}
+
+        # ✅ Detecção de rota nula
+        if dist_km < 0.05 or tempo_min < 0.05:
+            logger.warning(
+                f"⚠️ Rota nula detectada (distância={dist_km:.2f} km, tempo={tempo_min:.1f} min). "
+                "Aplicando fallback local com tempo de serviço mínimo."
+            )
+            return {
+                "distancia_km": 0.0,
+                "tempo_min": 15.0,
+                "rota_coord": [
+                    {"lat": coords_list[0][0], "lon": coords_list[0][1]},
+                    {"lat": coords_list[-1][0], "lon": coords_list[-1][1]},
+                ],
+                "fonte": "local",
+            }
+
+        logger.info(f"🗺️ Rota completa {fonte}: {len(coords)} pts / {dist_km:.2f} km / {tempo_min:.1f} min")
+        return {"distancia_km": dist_km, "tempo_min": tempo_min, "rota_coord": coords, "fonte": fonte}
 
     # ============================================================
-    # Fechamento
+    # Fechamento e métricas
     # ============================================================
     def _log_progresso(self):
         cache_pct = (self.req_cache / self.req_count) * 100 if self.req_count else 0
@@ -229,11 +287,30 @@ class RouteDistanceService:
             f"Google {self.req_google}, Haversine {self.req_haversine})"
         )
 
+    # ============================================================
+    # Diagnóstico avançado (inversões e fora da área)
+    # ============================================================
+    def _verificar_coord(self, a, b):
+        """Detecta e loga coordenadas possivelmente invertidas."""
+        for lat, lon in [a, b]:
+            if lat is None or lon is None:
+                continue
+            # No Brasil, |lat| < 35 e |lon| > 34
+            if abs(lat) > abs(lon):
+                logger.warning(f"⚠️ Coordenadas possivelmente invertidas: ({lat},{lon})")
+
+    def _registrar_fora_area(self, a, b, dist_km, tempo_min):
+        """Registra caso fora da área do mapa."""
+        if dist_km < 0.05 or tempo_min < 0.05:
+            logger.warning(f"🚫 Rota fora da área do mapa: {a} → {b} ({dist_km:.2f} km / {tempo_min:.1f} min)")
+            self.req_out_of_area = getattr(self, "req_out_of_area", 0) + 1
+
     def close(self):
+        fora_area = getattr(self, "req_out_of_area", 0)
         if self.conn:
             logger.info(
-                f"🏁 Encerrando DistanceService — Total: {self.req_count}, "
-                f"Cache: {self.req_cache}, OSRM: {self.req_osrm}, "
-                f"Google: {self.req_google}, Haversine: {self.req_haversine}"
+                f"🏁 Encerrando DistanceService — "
+                f"Total: {self.req_count}, Cache: {self.req_cache}, OSRM: {self.req_osrm}, "
+                f"Google: {self.req_google}, Haversine: {self.req_haversine}, ForaMapa: {fora_area}"
             )
             self.conn.close()

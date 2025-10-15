@@ -1,19 +1,18 @@
 # src/sales_routing/infrastructure/database_reader.py
 
+import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from typing import List, Dict, Any, Optional
+from loguru import logger
 from src.sales_routing.domain.entities.cluster_data_entity import ClusterData, PDVData
-import os
 
 
 class SalesRoutingDatabaseReader:
     """
-    Leitor de dados de clusterização para o módulo Sales Routing.
-    Busca dados consolidados no banco sales_routing_db:
-      - Último run concluído
-      - Setores (clusters)
-      - PDVs associados a cada cluster
+    Classe de leitura de dados para o módulo Sales Routing.
+    Responsável por buscar dados de runs, clusters, PDVs, snapshots e rotas operacionais
+    no banco de dados sales_routing_db.
     """
 
     def __init__(self):
@@ -25,7 +24,9 @@ class SalesRoutingDatabaseReader:
             port=os.getenv("DB_PORT", "5432"),
         )
 
-    # -------------------------------------------------------------------------
+    # =========================================================
+    # 1️⃣ Último run concluído
+    # =========================================================
     def get_last_run(self) -> Optional[Dict[str, Any]]:
         """Retorna o último run concluído (status='done')."""
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -39,7 +40,9 @@ class SalesRoutingDatabaseReader:
             row = cur.fetchone()
             return dict(row) if row else None
 
-    # -------------------------------------------------------------------------
+    # =========================================================
+    # 2️⃣ Busca clusters (setores)
+    # =========================================================
     def get_clusters(self, run_id: int) -> List[ClusterData]:
         """Busca os clusters (setores) de um run específico."""
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -70,7 +73,9 @@ class SalesRoutingDatabaseReader:
                 for row in rows
             ]
 
-    # -------------------------------------------------------------------------
+    # =========================================================
+    # 3️⃣ Busca PDVs
+    # =========================================================
     def get_pdvs(self, run_id: int) -> List[PDVData]:
         """Busca os PDVs mapeados de um run específico."""
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -101,6 +106,9 @@ class SalesRoutingDatabaseReader:
                 for row in rows
             ]
 
+    # =========================================================
+    # 4️⃣ Último run por localização
+    # =========================================================
     def get_last_run_by_location(self, uf: str, cidade: str):
         """Retorna o último run concluído filtrado por UF e cidade."""
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -113,9 +121,12 @@ class SalesRoutingDatabaseReader:
             """, (uf, cidade))
             row = cur.fetchone()
             return dict(row) if row else None
-    # Dentro de SalesRoutingDatabaseReader
 
+    # =========================================================
+    # 5️⃣ Lista snapshots
+    # =========================================================
     def list_snapshots(self, tenant_id, uf=None, cidade=None):
+        """Lista snapshots do tenant, com filtros opcionais por UF e cidade."""
         cur = self.conn.cursor()
         query = """
             SELECT id, nome, descricao, criado_em, tags, uf, cidade
@@ -149,8 +160,11 @@ class SalesRoutingDatabaseReader:
             for r in rows
         ]
 
-
+    # =========================================================
+    # 6️⃣ Busca snapshot por nome
+    # =========================================================
     def get_snapshot_by_name(self, tenant_id, nome):
+        """Busca um snapshot específico pelo nome."""
         cur = self.conn.cursor()
         cur.execute("""
             SELECT id, nome, descricao, uf, cidade
@@ -171,8 +185,11 @@ class SalesRoutingDatabaseReader:
             "cidade": row[4],
         }
 
-
+    # =========================================================
+    # 7️⃣ Subclusters e PDVs de snapshot
+    # =========================================================
     def get_snapshot_subclusters(self, snapshot_id):
+        """Retorna subclusters de um snapshot específico."""
         cur = self.conn.cursor()
         cur.execute("""
             SELECT cluster_id, subcluster_seq, k_final, tempo_total_min, dist_total_km, n_pdvs
@@ -193,8 +210,8 @@ class SalesRoutingDatabaseReader:
             for r in rows
         ]
 
-
     def get_snapshot_pdvs(self, snapshot_id):
+        """Retorna PDVs de um snapshot específico."""
         cur = self.conn.cursor()
         cur.execute("""
             SELECT cluster_id, subcluster_seq, pdv_id, sequencia_ordem
@@ -213,9 +230,78 @@ class SalesRoutingDatabaseReader:
             for r in rows
         ]
 
+    # =========================================================
+    # 8️⃣ Rotas operacionais com centroides e filtros UF/Cidade
+    # =========================================================
+    def get_operational_routes(self, tenant_id: int, uf: str = None, cidade: str = None):
+        """
+        Retorna as rotas operacionais (sales_subcluster) com centroides
+        calculados a partir das coordenadas dos PDVs (sales_subcluster_pdv),
+        permitindo filtros opcionais por UF e cidade.
+        """
+        conn = self.conn
+        cur = conn.cursor()
 
-    # -------------------------------------------------------------------------
+        sql = """
+            SELECT 
+                s.id,
+                s.cluster_id,
+                s.subcluster_seq,
+                s.n_pdvs,
+                s.dist_total_km,
+                s.tempo_total_min,
+                AVG(p.lat) AS centro_lat,
+                AVG(p.lon) AS centro_lon
+            FROM sales_subcluster s
+            JOIN sales_subcluster_pdv p
+              ON p.cluster_id = s.cluster_id
+             AND p.subcluster_seq = s.subcluster_seq
+             AND p.tenant_id = s.tenant_id
+            LEFT JOIN pdvs pd
+              ON pd.id = p.pdv_id
+            WHERE s.tenant_id = %s
+        """
+
+        params = [tenant_id]
+        if uf:
+            sql += " AND pd.uf = %s"
+            params.append(uf)
+        if cidade:
+            sql += " AND LOWER(pd.cidade) = LOWER(%s)"
+            params.append(cidade)
+
+        sql += """
+            GROUP BY 
+                s.id, s.cluster_id, s.subcluster_seq, s.n_pdvs, 
+                s.dist_total_km, s.tempo_total_min
+            ORDER BY s.cluster_id, s.subcluster_seq;
+        """
+
+        try:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+            colnames = [desc[0] for desc in cur.description]
+            logger.info(
+                f"📦 {len(rows)} rotas carregadas do banco para tenant={tenant_id}"
+                + (f" | UF={uf}" if uf else "")
+                + (f" | Cidade={cidade}" if cidade else "")
+            )
+            return [dict(zip(colnames, row)) for row in rows]
+
+        except Exception as e:
+            logger.error(f"❌ Erro ao buscar rotas operacionais: {e}")
+            raise
+
+        finally:
+            cur.close()
+
+    # =========================================================
+    # 9️⃣ Fecha conexão
+    # =========================================================
     def close(self):
         """Fecha a conexão com o banco."""
         if self.conn:
-            self.conn.close()
+            try:
+                self.conn.close()
+            except Exception:
+                pass

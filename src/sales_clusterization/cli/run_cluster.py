@@ -19,7 +19,7 @@ def main():
     parser.add_argument("--k", type=int, default=None, help="K forçado (opcional)")
     parser.add_argument("--dias_uteis", type=int, default=20, help="Dias úteis no ciclo")
     parser.add_argument("--freq", type=int, default=1, help="Frequência mensal de visitas")
-    parser.add_argument("--workday", type=int, default=480, help="Tempo máximo de trabalho diário (minutos)")
+    parser.add_argument("--workday", type=int, default=600, help="Tempo máximo de trabalho diário (minutos)")
     parser.add_argument("--routekm", type=float, default=100.0, help="Distância máxima por rota (km)")
     parser.add_argument("--service", type=int, default=20, help="Tempo médio de visita por PDV (minutos)")
     parser.add_argument("--vel", type=float, default=30.0, help="Velocidade média (km/h)")
