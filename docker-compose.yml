@@ -254,6 +254,22 @@ services:
       - sales_router_net
     restart: always
 
+  routing_subjobs_worker:
+    build:
+      context: .
+      dockerfile: ./src/jobs/Dockerfile.routing_subjobs_worker
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - sales_router_db
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./output:/app/output
+    networks:
+      - sales_router_net
+    restart: always
 
 
 # ======================
