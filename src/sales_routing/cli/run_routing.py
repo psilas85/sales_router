@@ -24,7 +24,7 @@ def main():
     # -----------------------
     # Parâmetros operacionais
     # -----------------------
-    parser.add_argument("--uf", type=str, help="UF dos PDVs (ex: SP, CE)")
+    parser.add_argument("--uf", type=str, help="UF dos PDVs (ex: SP, CE, RJ)")
     parser.add_argument("--cidade", type=str, help="Cidade dos PDVs (ex: Fortaleza)")
     parser.add_argument("--workday", type=int, default=600, help="Tempo máximo de trabalho diário (minutos)")
     parser.add_argument("--routekm", type=float, default=100.0, help="Distância máxima por rota (km)")
@@ -133,22 +133,41 @@ def main():
     # ======================================================
     # 4️⃣ EXECUTAR NOVA SIMULAÇÃO DE ROTAS
     # ======================================================
-    if not args.uf or not args.cidade:
-        print("❌ É necessário informar --uf e --cidade para executar uma simulação.")
+    if not args.uf:
+        print("❌ É necessário informar a UF (--uf).")
         return
 
-    print("\n🚀 Iniciando geração de rotas diárias...")
-    print(f"📍 Filtros aplicados: {args.cidade}/{args.uf}")
-    print("------------------------------------------------------")
-
-    run = db_reader.get_last_run_by_location(args.uf, args.cidade)
-    if not run:
-        print(f"❌ Nenhum run concluído encontrado para {args.cidade}/{args.uf}.")
-        return
+    # ✅ Se cidade não informada, busca o último run da UF inteira
+    if not args.cidade:
+        logger.info(f"🌎 Nenhuma cidade especificada — buscando último run concluído da UF={args.uf}")
+        with db_reader.conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, uf, cidade, algo, k_final, params
+                FROM cluster_run
+                WHERE status = 'done' AND UPPER(uf) = UPPER(%s)
+                ORDER BY id DESC
+                LIMIT 1;
+            """, (args.uf,))
+            row = cur.fetchone()
+        if not row:
+            print(f"❌ Nenhum run concluído encontrado para UF={args.uf}.")
+            db_reader.close()
+            return
+        run = dict(zip([desc[0] for desc in cur.description], row))
+        args.cidade = run.get("cidade")
+    else:
+        run = db_reader.get_last_run_by_location(args.uf, args.cidade)
+        if not run:
+            print(f"❌ Nenhum run concluído encontrado para {args.cidade}/{args.uf}.")
+            db_reader.close()
+            return
 
     run_id = run["id"]
-
+    cidade_ref = args.cidade or "todas as cidades"
+    print(f"\n🚀 Iniciando geração de rotas diárias para {args.uf} ({cidade_ref})...")
     print(f"✅ Run encontrado: ID={run_id} (K={run['k_final']})")
+    print("------------------------------------------------------")
+
     clusters = db_reader.get_clusters(run_id)
     pdvs = db_reader.get_pdvs(run_id)
     print(f"🔹 Clusters carregados: {len(clusters)}")
@@ -177,7 +196,7 @@ def main():
             nome=nome,
             descricao=descricao,
             criado_por=args.usuario,
-            tags={"uf": args.uf, "cidade": args.cidade}
+            tags={"uf": args.uf, "cidade": args.cidade},
         )
         print(f"📦 Snapshot '{nome}' salvo com sucesso!\n")
 

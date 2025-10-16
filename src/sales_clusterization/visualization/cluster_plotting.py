@@ -55,47 +55,68 @@ def buscar_ultimo_run(tenant_id: int):
 
 def gerar_mapa_clusters(dados, output_path: Path):
     """
-    Gera mapa HTML com clusters (macrosetores) e PDVs, colorindo por cluster_label.
+    Gera mapa HTML com clusters (macrosetores) e PDVs colorindo por cluster_label.
+    Nesta etapa, o foco é apenas a setorização macro — não há marcador de centro.
     """
+    import pandas as pd
+    import random
+    import math
+
     if not dados:
         logger.warning("❌ Nenhum dado de clusterização encontrado.")
         return
 
-    # Centraliza o mapa com base nos PDVs
-    latitudes = [row[3] for row in dados if row[3]]
-    longitudes = [row[4] for row in dados if row[4]]
-    lat_centro = sum(latitudes) / len(latitudes) if latitudes else -3.73
-    lon_centro = sum(longitudes) / len(longitudes) if longitudes else -38.52
-    m = folium.Map(location=[lat_centro, lon_centro], zoom_start=9)
+    # =====================================================
+    # 🔹 Centraliza o mapa com base na média dos PDVs
+    # =====================================================
+    latitudes = [row[3] for row in dados if isinstance(row[3], (int, float)) and not math.isnan(row[3])]
+    longitudes = [row[4] for row in dados if isinstance(row[4], (int, float)) and not math.isnan(row[4])]
 
-    # Agrupar por cluster_label
+    lat_centro = sum(latitudes) / len(latitudes) if latitudes else -15.78
+    lon_centro = sum(longitudes) / len(longitudes) if longitudes else -47.93
+
+    if pd.isna(lat_centro) or pd.isna(lon_centro):
+        lat_centro, lon_centro = -15.78, -47.93  # fallback genérico (centro do Brasil)
+
+    m = folium.Map(location=[lat_centro, lon_centro], zoom_start=6)
+
+    # =====================================================
+    # 🔹 Agrupar por cluster_label (ignorando centro)
+    # =====================================================
     clusters = {}
     for row in dados:
-        label, centro_lat, centro_lon, lat, lon, cidade, uf = row
-        clusters.setdefault(label, {"pdvs": [], "centro": (centro_lat, centro_lon)})
-        clusters[label]["pdvs"].append((lat, lon, cidade, uf))
+        label, _, _, lat, lon, cidade, uf = row
+        # Ignora coordenadas inválidas
+        if (
+            lat is None or lon is None
+            or not isinstance(lat, (int, float))
+            or not isinstance(lon, (int, float))
+            or math.isnan(lat) or math.isnan(lon)
+            or math.isinf(lat) or math.isinf(lon)
+        ):
+            logger.debug(f"⚠️ Coordenadas inválidas ignoradas: Cluster {label} | {cidade}/{uf} | ({lat}, {lon})")
+            continue
+        clusters.setdefault(label, []).append((lat, lon, cidade, uf))
 
-    # Paleta de cores legível
-    import random
+    if not clusters:
+        logger.warning("⚠️ Nenhum PDV válido encontrado para plotagem.")
+        return
+
+    # =====================================================
+    # 🔹 Paleta de cores legível
+    # =====================================================
     random.seed(42)
     palette = [
         "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
         "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
     ]
 
-    for i, (label, info) in enumerate(sorted(clusters.items())):
+    # =====================================================
+    # 🔹 Plotagem dos PDVs por cluster
+    # =====================================================
+    for i, (label, pontos) in enumerate(sorted(clusters.items())):
         cor = palette[i % len(palette)]
-        centro_lat, centro_lon = info["centro"]
-
-        # Marcador do centro
-        folium.Marker(
-            location=(centro_lat, centro_lon),
-            icon=folium.Icon(color="blue", icon="home"),
-            popup=f"Centro Cluster {label}"
-        ).add_to(m)
-
-        # PDVs do cluster
-        for lat, lon, cidade, uf in info["pdvs"]:
+        for lat, lon, cidade, uf in pontos:
             folium.CircleMarker(
                 location=(lat, lon),
                 radius=3,
@@ -105,7 +126,9 @@ def gerar_mapa_clusters(dados, output_path: Path):
                 popup=f"Cluster {label} - {cidade}/{uf}"
             ).add_to(m)
 
-    # Legenda
+    # =====================================================
+    # 🔹 Legenda
+    # =====================================================
     legend_html = """
     <div style="
         position: fixed; bottom: 50px; left: 50px; width: 180px;
@@ -120,12 +143,15 @@ def gerar_mapa_clusters(dados, output_path: Path):
 
     m.get_root().html.add_child(folium.Element(legend_html))
 
-    # 🔁 Sempre sobrescreve o arquivo existente
+    # =====================================================
+    # 🔹 Salva o mapa (sempre sobrescreve)
+    # =====================================================
     if output_path.exists():
         output_path.unlink()
 
     m.save(output_path)
     logger.success(f"✅ Mapa de clusterização salvo em {output_path}")
+
 
 
 # =========================================================

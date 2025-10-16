@@ -1,9 +1,21 @@
 # src/sales_clusterization/infrastructure/persistence/database_writer.py
 
 import json
+import numpy as np
+import psycopg2
 from typing import List, Dict
 from src.sales_clusterization.domain.entities import Setor, PDV
 from src.database.db_connection import get_connection
+from loguru import logger
+
+
+# ============================================================
+# 🔧 Adapters para tipos NumPy → psycopg2
+# ============================================================
+psycopg2.extensions.register_adapter(np.int64, psycopg2._psycopg.AsIs)
+psycopg2.extensions.register_adapter(np.int32, psycopg2._psycopg.AsIs)
+psycopg2.extensions.register_adapter(np.float64, psycopg2._psycopg.AsIs)
+psycopg2.extensions.register_adapter(np.float32, psycopg2._psycopg.AsIs)
 
 
 def criar_run(tenant_id: int, uf: str | None, cidade: str | None, algo: str, params: dict) -> int:
@@ -20,6 +32,7 @@ def criar_run(tenant_id: int, uf: str | None, cidade: str | None, algo: str, par
             cur.execute(sql, (tenant_id, uf, cidade, algo, json.dumps(params, ensure_ascii=False)))
             run_id = cur.fetchone()[0]
             conn.commit()
+    logger.info(f"🆕 Run criado | tenant={tenant_id} | UF={uf or 'todas'} | cidade={cidade or 'todas'} | id={run_id}")
     return run_id
 
 
@@ -34,8 +47,9 @@ def finalizar_run(run_id: int, k_final: int, status: str = "done", error: str | 
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (k_final, status, error, run_id))
+            cur.execute(sql, (int(k_final), status, error, int(run_id)))
             conn.commit()
+    logger.info(f"🏁 Run finalizado | id={run_id} | status={status} | k_final={k_final}")
 
 
 def salvar_setores(tenant_id: int, run_id: int, setores: List[Setor]) -> Dict[int, int]:
@@ -52,27 +66,37 @@ def salvar_setores(tenant_id: int, run_id: int, setores: List[Setor]) -> Dict[in
     with get_connection() as conn:
         with conn.cursor() as cur:
             for s in setores:
+                # ✅ Converte tipos NumPy para nativos
+                cluster_label = int(s.cluster_label)
+                centro_lat = float(s.centro_lat)
+                centro_lon = float(s.centro_lon)
+                n_pdvs = int(s.n_pdvs)
+                raio_med_km = float(s.raio_med_km)
+                raio_p95_km = float(s.raio_p95_km)
+
                 cur.execute(
                     sql,
                     (
-                        tenant_id,
-                        run_id,
-                        s.cluster_label,
-                        f"CL-{s.cluster_label}",
-                        s.centro_lat,
-                        s.centro_lon,
-                        s.n_pdvs,
+                        int(tenant_id),
+                        int(run_id),
+                        cluster_label,
+                        f"CL-{cluster_label}",
+                        centro_lat,
+                        centro_lon,
+                        n_pdvs,
                         json.dumps(
                             {
-                                "raio_med_km": s.raio_med_km,
-                                "raio_p95_km": s.raio_p95_km,
-                            }
+                                "raio_med_km": raio_med_km,
+                                "raio_p95_km": raio_p95_km,
+                            },
+                            ensure_ascii=False,
                         ),
                     ),
                 )
                 cid = cur.fetchone()[0]
-                mapping[s.cluster_label] = cid
+                mapping[cluster_label] = cid
             conn.commit()
+    logger.info(f"💾 {len(mapping)} setores salvos no banco (run_id={run_id})")
     return mapping
 
 
@@ -93,20 +117,23 @@ def salvar_mapeamento_pdvs(
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
+            count = 0
             for pdv, label in zip(pdvs, labels):
-                cluster_id = mapping_cluster_id.get(label)
+                cluster_id = mapping_cluster_id.get(int(label)) if label is not None else None
                 if cluster_id:
                     cur.execute(
                         sql,
                         (
-                            tenant_id,
-                            run_id,
-                            cluster_id,
-                            pdv.id,
-                            pdv.lat,
-                            pdv.lon,
+                            int(tenant_id),
+                            int(run_id),
+                            int(cluster_id),
+                            int(pdv.id),
+                            float(pdv.lat) if pdv.lat is not None else None,
+                            float(pdv.lon) if pdv.lon is not None else None,
                             pdv.cidade,
                             pdv.uf,
                         ),
                     )
+                    count += 1
             conn.commit()
+    logger.info(f"🧩 {count} PDVs mapeados em clusters (run_id={run_id})")
