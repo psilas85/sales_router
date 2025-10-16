@@ -107,20 +107,34 @@ class SalesRoutingDatabaseReader:
             ]
 
     # =========================================================
-    # 4️⃣ Último run por localização
+    # 4️⃣ Último run por localização (corrigido)
     # =========================================================
-    def get_last_run_by_location(self, uf: str, cidade: str):
-        """Retorna o último run concluído filtrado por UF e cidade."""
+    def get_last_run_by_location(self, uf: str, cidade: Optional[str]):
+        """
+        Retorna o último run concluído filtrado por UF e cidade.
+        Se cidade=None, busca o run da UF com cidade nula (todas as cidades).
+        """
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
                 SELECT id, uf, cidade, algo, k_final, params
                 FROM cluster_run
-                WHERE status = 'done' AND uf = %s AND cidade = %s
+                WHERE status = 'done'
+                  AND uf = %s
+                  AND (cidade = %s OR (%s IS NULL AND cidade IS NULL))
                 ORDER BY id DESC
                 LIMIT 1;
-            """, (uf, cidade))
+            """, (uf, cidade, cidade))
             row = cur.fetchone()
-            return dict(row) if row else None
+
+            if not row:
+                logger.warning(f"⚠️ Nenhum run encontrado para UF={uf}, cidade={cidade}")
+                return None
+
+            logger.info(
+                f"📦 Último run encontrado: id={row['id']} | UF={row['uf']} | cidade={row['cidade']} | algo={row['algo']}"
+            )
+            return dict(row)
+
 
     # =========================================================
     # 5️⃣ Lista snapshots
@@ -294,6 +308,29 @@ class SalesRoutingDatabaseReader:
 
         finally:
             cur.close()
+
+        # =========================================================
+    # 🗺️ 10️⃣ Retorna lista de cidades por UF (para execução em batch)
+    # =========================================================
+    def get_cidades_por_uf(self, tenant_id: int, uf: str) -> list[str]:
+        """
+        Retorna lista única de cidades que possuem PDVs clusterizados na UF informada.
+        Usado para execuções em batch (todas as cidades da UF).
+        """
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT p.cidade
+                FROM pdvs p
+                WHERE p.tenant_id = %s AND UPPER(p.uf) = UPPER(%s)
+                  AND p.pdv_lat IS NOT NULL AND p.pdv_lon IS NOT NULL
+                ORDER BY p.cidade;
+            """, (tenant_id, uf))
+            rows = cur.fetchall()
+
+        cidades = [r[0] for r in rows] if rows else []
+        logger.info(f"🌎 {len(cidades)} cidades encontradas para tenant={tenant_id}, UF={uf}")
+        return cidades
+
 
     # =========================================================
     # 9️⃣ Fecha conexão

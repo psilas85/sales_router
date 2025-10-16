@@ -1,8 +1,9 @@
-#sales_router/src/sales_clusterization/cli/run_cluster.py
+# sales_router/src/sales_clusterization/cli/run_cluster.py
 
 import argparse
 from loguru import logger
-from src.database.cleanup_service import limpar_dados_operacionais
+# ⚠️ Limpeza removida — agora é feita apenas no início do job
+# from src.database.cleanup_service import limpar_dados_operacionais
 from src.sales_clusterization.application.cluster_use_case import executar_clusterizacao
 
 
@@ -14,7 +15,7 @@ def main():
     # =============================
     parser.add_argument("--tenant_id", type=int, required=True, help="ID do tenant (empresa)")
     parser.add_argument("--uf", required=True, help="UF dos PDVs (ex: SP, CE)")
-    parser.add_argument("--cidade", required=True, help="Cidade dos PDVs (ex: Fortaleza)")
+    parser.add_argument("--cidade", required=False, help="Cidade opcional dos PDVs (ex: Fortaleza)")
     parser.add_argument("--algo", default="kmeans", choices=["kmeans", "dbscan"], help="Algoritmo de clusterização")
     parser.add_argument("--k", type=int, default=None, help="K forçado (opcional)")
     parser.add_argument("--dias_uteis", type=int, default=20, help="Dias úteis no ciclo")
@@ -27,13 +28,14 @@ def main():
 
     args = parser.parse_args()
 
-    logger.info(f"🚀 Iniciando clusterização para tenant_id={args.tenant_id} | {args.uf}-{args.cidade} | algoritmo={args.algo}")
+    cidade = args.cidade if args.cidade not in (None, "", "None") else None
+    msg_ref = f"{args.uf}-{cidade}" if cidade else f"{args.uf} (todas as cidades)"
+    logger.info(f"🚀 Iniciando clusterização | tenant_id={args.tenant_id} | {msg_ref} | algoritmo={args.algo}")
 
     # ============================================================
-    # 🧹 LIMPEZA AUTOMÁTICA DE SIMULAÇÕES OPERACIONAIS
+    # 🚫 Limpeza removida — agora controlada pelo job principal
     # ============================================================
-    limpar_dados_operacionais("clusterization", tenant_id=args.tenant_id)
-
+    # limpar_dados_operacionais("clusterization", tenant_id=args.tenant_id)
 
     # =============================
     # Execução principal
@@ -41,7 +43,7 @@ def main():
     result = executar_clusterizacao(
         tenant_id=args.tenant_id,
         uf=args.uf,
-        cidade=args.cidade,
+        cidade=cidade,
         algo=args.algo,
         k_forcado=args.k,
         dias_uteis=args.dias_uteis,
