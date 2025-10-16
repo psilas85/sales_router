@@ -1,4 +1,4 @@
-# sales_router/docker-compose.yml
+#sales_router/docker-compose.yml
 
 version: "3.9"
 
@@ -25,7 +25,7 @@ services:
     ports:
       - "8001:8000"
     env_file:
-      - .env              # ✅ carrega todas as variáveis do .env global
+      - .env
     depends_on:
       - sales_router_db
     volumes:
@@ -54,7 +54,6 @@ services:
       - sales_router_net
     restart: always
 
-
   # ======================
   # PDV Jobs Worker (RQ)
   # ======================
@@ -65,6 +64,9 @@ services:
     container_name: pdv_jobs_worker
     env_file:
       - .env
+    environment:
+      - DB_HOST=sales_router_db
+      - DB_PORT=5432
     depends_on:
       - redis
       - sales_router_db
@@ -86,10 +88,13 @@ services:
     container_name: sales_clusterization
     env_file:
       - .env
+    environment:
+      - DB_HOST=sales_router_db
+      - DB_PORT=5432
     depends_on:
       - sales_router_db
       - redis
-    user: "${UID:-1000}:${GID:-1000}"      # 👈 adicionado
+    user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - ./src/sales_clusterization:/app/src/sales_clusterization
       - ./src/database:/app/src/database
@@ -98,7 +103,6 @@ services:
     networks:
       - sales_router_net
     restart: always
-
 
   # ======================
   # Roteirização de Vendas (Sales Routing)
@@ -110,6 +114,9 @@ services:
     container_name: sales_routing
     env_file:
       - .env
+    environment:
+      - DB_HOST=sales_router_db
+      - DB_PORT=5432
     depends_on:
       - sales_router_db
       - redis
@@ -119,11 +126,10 @@ services:
       - ./src/database:/app/src/database
       - ./src/cli:/app/src/cli
       - ./output:/app/output
-      - ./data:/app/data          # ✅ Pasta completa, não só /logs
+      - ./data:/app/data
     networks:
       - sales_router_net
     restart: always
-
 
   # ======================
   # Banco de Dados (PostgreSQL + PostGIS)
@@ -135,6 +141,8 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: sales_routing_db
+      POSTGRES_MAX_CONNECTIONS: 200
+      POSTGRES_SHARED_BUFFERS: 512MB
     ports:
       - "5434:5432"
     volumes:
@@ -199,31 +207,12 @@ services:
     container_name: pipeline_worker
     env_file:
       - .env
+    environment:
+      - DB_HOST=sales_router_db
+      - DB_PORT=5432
     depends_on:
       - redis
       - sales_router_db
-    volumes:
-      - ./src:/app/src
-      - ./data:/app/data
-      - ./output:/app/output
-    networks:
-      - sales_router_net
-    restart: always
-
-  # ======================
-  # Routing Jobs Worker (RQ)
-  # ======================
-  routing_jobs_worker:
-    build:
-      context: .
-      dockerfile: ./src/jobs/Dockerfile.routing_worker
-    container_name: routing_jobs_worker
-    env_file:
-      - .env
-    depends_on:
-      - redis
-      - sales_router_db
-      - sales_routing
     volumes:
       - ./src:/app/src
       - ./data:/app/data
@@ -242,6 +231,9 @@ services:
     container_name: clusterization_jobs_worker
     env_file:
       - .env
+    environment:
+      - DB_HOST=sales_router_db
+      - DB_PORT=5432
     depends_on:
       - redis
       - sales_router_db
@@ -254,12 +246,44 @@ services:
       - sales_router_net
     restart: always
 
+  # ======================
+  # Routing Jobs Worker (RQ)
+  # ======================
+  routing_jobs_worker:
+    build:
+      context: .
+      dockerfile: ./src/jobs/Dockerfile.routing_worker
+    container_name: routing_jobs_worker
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=sales_router_db
+      - DB_PORT=5432
+    depends_on:
+      - redis
+      - sales_router_db
+      - sales_routing
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./output:/app/output
+    networks:
+      - sales_router_net
+    restart: always
+
+  # ======================
+  # Routing Subjobs Worker (RQ)
+  # ======================
   routing_subjobs_worker:
     build:
       context: .
       dockerfile: ./src/jobs/Dockerfile.routing_subjobs_worker
+    container_name: routing_subjobs_worker
     env_file:
       - .env
+    environment:
+      - DB_HOST=sales_router_db
+      - DB_PORT=5432
     depends_on:
       - redis
       - sales_router_db
@@ -269,8 +293,9 @@ services:
       - ./output:/app/output
     networks:
       - sales_router_net
+    command: >
+      sh -c "rq worker -u redis://redis:6379/0 routing_subjobs"
     restart: always
-
 
 # ======================
 # Volumes persistentes
