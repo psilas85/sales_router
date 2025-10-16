@@ -1,4 +1,4 @@
-#sales_router/src/pdv_preprocessing/main_pdv_preprocessing.py
+# sales_router/src/pdv_preprocessing/main_pdv_preprocessing.py
 import os
 import argparse
 import logging
@@ -12,6 +12,7 @@ from pdv_preprocessing.infrastructure.database_reader import DatabaseReader
 from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
 from database.db_connection import get_connection
 from src.database.cleanup_service import limpar_dados_operacionais
+from pdv_preprocessing.logs.logging_config import setup_logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 load_dotenv()
@@ -53,7 +54,13 @@ def main():
         return
 
     # ============================================================
-    # 🧹 LIMPEZA AUTOMÁTICA DE SIMULAÇÕES (sempre que há novo preprocessing)
+    # 🧾 Inicializa logging dedicado
+    # ============================================================
+    caminho_log = setup_logging(tenant_id)
+    logging.info(f"🚀 Iniciando pré-processamento de PDVs (tenant={tenant_id})")
+
+    # ============================================================
+    # 🧹 LIMPEZA AUTOMÁTICA DE SIMULAÇÕES
     # ============================================================
     logging.info(f"🧹 Limpando simulações operacionais do tenant_id={tenant_id} antes do novo pré-processamento...")
     try:
@@ -98,7 +105,7 @@ def main():
 
     try:
         use_case = PDVPreprocessingUseCase(db_reader, db_writer, tenant_id)
-        df_validos, df_invalidos = use_case.execute(input_path, sep)
+        df_validos, df_invalidos, inseridos, sobrescritos = use_case.execute(input_path, sep)
 
         total_validos = len(df_validos) if df_validos is not None else 0
         total_invalidos = len(df_invalidos) if df_invalidos is not None else 0
@@ -123,6 +130,26 @@ def main():
             logging.error(f"❌ Erro ao consultar total final de PDVs: {e}")
             total_final = None
 
+        # ============================================================
+        # 🧾 Registro de histórico
+        # ============================================================
+        try:
+            db_writer.salvar_historico_pdv_job(
+                tenant_id=tenant_id,
+                job_id=job_id,
+                arquivo=os.path.basename(input_path),
+                status="done",
+                total_processados=total,
+                validos=total_validos,
+                invalidos=total_invalidos,
+                arquivo_invalidos=arquivo_invalidos,
+                mensagem="✅ Pré-processamento de PDVs concluído com sucesso",
+                inseridos=inseridos,
+                sobrescritos=sobrescritos
+            )
+        except Exception as e:
+            logging.error(f"❌ Falha ao salvar histórico do job: {e}")
+
         print(json.dumps({
             "status": "done",
             "job_id": job_id,
@@ -131,6 +158,8 @@ def main():
             "total_processados": total,
             "validos": total_validos,
             "invalidos": total_invalidos,
+            "inseridos": inseridos,
+            "sobrescritos": sobrescritos,
             "arquivo_invalidos": arquivo_invalidos,
             "duracao_segundos": round(duracao, 2),
             "total_final_banco": total_final
@@ -138,6 +167,23 @@ def main():
 
     except Exception as e:
         logging.error(f"❌ Erro inesperado: {e}", exc_info=True)
+        try:
+            db_writer.salvar_historico_pdv_job(
+                tenant_id=tenant_id,
+                job_id=job_id,
+                arquivo=os.path.basename(input_path),
+                status="error",
+                total_processados=0,
+                validos=0,
+                invalidos=0,
+                arquivo_invalidos=None,
+                mensagem=str(e),
+                inseridos=0,
+                sobrescritos=0
+            )
+        except Exception as inner_e:
+            logging.error(f"❌ Falha ao registrar histórico de erro: {inner_e}")
+
         print(json.dumps({
             "status": "error",
             "erro": str(e),

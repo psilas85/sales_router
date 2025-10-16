@@ -24,7 +24,7 @@ def limpar_dados_operacionais(nivel: str, tenant_id: int | None = None):
             "cluster_setor",
             "cluster_run",
         ]
-        logger.info("🧹 Limpando simulações operacionais (pré-processamento).")
+        logger.info("🧹 Limpando dados operacionais (nível: pré-processamento).")
 
     elif nivel == "clusterization":
         tabelas = [
@@ -34,25 +34,38 @@ def limpar_dados_operacionais(nivel: str, tenant_id: int | None = None):
             "cluster_setor",
             "cluster_run",
         ]
-        logger.info("🧹 Limpando simulações operacionais (clusterização).")
+        logger.info("🧹 Limpando dados operacionais (nível: clusterização).")
 
     elif nivel == "routing":
         tabelas = ["sales_subcluster_pdv", "sales_subcluster"]
-        logger.info("🧹 Limpando simulações operacionais (roteirização).")
+        logger.info("🧹 Limpando dados operacionais (nível: roteirização).")
 
     else:
         raise ValueError(f"Nível de limpeza inválido: {nivel}")
 
     # Executa limpeza com segurança — filtrando por tenant se informado
-    for tabela in tabelas:
-        if tenant_id:
-            cur.execute(f"DELETE FROM {tabela} WHERE tenant_id = %s;", (tenant_id,))
-            logger.debug(f"🧹 Linhas removidas da tabela {tabela} (tenant_id={tenant_id})")
-        else:
-            cur.execute(f"TRUNCATE TABLE {tabela} CASCADE;")
-            logger.debug(f"🧹 Tabela {tabela} truncada completamente.")
+    tabelas_limpeza = []
+    try:
+        for tabela in tabelas:
+            if tenant_id:
+                cur.execute(f"DELETE FROM {tabela} WHERE tenant_id = %s;", (tenant_id,))
+                logger.debug(f"🧹 Linhas removidas da tabela '{tabela}' (tenant_id={tenant_id})")
+            else:
+                cur.execute(f"TRUNCATE TABLE {tabela} CASCADE;")
+                logger.debug(f"🧹 Tabela '{tabela}' truncada completamente (sem filtro de tenant).")
 
-    conn.commit()
-    cur.close()
-    conn.close()
-    logger.success("✅ Limpeza concluída. Snapshots e caches preservados.")
+            tabelas_limpeza.append(tabela)
+
+        conn.commit()
+        logger.success(
+            f"✅ Limpeza concluída para {len(tabelas_limpeza)} tabela(s): "
+            f"{', '.join(tabelas_limpeza)}. Snapshots, históricos e caches preservados."
+        )
+
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"❌ Erro ao limpar dados operacionais ({nivel}): {e}", exc_info=True)
+
+    finally:
+        cur.close()
+        conn.close()

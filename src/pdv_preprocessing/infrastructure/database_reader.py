@@ -112,3 +112,22 @@ class DatabaseReader:
         cnpjs = [row[0] for row in cur.fetchall()]
         cur.close()
         return cnpjs
+
+    def buscar_enderecos_cache(self, enderecos: list[str]) -> dict[str, tuple[float, float]]:
+        """
+        Retorna um dicionário {endereco: (lat, lon)} com endereços já presentes no cache.
+        """
+        if not enderecos:
+            return {}
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT endereco, lat, lon
+            FROM enderecos_cache
+            WHERE endereco = ANY(%s)
+            """,
+            (enderecos,),
+        )
+        resultados = {row[0].strip().lower(): (row[1], row[2]) for row in cur.fetchall()}
+        cur.close()
+        return resultados
