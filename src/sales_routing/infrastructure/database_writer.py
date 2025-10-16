@@ -1,17 +1,17 @@
 #sales_router/src/sales_routing/infrastructure/database_writer.py
 
 import json
-import psycopg2
 from psycopg2.extras import execute_values
 from datetime import datetime
 from loguru import logger
-from src.database.db_connection import get_connection
+from src.database.db_connection import get_connection_context
 
 
 class SalesRoutingDatabaseWriter:
     """
     Responsável por persistir resultados de subclusterização (rotas diárias)
     e snapshots nomeados ("carteiras") no banco de dados.
+    Agora com fechamento automático de conexão (context manager).
     """
 
     # =========================================================
@@ -25,8 +25,6 @@ class SalesRoutingDatabaseWriter:
         """
         from src.sales_routing.application.route_distance_service import RouteDistanceService
 
-        conn = get_connection()
-        cur = conn.cursor()
         distance_service = RouteDistanceService()
 
         try:
@@ -47,8 +45,6 @@ class SalesRoutingDatabaseWriter:
                     for p in pdvs:
                         if abs(p["lat"]) > abs(p["lon"]):
                             p["lat"], p["lon"] = p["lon"], p["lat"]
-
-
 
                     # ============================================================
                     # 1️⃣ Monta lista de coordenadas
@@ -140,29 +136,29 @@ class SalesRoutingDatabaseWriter:
                         ))
 
             # ============================================================
-            # 6️⃣ Inserções em batch
+            # 6️⃣ Inserções em batch (fechamento automático)
             # ============================================================
-            if subcluster_rows:
-                execute_values(cur, """
-                    INSERT INTO sales_subcluster (
-                        tenant_id, run_id, cluster_id, subcluster_seq,
-                        k_final, tempo_total_min, dist_total_km, n_pdvs, rota_coord, criado_em
-                    ) VALUES %s
-                """, subcluster_rows)
+            with get_connection_context() as conn:
+                with conn.cursor() as cur:
+                    if subcluster_rows:
+                        execute_values(cur, """
+                            INSERT INTO sales_subcluster (
+                                tenant_id, run_id, cluster_id, subcluster_seq,
+                                k_final, tempo_total_min, dist_total_km, n_pdvs, rota_coord, criado_em
+                            ) VALUES %s
+                        """, subcluster_rows)
 
-            if pdv_rows:
-                execute_values(cur, """
-                    INSERT INTO sales_subcluster_pdv (
-                        tenant_id, run_id, cluster_id, subcluster_seq,
-                        pdv_id, sequencia_ordem, lat, lon, criado_em
-                    ) VALUES %s
-                """, pdv_rows)
+                    if pdv_rows:
+                        execute_values(cur, """
+                            INSERT INTO sales_subcluster_pdv (
+                                tenant_id, run_id, cluster_id, subcluster_seq,
+                                pdv_id, sequencia_ordem, lat, lon, criado_em
+                            ) VALUES %s
+                        """, pdv_rows)
 
-            conn.commit()
             logger.success(f"✅ Simulação operacional salva com sucesso (tenant {tenant_id}, {len(subcluster_rows)} subclusters).")
 
         except Exception as e:
-            conn.rollback()
             logger.error(f"❌ Erro ao salvar simulação operacional: {e}")
             raise
 
@@ -171,200 +167,163 @@ class SalesRoutingDatabaseWriter:
                 distance_service.close()
             except Exception:
                 pass
-            cur.close()
-            conn.close()
 
     # =========================================================
     # 2️⃣ Cria snapshot
     # =========================================================
     def salvar_snapshot(self, resultados, tenant_id, nome, descricao, criado_por=None, tags=None):
-        conn = get_connection()
-        cur = conn.cursor()
+        with get_connection_context() as conn:
+            with conn.cursor() as cur:
+                try:
+                    logger.info(f"💾 Criando snapshot '{nome}' para tenant {tenant_id}...")
 
-        try:
-            logger.info(f"💾 Criando snapshot '{nome}' para tenant {tenant_id}...")
-
-            tags_json = json.dumps(tags or {}, ensure_ascii=False)
-            uf = tags.get("uf") if tags else None
-            cidade = tags.get("cidade") if tags else None
-
-            cur.execute("""
-                INSERT INTO sales_routing_snapshot (
-                    tenant_id, nome, descricao, criado_por, tags, uf, cidade
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                RETURNING id;
-            """, (tenant_id, nome, descricao, criado_por, tags_json, uf, cidade))
-
-            snapshot_id = cur.fetchone()[0]
-
-            for r in resultados:
-                for sub in r["subclusters"]:
-                    rota = sub.get("rota_coord") or sub.get("rota") or []
-                    rota_coord_json = json.dumps(rota, ensure_ascii=False)
+                    tags_json = json.dumps(tags or {}, ensure_ascii=False)
+                    uf = tags.get("uf") if tags else None
+                    cidade = tags.get("cidade") if tags else None
 
                     cur.execute("""
-                        INSERT INTO sales_routing_snapshot_subcluster (
-                            snapshot_id, cluster_id, subcluster_seq,
-                            tempo_total_min, dist_total_km, n_pdvs, rota_coord
+                        INSERT INTO sales_routing_snapshot (
+                            tenant_id, nome, descricao, criado_por, tags, uf, cidade
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s);
-                    """, (
-                        snapshot_id,
-                        r["cluster_id"],
-                        sub["subcluster_id"],
-                        sub["tempo_total_min"],
-                        sub["dist_total_km"],
-                        sub["n_pdvs"],
-                        rota_coord_json
-                    ))
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        RETURNING id;
+                    """, (tenant_id, nome, descricao, criado_por, tags_json, uf, cidade))
+                    snapshot_id = cur.fetchone()[0]
 
-                    for ordem, p in enumerate(sub["pdvs"], start=1):
-                        cur.execute("""
-                            INSERT INTO sales_routing_snapshot_pdv (
-                                snapshot_id, cluster_id, subcluster_seq,
-                                pdv_id, sequencia_ordem, lat, lon
-                            )
-                            VALUES (%s, %s, %s, %s, %s, %s, %s);
-                        """, (
-                            snapshot_id,
-                            r["cluster_id"],
-                            sub["subcluster_id"],
-                            p["pdv_id"],
-                            ordem,
-                            p.get("lat"),
-                            p.get("lon")
-                        ))
+                    for r in resultados:
+                        for sub in r["subclusters"]:
+                            rota = sub.get("rota_coord") or sub.get("rota") or []
+                            rota_json = json.dumps(rota, ensure_ascii=False)
 
-            conn.commit()
-            logger.success(f"✅ Snapshot '{nome}' salvo com sucesso (ID={snapshot_id})")
+                            cur.execute("""
+                                INSERT INTO sales_routing_snapshot_subcluster (
+                                    snapshot_id, cluster_id, subcluster_seq,
+                                    tempo_total_min, dist_total_km, n_pdvs, rota_coord
+                                )
+                                VALUES (%s, %s, %s, %s, %s, %s, %s);
+                            """, (
+                                snapshot_id,
+                                r["cluster_id"],
+                                sub["subcluster_id"],
+                                sub["tempo_total_min"],
+                                sub["dist_total_km"],
+                                sub["n_pdvs"],
+                                rota_json
+                            ))
 
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"❌ Erro ao salvar snapshot '{nome}': {e}")
-            raise
+                            for ordem, p in enumerate(sub["pdvs"], start=1):
+                                cur.execute("""
+                                    INSERT INTO sales_routing_snapshot_pdv (
+                                        snapshot_id, cluster_id, subcluster_seq,
+                                        pdv_id, sequencia_ordem, lat, lon
+                                    )
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s);
+                                """, (
+                                    snapshot_id,
+                                    r["cluster_id"],
+                                    sub["subcluster_id"],
+                                    p["pdv_id"],
+                                    ordem,
+                                    p.get("lat"),
+                                    p.get("lon")
+                                ))
 
-        finally:
-            cur.close()
-            conn.close()
+                    logger.success(f"✅ Snapshot '{nome}' salvo com sucesso (ID={snapshot_id})")
+
+                except Exception as e:
+                    logger.error(f"❌ Erro ao salvar snapshot '{nome}': {e}")
+                    raise
 
     # =========================================================
     # 3️⃣ Excluir snapshot
     # =========================================================
     def delete_snapshot(self, snapshot_id: int):
-        conn = get_connection()
-        cur = conn.cursor()
-        try:
-            cur.execute("DELETE FROM sales_routing_snapshot WHERE id = %s;", (snapshot_id,))
-            conn.commit()
-            logger.success(f"🗑️ Snapshot ID={snapshot_id} excluído com sucesso.")
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"❌ Erro ao excluir snapshot ID={snapshot_id}: {e}")
-            raise
-        finally:
-            cur.close()
-            conn.close()
+        with get_connection_context() as conn:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute("DELETE FROM sales_routing_snapshot WHERE id = %s;", (snapshot_id,))
+                    logger.success(f"🗑️ Snapshot ID={snapshot_id} excluído com sucesso.")
+                except Exception as e:
+                    logger.error(f"❌ Erro ao excluir snapshot ID={snapshot_id}: {e}")
+                    raise
 
     # =========================================================
     # 4️⃣ Restaurar snapshot
     # =========================================================
     def restore_snapshot_operacional(self, tenant_id, subclusters, pdvs, run_id=None):
-        conn = get_connection()
-        cur = conn.cursor()
-        try:
-            run_id = run_id or 0
-            logger.info(f"💾 Restaurando snapshot para tenant {tenant_id}...")
+        run_id = run_id or 0
+        with get_connection_context() as conn:
+            with conn.cursor() as cur:
+                try:
+                    logger.info(f"💾 Restaurando snapshot para tenant {tenant_id}...")
 
-            for s in subclusters:
-                cur.execute("""
-                    INSERT INTO sales_subcluster (
-                        tenant_id, run_id, cluster_id, subcluster_seq, k_final,
-                        tempo_total_min, dist_total_km, n_pdvs, rota_coord, criado_em
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-                """, (
-                    tenant_id, run_id, s["cluster_id"], s["subcluster_seq"], s["k_final"],
-                    s["tempo_total_min"], s["dist_total_km"], s["n_pdvs"],
-                    json.dumps(s.get("rota_coord", []), ensure_ascii=False),
-                    datetime.now()
-                ))
+                    for s in subclusters:
+                        cur.execute("""
+                            INSERT INTO sales_subcluster (
+                                tenant_id, run_id, cluster_id, subcluster_seq, k_final,
+                                tempo_total_min, dist_total_km, n_pdvs, rota_coord, criado_em
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                        """, (
+                            tenant_id, run_id, s["cluster_id"], s["subcluster_seq"], s["k_final"],
+                            s["tempo_total_min"], s["dist_total_km"], s["n_pdvs"],
+                            json.dumps(s.get("rota_coord", []), ensure_ascii=False),
+                            datetime.now()
+                        ))
 
-            for p in pdvs:
-                cur.execute("""
-                    INSERT INTO sales_subcluster_pdv (
-                        tenant_id, run_id, cluster_id, subcluster_seq,
-                        pdv_id, sequencia_ordem, criado_em
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s);
-                """, (
-                    tenant_id, run_id, p["cluster_id"], p["subcluster_seq"],
-                    p["pdv_id"], p["sequencia_ordem"], datetime.now()
-                ))
+                    for p in pdvs:
+                        cur.execute("""
+                            INSERT INTO sales_subcluster_pdv (
+                                tenant_id, run_id, cluster_id, subcluster_seq,
+                                pdv_id, sequencia_ordem, criado_em
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s);
+                        """, (
+                            tenant_id, run_id, p["cluster_id"], p["subcluster_seq"],
+                            p["pdv_id"], p["sequencia_ordem"], datetime.now()
+                        ))
 
-            conn.commit()
-            logger.success(f"✅ Snapshot restaurado com sucesso para tenant {tenant_id}")
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"❌ Erro ao restaurar snapshot: {e}")
-            raise
-        finally:
-            cur.close()
-            conn.close()
+                    logger.success(f"✅ Snapshot restaurado com sucesso para tenant {tenant_id}")
+
+                except Exception as e:
+                    logger.error(f"❌ Erro ao restaurar snapshot: {e}")
+                    raise
 
     # =========================================================
-    # 5️⃣ Atualiza vendedor_id (versão corrigida e otimizada)
+    # 5️⃣ Atualiza vendedor_id (versão otimizada)
     # =========================================================
     def update_vendedores_operacional(self, tenant_id: int, rotas: list):
-        """
-        Atualiza o campo vendedor_id em sales_subcluster para as rotas do tenant informado.
-        Executa atualização em batch (eficiente e compatível com psycopg2).
-        """
+        """Atualiza o campo vendedor_id em batch."""
         if not rotas:
             logger.warning("⚠️ Nenhuma rota recebida para atualização de vendedores.")
             return
 
-        # 🔹 Remove registros inválidos
         rotas_validas = [r for r in rotas if r.get("id") and r.get("vendedor_id") is not None]
         if not rotas_validas:
             logger.warning("⚠️ Nenhuma rota válida para atualização (faltando id ou vendedor_id).")
             return
 
-        conn = get_connection()
-        cur = conn.cursor()
+        with get_connection_context() as conn:
+            with conn.cursor() as cur:
+                try:
+                    logger.info(f"💾 Atualizando vendedor_id em batch ({len(rotas_validas)} rotas, tenant={tenant_id})...")
 
-        try:
-            logger.info(f"💾 Atualizando vendedor_id em batch ({len(rotas_validas)} rotas, tenant={tenant_id})...")
+                    execute_values(
+                        cur,
+                        """
+                        CREATE TEMP TABLE tmp_vendedores (id int, vendedor_id int);
+                        INSERT INTO tmp_vendedores (id, vendedor_id) VALUES %s;
+                        """,
+                        [(r["id"], r["vendedor_id"]) for r in rotas_validas]
+                    )
 
-            # ============================================================
-            # 🚀 Atualização em lote via execute_values (sem args)
-            # ============================================================
-            from psycopg2.extras import execute_values
+                    cur.execute("""
+                        UPDATE sales_subcluster AS s
+                        SET vendedor_id = t.vendedor_id
+                        FROM tmp_vendedores AS t
+                        WHERE s.id = t.id AND s.tenant_id = %s;
+                    """, (tenant_id,))
 
-            # Cria tabela temporária de pares (id, vendedor_id)
-            execute_values(
-                cur,
-                """
-                CREATE TEMP TABLE tmp_vendedores (id int, vendedor_id int);
-                INSERT INTO tmp_vendedores (id, vendedor_id) VALUES %s;
-                """,
-                [(r["id"], r["vendedor_id"]) for r in rotas_validas]
-            )
+                    logger.success(f"✅ {len(rotas_validas)} rotas atualizadas com vendedor_id (tenant={tenant_id}).")
 
-            # Atualiza em batch a tabela principal
-            cur.execute("""
-                UPDATE sales_subcluster AS s
-                SET vendedor_id = t.vendedor_id
-                FROM tmp_vendedores AS t
-                WHERE s.id = t.id AND s.tenant_id = %s;
-            """, (tenant_id,))
-
-            conn.commit()
-            logger.success(f"✅ {len(rotas_validas)} rotas atualizadas com vendedor_id (tenant={tenant_id}).")
-
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"❌ Erro ao atualizar vendedor_id: {e}")
-            raise
-
-        finally:
-            cur.close()
-            conn.close()
+                except Exception as e:
+                    logger.error(f"❌ Erro ao atualizar vendedor_id: {e}")
+                    raise

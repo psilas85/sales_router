@@ -1,9 +1,10 @@
-#sales_router/src/sales_routing/cli/run_routing.py
+# sales_router/src/sales_routing/cli/run_routing.py
 
 import argparse
 from datetime import datetime
 from loguru import logger
 from src.database.cleanup_service import limpar_dados_operacionais
+from src.database.db_connection import get_connection_context
 from src.sales_routing.infrastructure.database_reader import SalesRoutingDatabaseReader
 from src.sales_routing.infrastructure.database_writer import SalesRoutingDatabaseWriter
 from src.sales_routing.application.adaptive_subcluster_splitter import gerar_subclusters_adaptativo
@@ -77,7 +78,6 @@ def main():
                 if s.get('descricao'):
                     print(f"   📝 {s['descricao']}")
                 print("-" * 60)
-        db_reader.close()
         return
 
     # ======================================================
@@ -90,7 +90,6 @@ def main():
 
         if not snapshot:
             print(f"❌ Nenhum snapshot encontrado com nome '{nome}'.")
-            db_reader.close()
             return
 
         subclusters = db_reader.get_snapshot_subclusters(snapshot["id"])
@@ -98,12 +97,10 @@ def main():
 
         if not subclusters or not pdvs:
             print(f"⚠️ Snapshot '{nome}' está vazio ou corrompido.")
-            db_reader.close()
             return
 
         db_writer.restore_snapshot_operacional(tenant_id, subclusters, pdvs)
         logger.success(f"✅ Snapshot '{nome}' restaurado com sucesso para tenant {tenant_id}")
-        db_reader.close()
         return
 
     # ======================================================
@@ -116,18 +113,15 @@ def main():
 
         if not snapshot:
             print(f"❌ Nenhum snapshot encontrado com nome '{nome}'.")
-            db_reader.close()
             return
 
         confirm = input(f"⚠️ Confirmar exclusão permanente de '{nome}'? (s/N): ").strip().lower()
         if confirm != "s":
             print("❎ Exclusão cancelada pelo usuário.")
-            db_reader.close()
             return
 
         db_writer.delete_snapshot(snapshot["id"])
         logger.success(f"✅ Snapshot '{nome}' excluído com sucesso.")
-        db_reader.close()
         return
 
     # ======================================================
@@ -140,26 +134,26 @@ def main():
     # ✅ Se cidade não informada, busca o último run da UF inteira
     if not args.cidade:
         logger.info(f"🌎 Nenhuma cidade especificada — buscando último run concluído da UF={args.uf}")
-        with db_reader.conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, uf, cidade, algo, k_final, params
-                FROM cluster_run
-                WHERE status = 'done' AND UPPER(uf) = UPPER(%s)
-                ORDER BY id DESC
-                LIMIT 1;
-            """, (args.uf,))
-            row = cur.fetchone()
-        if not row:
-            print(f"❌ Nenhum run concluído encontrado para UF={args.uf}.")
-            db_reader.close()
-            return
-        run = dict(zip([desc[0] for desc in cur.description], row))
-        args.cidade = run.get("cidade")
+        with get_connection_context() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, uf, cidade, algo, k_final, params
+                    FROM cluster_run
+                    WHERE status = 'done' AND UPPER(uf) = UPPER(%s)
+                    ORDER BY id DESC
+                    LIMIT 1;
+                """, (args.uf,))
+                row = cur.fetchone()
+                if not row:
+                    print(f"❌ Nenhum run concluído encontrado para UF={args.uf}.")
+                    return
+                colnames = [desc[0] for desc in cur.description]
+                run = dict(zip(colnames, row))
+                args.cidade = run.get("cidade")
     else:
         run = db_reader.get_last_run_by_location(args.uf, args.cidade)
         if not run:
             print(f"❌ Nenhum run concluído encontrado para {args.cidade}/{args.uf}.")
-            db_reader.close()
             return
 
     run_id = run["id"]
@@ -201,7 +195,6 @@ def main():
         print(f"📦 Snapshot '{nome}' salvo com sucesso!\n")
 
     print("\n🏁 Execução concluída com sucesso!\n")
-    db_reader.close()
 
 
 if __name__ == "__main__":
