@@ -2,9 +2,8 @@
 
 import argparse
 from loguru import logger
-# ⚠️ Limpeza removida — agora é feita apenas no início do job
-# from src.database.cleanup_service import limpar_dados_operacionais
 from src.sales_clusterization.application.cluster_use_case import executar_clusterizacao
+from src.database.cleanup_service import limpar_dados_operacionais
 
 
 def main():
@@ -14,10 +13,10 @@ def main():
     # Parâmetros principais
     # =============================
     parser.add_argument("--tenant_id", type=int, required=True, help="ID do tenant (empresa)")
-    parser.add_argument("--uf", required=True, help="UF dos PDVs (ex: SP, CE)")
+    parser.add_argument("--uf", required=True, help="UF dos PDVs (ex: SP, CE, RJ)")
     parser.add_argument("--cidade", required=False, help="Cidade opcional dos PDVs (ex: Fortaleza)")
-    parser.add_argument("--algo", default="kmeans", choices=["kmeans", "dbscan"], help="Algoritmo de clusterização")
-    parser.add_argument("--k", type=int, default=None, help="K forçado (opcional)")
+    parser.add_argument("--algo", default="dbscan", choices=["kmeans", "dbscan"], help="Algoritmo de clusterização")
+    parser.add_argument("--k", type=int, default=None, help="K forçado (apenas para KMeans)")
     parser.add_argument("--dias_uteis", type=int, default=20, help="Dias úteis no ciclo")
     parser.add_argument("--freq", type=int, default=1, help="Frequência mensal de visitas")
     parser.add_argument("--workday", type=int, default=600, help="Tempo máximo de trabalho diário (minutos)")
@@ -25,21 +24,31 @@ def main():
     parser.add_argument("--service", type=int, default=20, help="Tempo médio de visita por PDV (minutos)")
     parser.add_argument("--vel", type=float, default=30.0, help="Velocidade média (km/h)")
     parser.add_argument("--alpha", type=float, default=1.4, help="Fator de correção de caminho (curvas/ruas)")
+    parser.add_argument("--modo_forcar", action="store_true", help="Força reprocessamento completo, limpando dados anteriores")
 
     args = parser.parse_args()
 
+    # ============================================================
+    # 🌆 Identificação e log inicial
+    # ============================================================
     cidade = args.cidade if args.cidade not in (None, "", "None") else None
     msg_ref = f"{args.uf}-{cidade}" if cidade else f"{args.uf} (todas as cidades)"
     logger.info(f"🚀 Iniciando clusterização | tenant_id={args.tenant_id} | {msg_ref} | algoritmo={args.algo}")
 
     # ============================================================
-    # 🚫 Limpeza removida — agora controlada pelo job principal
+    # 🧹 Limpeza opcional se --modo_forcar
     # ============================================================
-    # limpar_dados_operacionais("clusterization", tenant_id=args.tenant_id)
+    if args.modo_forcar:
+        logger.warning("🧹 Modo forçar ativado — limpando dados anteriores de clusterização...")
+        try:
+            limpar_dados_operacionais("clusterization", tenant_id=args.tenant_id)
+            logger.success("✅ Limpeza concluída com sucesso antes da nova execução.")
+        except Exception as e:
+            logger.error(f"❌ Falha ao limpar dados anteriores: {e}")
 
-    # =============================
-    # Execução principal
-    # =============================
+    # ============================================================
+    # 🧠 Execução principal
+    # ============================================================
     result = executar_clusterizacao(
         tenant_id=args.tenant_id,
         uf=args.uf,
@@ -55,9 +64,9 @@ def main():
         alpha_path=args.alpha,
     )
 
-    # =============================
-    # Resultado final
-    # =============================
+    # ============================================================
+    # 📊 Resultado final
+    # ============================================================
     print("\n=== RESULTADO FINAL ===")
     print(f"run_id: {result['run_id']}")
     print(f"clusters (K): {result['k_final']}")
