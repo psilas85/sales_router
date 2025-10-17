@@ -9,7 +9,7 @@ def limpar_dados_operacionais(nivel: str, tenant_id: int | None = None):
     Limpa os dados operacionais do SalesRouter conforme o nível de execução.
 
     Parâmetros:
-        nivel: 'preprocessing' | 'clusterization' | 'routing'
+        nivel: 'preprocessing' | 'clusterization' | 'routing' | 'assign_vendedores'
         tenant_id: se informado, filtra apenas os dados do tenant específico
     """
     conn = get_connection()
@@ -23,6 +23,7 @@ def limpar_dados_operacionais(nivel: str, tenant_id: int | None = None):
             "cluster_setor_pdv",
             "cluster_setor",
             "cluster_run",
+            "sales_vendedor_base",  # 🔹 limpa base de vendedores
         ]
         logger.info("🧹 Limpando dados operacionais (nível: pré-processamento).")
 
@@ -33,12 +34,21 @@ def limpar_dados_operacionais(nivel: str, tenant_id: int | None = None):
             "cluster_setor_pdv",
             "cluster_setor",
             "cluster_run",
+            "sales_vendedor_base",  # 🔹 limpa base de vendedores
         ]
         logger.info("🧹 Limpando dados operacionais (nível: clusterização).")
 
     elif nivel == "routing":
-        tabelas = ["sales_subcluster_pdv", "sales_subcluster"]
+        tabelas = [
+            "sales_subcluster_pdv",
+            "sales_subcluster",
+            "sales_vendedor_base",  # 🔹 limpa base de vendedores
+        ]
         logger.info("🧹 Limpando dados operacionais (nível: roteirização).")
+
+    elif nivel == "assign_vendedores":
+        tabelas = ["sales_vendedor_base"]  # 🔹 somente esta tabela
+        logger.info("🧹 Limpando dados de vendedores antes da nova atribuição.")
 
     else:
         raise ValueError(f"Nível de limpeza inválido: {nivel}")
@@ -59,7 +69,7 @@ def limpar_dados_operacionais(nivel: str, tenant_id: int | None = None):
         conn.commit()
         logger.success(
             f"✅ Limpeza concluída para {len(tabelas_limpeza)} tabela(s): "
-            f"{', '.join(tabelas_limpeza)}. Snapshots, históricos e caches preservados."
+            f"{', '.join(tabelas_limpeza)}. Snapshots e históricos preservados."
         )
 
     except Exception as e:

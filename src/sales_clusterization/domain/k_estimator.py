@@ -1,7 +1,5 @@
 # sales_clusterization/domain/k_estimator.py
 
-# sales_clusterization/domain/k_estimator.py
-
 import math, random
 from typing import List, Tuple
 from .entities import PDV

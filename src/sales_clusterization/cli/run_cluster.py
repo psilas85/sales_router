@@ -25,6 +25,12 @@ def main():
     parser.add_argument("--vel", type=float, default=30.0, help="Velocidade média (km/h)")
     parser.add_argument("--alpha", type=float, default=1.4, help="Fator de correção de caminho (curvas/ruas)")
     parser.add_argument("--modo_forcar", action="store_true", help="Força reprocessamento completo, limpando dados anteriores")
+    parser.add_argument(
+        "--max_pdv_cluster",
+        type=int,
+        default=300,
+        help="Máximo de PDVs permitidos por cluster (usado no balanceamento híbrido DBSCAN + KMeans)",
+    )
 
     args = parser.parse_args()
 
@@ -62,6 +68,7 @@ def main():
         service_min=args.service,
         v_kmh=args.vel,
         alpha_path=args.alpha,
+        max_pdv_cluster=args.max_pdv_cluster,
     )
 
     # ============================================================

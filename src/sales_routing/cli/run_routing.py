@@ -1,5 +1,3 @@
-# sales_router/src/sales_routing/cli/run_routing.py
-
 import argparse
 from datetime import datetime
 from loguru import logger
@@ -29,7 +27,7 @@ def main():
     parser.add_argument("--cidade", type=str, help="Cidade dos PDVs (ex: Fortaleza)")
     parser.add_argument("--workday", type=int, default=600, help="Tempo máximo de trabalho diário (minutos)")
     parser.add_argument("--routekm", type=float, default=100.0, help="Distância máxima por rota (km)")
-    parser.add_argument("--service", type=int, default=20, help="Tempo médio de visita por PDV (minutos)")
+    parser.add_argument("--service", type=float, default=20.0, help="Tempo médio de visita por PDV (minutos)")
     parser.add_argument("--vel", type=float, default=30.0, help="Velocidade média (km/h)")
     parser.add_argument("--alpha", type=float, default=1.4, help="Fator de correção de caminho (curvas/ruas)")
     parser.add_argument("--twoopt", action="store_true", help="Ativa heurística 2-Opt para otimização fina da rota")
@@ -44,6 +42,13 @@ def main():
 
     args = parser.parse_args()
     tenant_id = args.tenant
+
+    # ======================================================
+    # 🔄 Exporta parâmetros para acesso global (usados por serviços internos)
+    # ======================================================
+    globals()["SERVICE_MIN_ARG"] = args.service
+    globals()["VEL_KMH_ARG"] = args.vel
+    globals()["ALPHA_PATH_ARG"] = args.alpha
 
     # ======================================================
     # 🧹 LIMPEZA AUTOMÁTICA DE SIMULAÇÕES OPERACIONAIS
@@ -87,18 +92,14 @@ def main():
         nome = args.restaurar.strip()
         logger.info(f"🔍 Buscando snapshot '{nome}' para tenant {tenant_id}...")
         snapshot = db_reader.get_snapshot_by_name(tenant_id, nome)
-
         if not snapshot:
             print(f"❌ Nenhum snapshot encontrado com nome '{nome}'.")
             return
-
         subclusters = db_reader.get_snapshot_subclusters(snapshot["id"])
         pdvs = db_reader.get_snapshot_pdvs(snapshot["id"])
-
         if not subclusters or not pdvs:
             print(f"⚠️ Snapshot '{nome}' está vazio ou corrompido.")
             return
-
         db_writer.restore_snapshot_operacional(tenant_id, subclusters, pdvs)
         logger.success(f"✅ Snapshot '{nome}' restaurado com sucesso para tenant {tenant_id}")
         return
@@ -110,16 +111,13 @@ def main():
         nome = args.excluir.strip()
         logger.info(f"🗑️ Solicitada exclusão do snapshot '{nome}' (tenant {tenant_id})...")
         snapshot = db_reader.get_snapshot_by_name(tenant_id, nome)
-
         if not snapshot:
             print(f"❌ Nenhum snapshot encontrado com nome '{nome}'.")
             return
-
         confirm = input(f"⚠️ Confirmar exclusão permanente de '{nome}'? (s/N): ").strip().lower()
         if confirm != "s":
             print("❎ Exclusão cancelada pelo usuário.")
             return
-
         db_writer.delete_snapshot(snapshot["id"])
         logger.success(f"✅ Snapshot '{nome}' excluído com sucesso.")
         return

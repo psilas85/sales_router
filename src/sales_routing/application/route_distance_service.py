@@ -82,15 +82,20 @@ class RouteDistanceService:
                     except Exception as e2:
                         logger.warning(f"⚠️ Google falhou ({e2}). Usando Haversine...")
 
-                # 4️⃣ Haversine
+                # ============================================================
+                # 4️⃣ Haversine (último recurso)
+                # ============================================================
                 if dist_km is None:
+                    v_kmh = float(os.getenv("VEL_KMH", 0)) or globals().get("VEL_KMH_ARG", 30.0)
                     dist_km = self._haversine_km(a, b) * self.alpha_path
-                    tempo_min = (dist_km / 40.0) * 60
+                    tempo_min = (dist_km / v_kmh) * 60
                     rota_coord = [
-                        {"lat": a[0], "lon": a[1]}, {"lat": b[0], "lon": b[1]}
+                        {"lat": a[0], "lon": a[1]},
+                        {"lat": b[0], "lon": b[1]},
                     ]
                     fonte = "haversine"
                     self.req_haversine += 1
+
 
             # Salva no cache
             self._gravar_cache(a, b, dist_km, tempo_min, fonte)
@@ -205,9 +210,33 @@ class RouteDistanceService:
     # Rota completa multi-stop (OSRM → Google → Haversine)
     # ============================================================
     def get_full_route(self, coords_list: list[tuple[float, float]]) -> dict:
-        if not coords_list or len(coords_list) < 2:
-            raise ValueError("Lista de coordenadas insuficiente para rota completa.")
+        """
+        Calcula rota completa multi-stop com fallback hierárquico.
+        Retorna:
+            {
+                "distancia_km": float,
+                "tempo_min": float,
+                "rota_coord": [{"lat": float, "lon": float}],
+                "fonte": "osrm" | "google" | "haversine" | "local"
+            }
+        """
+        import requests
 
+        # ============================================================
+        # 1️⃣ Validação mínima
+        # ============================================================
+        if not coords_list or len(coords_list) < 2:
+            logger.warning("⚠️ Lista de coordenadas insuficiente para rota completa.")
+            return {
+                "distancia_km": 0.0,
+                "tempo_min": 10.0,
+                "rota_coord": [{"lat": c[0], "lon": c[1]} for c in coords_list],
+                "fonte": "local",
+            }
+
+        # ============================================================
+        # 2️⃣ OSRM
+        # ============================================================
         try:
             coords_str = ";".join([f"{lon},{lat}" for (lat, lon) in coords_list])
             url = f"{self.osrm_url}/route/v1/driving/{coords_str}?overview=full&geometries=geojson"
@@ -216,64 +245,69 @@ class RouteDistanceService:
             data = resp.json()
 
             if data.get("code") != "Ok" or not data.get("routes"):
-                raise Exception("OSRM não retornou rota válida.")
+                raise Exception(f"OSRM retornou código inválido ({data.get('code')}).")
 
             route = data["routes"][0]
             dist_km = route["distance"] / 1000
             tempo_min = route["duration"] / 60
             coords = [{"lat": lat, "lon": lon} for lon, lat in route["geometry"]["coordinates"]]
-
             fonte = "osrm"
 
+            # ✅ Rota válida?
+            if dist_km < 0.05 or tempo_min < 0.05:
+                raise Exception(f"Rota nula detectada ({dist_km:.2f} km, {tempo_min:.2f} min).")
+
+            logger.debug(f"🗺️ OSRM: {len(coords)} pts / {dist_km:.2f} km / {tempo_min:.1f} min")
+            return {"distancia_km": dist_km, "tempo_min": tempo_min, "rota_coord": coords, "fonte": fonte}
+
         except Exception as e:
-            logger.warning(f"⚠️ Falha ao gerar rota completa via OSRM ({e}). Aplicando fallback...")
+            logger.warning(f"⚠️ Falha ao gerar rota via OSRM ({e}). Aplicando fallback...")
 
-            if self.google_api_key:
-                try:
-                    total_km, total_min, coords = 0.0, 0.0, []
-                    for i in range(len(coords_list) - 1):
-                        a, b = coords_list[i], coords_list[i + 1]
-                        dist_km, tempo_parcial, _ = self._from_google(a, b)
-                        total_km += dist_km
-                        total_min += tempo_parcial
-                        coords.append({"lat": a[0], "lon": a[1]})
-                    coords.append({"lat": coords_list[-1][0], "lon": coords_list[-1][1]})
-                    logger.info(f"🧭 Rota completa fallback gerada (google): {total_km:.2f} km / {total_min:.1f} min")
-                    return {"distancia_km": total_km, "tempo_min": total_min, "rota_coord": coords, "fonte": "google"}
-                except Exception as e2:
-                    logger.warning(f"⚠️ Falha também no Google ({e2}). Usando Haversine...")
+        # ============================================================
+        # 3️⃣ Fallback Google
+        # ============================================================
+        if getattr(self, "google_api_key", None):
+            try:
+                total_km, total_min, coords = 0.0, 0.0, []
+                for i in range(len(coords_list) - 1):
+                    a, b = coords_list[i], coords_list[i + 1]
+                    dist_km, tempo_parcial, _ = self._from_google(a, b)
+                    total_km += dist_km
+                    total_min += tempo_parcial
+                    coords.append({"lat": a[0], "lon": a[1]})
+                coords.append({"lat": coords_list[-1][0], "lon": coords_list[-1][1]})
+                logger.debug(f"🧭 Google fallback: {total_km:.2f} km / {total_min:.1f} min")
+                return {"distancia_km": total_km, "tempo_min": total_min, "rota_coord": coords, "fonte": "google"}
+            except Exception as e2:
+                logger.warning(f"⚠️ Falha também no Google ({e2}). Usando Haversine...")
 
-            total_km, total_min, coords = 0.0, 0.0, []
-            for i in range(len(coords_list) - 1):
-                a, b = coords_list[i], coords_list[i + 1]
-                dist_km = self._haversine_km(a, b) * self.alpha_path
-                tempo_parcial = (dist_km / 40.0) * 60
-                total_km += dist_km
-                total_min += tempo_parcial
-                coords.append({"lat": a[0], "lon": a[1]})
-            coords.append({"lat": coords_list[-1][0], "lon": coords_list[-1][1]})
-            fonte = "haversine"
-            logger.info(f"🧭 Rota completa fallback gerada (haversine): {total_km:.2f} km / {total_min:.1f} min")
-            return {"distancia_km": total_km, "tempo_min": total_min, "rota_coord": coords, "fonte": fonte}
+        # ============================================================
+        # 4️⃣ Fallback Haversine (multi-stop incremental)
+        # ============================================================
+        v_kmh = float(os.getenv("VEL_KMH", 0)) or globals().get("VEL_KMH_ARG", 30.0)
 
-        # ✅ Detecção de rota nula
-        if dist_km < 0.05 or tempo_min < 0.05:
-            logger.warning(
-                f"⚠️ Rota nula detectada (distância={dist_km:.2f} km, tempo={tempo_min:.1f} min). "
-                "Aplicando fallback local com tempo de serviço mínimo."
-            )
-            return {
-                "distancia_km": 0.0,
-                "tempo_min": 15.0,
-                "rota_coord": [
-                    {"lat": coords_list[0][0], "lon": coords_list[0][1]},
-                    {"lat": coords_list[-1][0], "lon": coords_list[-1][1]},
-                ],
-                "fonte": "local",
-            }
+        total_km, total_min, coords = 0.0, 0.0, []
+        for i in range(len(coords_list) - 1):
+            a, b = coords_list[i], coords_list[i + 1]
+            dist_km = self._haversine_km(a, b) * getattr(self, "alpha_path", 1.0)
+            tempo_parcial = (dist_km / v_kmh) * 60  # velocidade média configurável
+            total_km += dist_km
+            total_min += tempo_parcial
+            coords.append({"lat": a[0], "lon": a[1]})
+        coords.append({"lat": coords_list[-1][0], "lon": coords_list[-1][1]})
+        fonte = "haversine"
 
-        logger.info(f"🗺️ Rota completa {fonte}: {len(coords)} pts / {dist_km:.2f} km / {tempo_min:.1f} min")
-        return {"distancia_km": dist_km, "tempo_min": tempo_min, "rota_coord": coords, "fonte": fonte}
+        logger.debug(
+            f"🧭 Haversine fallback: {total_km:.2f} km / {total_min:.1f} min "
+            f"(vel={v_kmh:.1f} km/h, α={getattr(self, 'alpha_path', 1.0)})"
+        )
+        return {
+            "distancia_km": total_km,
+            "tempo_min": total_min,
+            "rota_coord": coords,
+            "fonte": fonte,
+        }
+
 
     # ============================================================
     # Fechamento e métricas
