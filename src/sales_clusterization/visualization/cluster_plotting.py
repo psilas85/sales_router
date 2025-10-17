@@ -15,13 +15,24 @@ from src.database.db_connection import get_connection
 def buscar_clusters(tenant_id: int, run_id: int):
     """
     Busca clusters (setores) e seus PDVs vinculados ao tenant e run_id.
+    Inclui CNPJ e endereço completo do PDV.
     """
     sql = """
-        SELECT cs.cluster_label, cs.centro_lat, cs.centro_lon,
-               csp.lat, csp.lon, csp.cidade, csp.uf
+        SELECT 
+            cs.cluster_label,
+            cs.centro_lat,
+            cs.centro_lon,
+            csp.lat,
+            csp.lon,
+            csp.cidade,
+            csp.uf,
+            csp.pdv_endereco_completo,
+            csp.cnpj
         FROM cluster_setor cs
         JOIN cluster_setor_pdv csp ON csp.cluster_id = cs.id
-        WHERE cs.run_id = %s AND cs.tenant_id = %s AND csp.tenant_id = %s;
+        WHERE cs.run_id = %s 
+          AND cs.tenant_id = %s 
+          AND csp.tenant_id = %s;
     """
     conn = get_connection()
     with conn.cursor() as cur:
@@ -56,7 +67,7 @@ def buscar_ultimo_run(tenant_id: int):
 def gerar_mapa_clusters(dados, output_path: Path):
     """
     Gera mapa HTML com clusters (macrosetores) e PDVs colorindo por cluster_label.
-    Nesta etapa, o foco é apenas a setorização macro — não há marcador de centro.
+    Agora cada PDV exibe CNPJ e endereço completo no popup.
     """
     import pandas as pd
     import random
@@ -78,15 +89,14 @@ def gerar_mapa_clusters(dados, output_path: Path):
     if pd.isna(lat_centro) or pd.isna(lon_centro):
         lat_centro, lon_centro = -15.78, -47.93  # fallback genérico (centro do Brasil)
 
-    m = folium.Map(location=[lat_centro, lon_centro], zoom_start=6)
+    m = folium.Map(location=[lat_centro, lon_centro], zoom_start=6, tiles="CartoDB positron")
 
     # =====================================================
-    # 🔹 Agrupar por cluster_label (ignorando centro)
+    # 🔹 Agrupar por cluster_label
     # =====================================================
     clusters = {}
     for row in dados:
-        label, _, _, lat, lon, cidade, uf = row
-        # Ignora coordenadas inválidas
+        label, _, _, lat, lon, cidade, uf, endereco, cnpj = row
         if (
             lat is None or lon is None
             or not isinstance(lat, (int, float))
@@ -96,7 +106,7 @@ def gerar_mapa_clusters(dados, output_path: Path):
         ):
             logger.debug(f"⚠️ Coordenadas inválidas ignoradas: Cluster {label} | {cidade}/{uf} | ({lat}, {lon})")
             continue
-        clusters.setdefault(label, []).append((lat, lon, cidade, uf))
+        clusters.setdefault(label, []).append((lat, lon, cidade, uf, endereco, cnpj))
 
     if not clusters:
         logger.warning("⚠️ Nenhum PDV válido encontrado para plotagem.")
@@ -112,18 +122,25 @@ def gerar_mapa_clusters(dados, output_path: Path):
     ]
 
     # =====================================================
-    # 🔹 Plotagem dos PDVs por cluster
+    # 🔹 Plotagem dos PDVs com popups detalhados
     # =====================================================
     for i, (label, pontos) in enumerate(sorted(clusters.items())):
         cor = palette[i % len(palette)]
-        for lat, lon, cidade, uf in pontos:
+        for lat, lon, cidade, uf, endereco, cnpj in pontos:
+            popup_html = f"""
+            <b>Cluster:</b> {label}<br>
+            <b>CNPJ:</b> {cnpj}<br>
+            <b>Endereço:</b> {endereco}<br>
+            <b>Cidade/UF:</b> {cidade}/{uf}<br>
+            <b>Lat/Lon:</b> {lat:.6f}, {lon:.6f}
+            """
             folium.CircleMarker(
                 location=(lat, lon),
                 radius=3,
                 color=cor,
                 fill=True,
-                fill_opacity=0.8,
-                popup=f"Cluster {label} - {cidade}/{uf}"
+                fill_opacity=0.85,
+                popup=folium.Popup(popup_html, max_width=320)
             ).add_to(m)
 
     # =====================================================
@@ -140,18 +157,16 @@ def gerar_mapa_clusters(dados, output_path: Path):
         f"<span style='color:{palette[i % len(palette)]}'>●</span> Cluster {label}"
         for i, label in enumerate(sorted(clusters.keys()))
     ]))
-
     m.get_root().html.add_child(folium.Element(legend_html))
 
     # =====================================================
-    # 🔹 Salva o mapa (sempre sobrescreve)
+    # 🔹 Salvar o mapa
     # =====================================================
     if output_path.exists():
         output_path.unlink()
 
     m.save(output_path)
     logger.success(f"✅ Mapa de clusterização salvo em {output_path}")
-
 
 
 # =========================================================
@@ -175,16 +190,12 @@ def main():
     output_dir = Path(f"output/maps/{args.tenant_id}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 🧩 Sobrescreve sempre o mesmo nome de arquivo
     mapa_html = output_dir / "clusterization_atual.html"
 
     dados = buscar_clusters(args.tenant_id, run_id)
     gerar_mapa_clusters(dados, mapa_html)
 
-    # 🌐 Abre automaticamente (funciona apenas fora do container)
     if args.modo_interativo:
-        if "DISPLAY" not in str(Path.home()):  # simples proteção contra ambiente sem GUI
-            logger.info(f"🌐 Mapa disponível em: {mapa_html.resolve()}")
         try:
             webbrowser.open_new_tab(mapa_html.resolve().as_uri())
         except Exception as e:

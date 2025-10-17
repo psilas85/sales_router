@@ -1,19 +1,29 @@
+# ============================================================
+# 📦 sales_router/src/sales_routing/application/adaptive_subcluster_splitter.py
+# ============================================================
+
 import math
 import numpy as np
 import os
 from sklearn.cluster import KMeans
 from typing import List, Dict, Any
 from datetime import datetime
+from geopy.distance import geodesic
 from loguru import logger
 from src.sales_routing.domain.entities.cluster_data_entity import ClusterData, PDVData
-from src.sales_routing.application.route_optimizer import RouteOptimizer
+
+# ============================================================
+# ⚙️ PARÂMETROS GLOBAIS AJUSTÁVEIS
+# ============================================================
+K_DIVISOR = int(os.getenv("K_DIVISOR", 15))                   # quanto menor → mais subclusters iniciais
+MIN_ROUTE_MINUTES = int(os.getenv("MIN_ROUTE_MINUTES", 240))  # rotas abaixo disso são fundidas
+DOUBLE_LIMIT_CHECK = bool(int(os.getenv("DOUBLE_LIMIT_CHECK", 1)))  # força redivisão se tempo > 2x limite
 
 
 # ============================================================
 # 🔹 Função auxiliar: distância Haversine
 # ============================================================
 def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
-    """Distância Haversine em km entre dois pontos."""
     R = 6371.0
     lat1, lon1 = map(math.radians, a)
     lat2, lon2 = map(math.radians, b)
@@ -26,11 +36,9 @@ def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
 # 🔹 Nearest Neighbor (heurística rápida)
 # ============================================================
 def nearest_neighbor_sequence(centro: dict, pdvs: List[dict]) -> List[dict]:
-    """Ordena PDVs pelo algoritmo Nearest Neighbor usando Haversine."""
     visitados = []
     restantes = pdvs.copy()
     atual = {"lat": centro["lat"], "lon": centro["lon"]}
-
     while restantes:
         prox = min(restantes, key=lambda p: haversine_km(
             (atual["lat"], atual["lon"]), (p["lat"], p["lon"])
@@ -38,29 +46,60 @@ def nearest_neighbor_sequence(centro: dict, pdvs: List[dict]) -> List[dict]:
         visitados.append(prox)
         restantes.remove(prox)
         atual = {"lat": prox["lat"], "lon": prox["lon"]}
-
     return visitados
 
 
 # ============================================================
-# 🔹 Consolidação de subclusters unitários
+# 🔹 Fusão de subclusters curtos (por quantidade de PDVs)
+# ============================================================
+def merge_small_routes(subclusters, min_pdvs: int = 2):
+    """Funde apenas subclusters com até `min_pdvs` PDVs ao mais próximo."""
+    pequenos = [s for s in subclusters if s["n_pdvs"] <= min_pdvs]
+    grandes = [s for s in subclusters if s["n_pdvs"] > min_pdvs]
+
+    if not pequenos or not grandes:
+        return subclusters
+
+    logger.info(f"🔧 Fundindo {len(pequenos)} subclusters com ≤{min_pdvs} PDVs...")
+    for s in pequenos:
+        centro_s = (
+            np.mean([p["lat"] for p in s["pdvs"]]),
+            np.mean([p["lon"] for p in s["pdvs"]])
+        )
+        destino = min(grandes, key=lambda g: geodesic(
+            centro_s,
+            (
+                np.mean([p["lat"] for p in g["pdvs"]]),
+                np.mean([p["lon"] for p in g["pdvs"]])
+            )
+        ).km)
+
+        destino["pdvs"].extend(s["pdvs"])
+        destino["n_pdvs"] += s["n_pdvs"]
+        destino["tempo_total_min"] += s["tempo_total_min"]
+        destino["dist_total_km"] += s["dist_total_km"]
+
+    logger.success(f"✅ {len(pequenos)} subclusters pequenos fundidos ao mais próximo.")
+    return [s for s in grandes]
+
+
+
+# ============================================================
+# 🔹 Consolidação de unitários
 # ============================================================
 def consolidar_unitarios(subclusters, cluster, workday_min, route_km_max, service_min, v_kmh):
-    """Agrupa subclusters com apenas 1 PDV ao mais próximo geograficamente."""
     unitarios = [s for s in subclusters if s["n_pdvs"] == 1]
     if not unitarios:
         return subclusters, 0
 
     logger.info(f"⚙️ Ajustando subclusters unitários ({len(unitarios)} detectados)...")
     fundidos = 0
-
     for sub_unit in unitarios:
         pdv = sub_unit["pdvs"][0]
         candidatos = [s for s in subclusters if s["n_pdvs"] > 1]
         if not candidatos:
             continue
 
-        # Ordena por distância do PDV ao centroide do subcluster de destino
         candidatos.sort(
             key=lambda s: haversine_km(
                 (pdv["lat"], pdv["lon"]),
@@ -81,7 +120,6 @@ def consolidar_unitarios(subclusters, cluster, workday_min, route_km_max, servic
             )
             novo_tempo = destino["tempo_total_min"] + service_min
             nova_dist = destino["dist_total_km"] + dist_extra
-
             if novo_tempo <= workday_min and nova_dist <= route_km_max:
                 destino["pdvs"].append(pdv)
                 destino["n_pdvs"] += 1
@@ -89,43 +127,17 @@ def consolidar_unitarios(subclusters, cluster, workday_min, route_km_max, servic
                 destino["dist_total_km"] = nova_dist
                 subclusters.remove(sub_unit)
                 fundidos += 1
-                logger.debug(
-                    f"   ↳ Sub {sub_unit['subcluster_id']} (1 PDV) agregado ao Sub {destino['subcluster_id']} "
-                    f"({dist_extra:.1f} km)"
-                )
                 break
 
-    if fundidos == 0:
+    if fundidos > 0:
+        logger.success(f"✅ {fundidos} subclusters unitários fundidos.")
+    else:
         logger.info("ℹ️ Nenhum subcluster unitário pôde ser consolidado.")
-        return subclusters, 0
-
-    # ============================================================
-    # 🔁 Reordena e recalcula rotas dos subclusters fundidos
-    # ============================================================
-    logger.info("🔄 Recalculando rotas após fusão de subclusters...")
-    for sub in subclusters:
-        centro = {"lat": cluster.centro_lat, "lon": cluster.centro_lon}
-        pdvs_reordenados = nearest_neighbor_sequence(centro, sub["pdvs"])
-
-        total_km = sum(
-            haversine_km(
-                (pdvs_reordenados[i]["lat"], pdvs_reordenados[i]["lon"]),
-                (pdvs_reordenados[i + 1]["lat"], pdvs_reordenados[i + 1]["lon"])
-            )
-            for i in range(len(pdvs_reordenados) - 1)
-        )
-        tempo_min = (total_km / v_kmh) * 60 + len(pdvs_reordenados) * service_min
-
-        sub["pdvs"] = pdvs_reordenados
-        sub["tempo_total_min"] = tempo_min
-        sub["dist_total_km"] = total_km
-
-    logger.success(f"✅ {fundidos} subclusters unitários consolidados e rotas recalculadas.")
     return subclusters, fundidos
 
 
 # ============================================================
-# 🔹 Divisão adaptativa de clusters com NN + KMeans + consolidação
+# 🔹 Divisão adaptativa com convergência teórica
 # ============================================================
 def dividir_cluster_em_subclusters(
     cluster: ClusterData,
@@ -137,32 +149,25 @@ def dividir_cluster_em_subclusters(
     alpha_path: float,
     aplicar_two_opt: bool = False
 ) -> Dict[str, Any]:
-    """
-    Divide adaptativamente um cluster em subclusters até que TODOS os subclusters
-    respeitem tempo e distância máximos.
-    Após convergência, consolida subclusters com 1 PDV ao mais próximo geograficamente
-    e recalcula as rotas dos grupos fundidos.
-    """
 
-    k = 1
+    k = max(1, int(len(pdvs_cluster) / K_DIVISOR))
     convergiu = False
-    resultados_iter = []
     violacoes = []
 
-    log_path = "/tmp/cluster_split_debug.csv"
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    if not os.path.exists(log_path):
-        with open(log_path, "w", encoding="utf-8") as f:
-            f.write("timestamp,cluster_id,k,max_tempo,max_dist,convergiu\n")
+    diagnostic_log = "/tmp/diagnostic_pre_osrm.csv"
+    os.makedirs(os.path.dirname(diagnostic_log), exist_ok=True)
+    if not os.path.exists(diagnostic_log):
+        with open(diagnostic_log, "w", encoding="utf-8") as f:
+            f.write("timestamp,cluster_id,subcluster_id,tempo_teorico_min,distancia_km,n_pdvs\n")
 
     while not convergiu:
         coords = np.array([[p.lat, p.lon] for p in pdvs_cluster])
         kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto").fit(coords)
         labels = kmeans.labels_
 
-        subclusters = []
-        tempos_sub, dist_sub = [], []
+        subclusters, tempos_sub, dist_sub, pdvs_count = [], [], [], []
         violacoes.clear()
+        hard_split = False
 
         for sub_id in range(k):
             pdvs_sub = [p for i, p in enumerate(pdvs_cluster) if labels[i] == sub_id]
@@ -180,73 +185,66 @@ def dividir_cluster_em_subclusters(
                 )
                 for i in range(len(pdvs_ordenados) - 1)
             )
-            tempo_min = (total_km / v_kmh) * 60 + len(pdvs_ordenados) * service_min
+            tempo_transito = (total_km / v_kmh) * 60
+            tempo_servico = len(pdvs_ordenados) * service_min
+            tempo_teorico = tempo_transito + tempo_servico
 
-            tempos_sub.append(tempo_min)
+            # Diagnóstico
+            if tempo_teorico > workday_min:
+                logger.warning(
+                    f"⏱️ [Pré-OSRM] Sub {sub_id+1} do cluster {cluster.cluster_id} "
+                    f"atingiu {tempo_teorico:.1f} min (> limite {workday_min})."
+                )
+                with open(diagnostic_log, "a", encoding="utf-8") as f:
+                    f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S},{cluster.cluster_id},{sub_id+1},{tempo_teorico:.1f},{total_km:.1f},{len(pdvs_ordenados)}\n")
+
+            if DOUBLE_LIMIT_CHECK and tempo_teorico > workday_min * 2:
+                logger.warning(f"🚨 Forçando hard split no cluster {cluster.cluster_id} (tempo > 2x limite)")
+                k = min(len(pdvs_cluster), k * 2)
+                hard_split = True
+                break
+
+            tempos_sub.append(tempo_teorico)
             dist_sub.append(total_km)
+            pdvs_count.append(len(pdvs_ordenados))
 
-            if tempo_min > workday_min:
-                violacoes.append({
-                    "cluster_id": cluster.cluster_id,
-                    "subcluster_id": sub_id + 1,
-                    "tipo": "tempo",
-                    "valor": tempo_min,
-                    "limite": workday_min
-                })
-            if total_km > route_km_max:
-                violacoes.append({
-                    "cluster_id": cluster.cluster_id,
-                    "subcluster_id": sub_id + 1,
-                    "tipo": "distancia",
-                    "valor": total_km,
-                    "limite": route_km_max
-                })
-
-            logger.debug(
-                f"📍 Cluster {cluster.cluster_id} / Sub {sub_id + 1} → "
-                f"{len(pdvs_sub)} PDVs | {total_km:.1f} km / {tempo_min:.1f} min (NN)"
-            )
+            if tempo_teorico > workday_min or total_km > route_km_max:
+                violacoes.append(True)
 
             subclusters.append({
                 "subcluster_id": sub_id + 1,
                 "n_pdvs": len(pdvs_sub),
-                "tempo_total_min": tempo_min,
+                "tempo_total_min": tempo_teorico,
                 "dist_total_km": total_km,
                 "pdvs": pdvs_ordenados,
                 "rota_coord": []
             })
 
-        max_tempo = max(tempos_sub) if tempos_sub else 0
-        max_dist = max(dist_sub) if dist_sub else 0
-        convergiu = len(violacoes) == 0
+        if hard_split:
+            continue
 
-        resultados_iter.append((k, max_tempo, max_dist, convergiu))
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S},{cluster.cluster_id},{k},{max_tempo:.1f},{max_dist:.1f},{convergiu}\n")
+        convergiu = not any(violacoes)
+        if not convergiu:
+            k = min(len(pdvs_cluster), k + max(1, int(k * 0.3)))
+            logger.info(f"🔁 Reavaliando cluster {cluster.cluster_id} → Novo K={k}")
+            continue
 
-        if convergiu:
-            logger.success(
-                f"🛑 Convergência atingida: todos os subclusters de {cluster.cluster_id} respeitam limites "
-                f"(K={k}, MáxTempo={max_tempo:.1f} min, MáxDist={max_dist:.1f} km)"
-            )
-            subclusters, fundidos = consolidar_unitarios(subclusters, cluster, workday_min, route_km_max, service_min, v_kmh)
-            if fundidos:
-                logger.info(f"🏗️ Cluster {cluster.cluster_id}: {fundidos} unitários fundidos → {len(subclusters)} subclusters finais.")
-            break
+        subclusters, _ = consolidar_unitarios(subclusters, cluster, workday_min, route_km_max, service_min, v_kmh)
+        subclusters = merge_small_routes(subclusters, min_pdvs=2)
 
-        if k >= len(pdvs_cluster):
-            logger.warning(
-                f"⚠️ Cluster {cluster.cluster_id}: limite de PDVs atingido ({len(pdvs_cluster)}). "
-                "Forçando parada sem convergência."
-            )
-            break
 
-        logger.debug(f"🔁 Iteração K={k}: MáxTempo={max_tempo:.1f} | MáxDist={max_dist:.1f} | Convergiu={convergiu}")
-        k += 1
+        mean_tempo = np.mean(tempos_sub or [0])
+        std_tempo = np.std(tempos_sub or [0])
+        mean_pdvs = np.mean(pdvs_count or [0])
+        max_tempo = max(tempos_sub or [0])
+        max_dist = max(dist_sub or [0])
 
-    logger.info(
-        f"🏁 Cluster {cluster.cluster_id}: K_final={k}, MáxTempo={max_tempo:.1f} min, MáxDist={max_dist:.1f} km, Subclusters={len(subclusters)}"
-    )
+        logger.success(
+            f"🛑 Convergência → Cluster {cluster.cluster_id} | K={k} | "
+            f"Rotas={len(subclusters)} | Média={mean_tempo:.1f}±{std_tempo:.1f} min | "
+            f"PDVs médios={mean_pdvs:.1f}"
+        )
+        break
 
     return {
         "cluster_id": cluster.cluster_id,
@@ -254,10 +252,12 @@ def dividir_cluster_em_subclusters(
         "total_pdvs": len(pdvs_cluster),
         "max_tempo": round(max_tempo, 1),
         "max_dist": round(max_dist, 1),
+        "mean_tempo": round(mean_tempo, 1),
+        "std_tempo": round(std_tempo, 1),
+        "mean_pdvs": round(mean_pdvs, 1),
         "subclusters": subclusters,
         "violacoes": violacoes
     }
-
 
 
 # ============================================================
@@ -273,9 +273,8 @@ def gerar_subclusters_adaptativo(
     alpha_path: float,
     aplicar_two_opt: bool = False
 ) -> List[Dict[str, Any]]:
-    """Executa subclusterização adaptativa com auditoria final."""
-    resultados = []
-    violacoes_totais = []
+    resultados, violacoes_totais = [], []
+    logger.info("🚀 Iniciando subclusterização adaptativa com convergência teórica...")
 
     for cluster in clusters:
         pdvs_cluster = [p for p in pdvs if p.cluster_id == cluster.cluster_id]
@@ -289,14 +288,8 @@ def gerar_subclusters_adaptativo(
         resultados.append(resultado)
         violacoes_totais.extend(resultado["violacoes"])
 
-    # Auditoria final
     if violacoes_totais:
-        logger.warning("\n⚠️ Restrições não atendidas:")
-        for v in violacoes_totais:
-            logger.warning(
-                f"   - Cluster {v['cluster_id']} / Sub {v['subcluster_id']} → "
-                f"{v['tipo'].upper()} = {v['valor']:.1f} (limite {v['limite']})"
-            )
+        logger.warning(f"\n⚠️ {len(violacoes_totais)} restrições não atendidas.")
     else:
         logger.success("✅ Todas as rotas atendem aos limites operacionais.")
 

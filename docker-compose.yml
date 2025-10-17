@@ -278,7 +278,6 @@ services:
     build:
       context: .
       dockerfile: ./src/jobs/Dockerfile.routing_subjobs_worker
-    container_name: routing_subjobs_worker
     env_file:
       - .env
     environment:
