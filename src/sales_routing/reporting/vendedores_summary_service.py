@@ -1,4 +1,6 @@
-# src/sales_routing/reporting/vendedores_summary_service.py
+# ============================================================
+# 📦 src/sales_routing/reporting/vendedores_summary_service.py
+# ============================================================
 
 import os
 import json
@@ -11,7 +13,8 @@ class VendedoresSummaryService:
     """
     Gera relatório consolidado de vendedores:
       - 1 linha por vendedor
-      - Inclui base (bairro/cidade), totais e médias diárias/por rota
+      - Usa dados diretos de sales_subcluster (sem JOIN com PDVs)
+      - Inclui totais e médias diárias/por rota
       - Exporta CSV (pt-BR) e JSON
     """
 
@@ -27,27 +30,20 @@ class VendedoresSummaryService:
         with get_connection_context() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT 
+                    SELECT
                         vb.vendedor_id,
-                        vb.base_bairro,
                         vb.base_cidade,
+                        vb.base_bairro,
                         vb.total_pdvs,
-                        vb.total_rotas,
+                        COUNT(s.id) AS total_rotas,
                         SUM(s.dist_total_km) AS km_total,
-                        SUM(s.tempo_total_min) AS tempo_total_min,
-                        COUNT(DISTINCT pd.cidade) AS cidades_pdvs
+                        SUM(s.tempo_total_min) AS tempo_total_min
                     FROM sales_vendedor_base vb
-                    JOIN sales_subcluster s 
-                        ON s.vendedor_id = vb.vendedor_id 
-                        AND s.tenant_id = vb.tenant_id
-                    JOIN sales_subcluster_pdv sp 
-                        ON sp.cluster_id = s.cluster_id
-                        AND sp.subcluster_seq = s.subcluster_seq
-                        AND sp.tenant_id = s.tenant_id
-                    JOIN pdvs pd 
-                        ON pd.id = sp.pdv_id
+                    LEFT JOIN sales_subcluster s
+                        ON s.vendedor_id = vb.vendedor_id
+                       AND s.tenant_id = vb.tenant_id
                     WHERE vb.tenant_id = %s
-                    GROUP BY vb.vendedor_id, vb.base_bairro, vb.base_cidade, vb.total_pdvs, vb.total_rotas
+                    GROUP BY vb.vendedor_id, vb.base_cidade, vb.base_bairro, vb.total_pdvs
                     ORDER BY vb.vendedor_id;
                 """, (self.tenant_id,))
                 rows = cur.fetchall()
@@ -58,28 +54,22 @@ class VendedoresSummaryService:
             logger.warning("⚠️ Nenhum vendedor encontrado para gerar o resumo.")
             return None
 
-        # Calcula médias
-        df["km_medio_diario"] = (df["km_total"] / 20).round(1)
-        df["tempo_medio_diario"] = (df["tempo_total_min"] / 20).round(1)
+        # =====================================================
+        # 🔹 Cálculos adicionais (médias diárias e por rota)
+        # =====================================================
         df["km_medio_por_rota"] = (df["km_total"] / df["total_rotas"]).round(1)
         df["tempo_medio_por_rota"] = (df["tempo_total_min"] / df["total_rotas"]).round(1)
+        df["km_medio_diario"] = (df["km_total"] / 20).round(1)
+        df["tempo_medio_diario"] = (df["tempo_total_min"] / 20).round(1)
 
-        df = df[
-            [
-                "vendedor_id", "base_cidade", "base_bairro",
-                "total_pdvs", "cidades_pdvs", "total_rotas",
-                "km_total", "km_medio_por_rota", "km_medio_diario",
-                "tempo_total_min", "tempo_medio_por_rota", "tempo_medio_diario"
-            ]
-        ]
-
-        # ✅ Formatação numérica para padrão brasileiro
+        # =====================================================
+        # 🔹 Formatação numérica para padrão brasileiro
+        # =====================================================
         colunas_numericas = [
-            "total_pdvs", "cidades_pdvs", "total_rotas",
+            "total_pdvs", "total_rotas",
             "km_total", "km_medio_por_rota", "km_medio_diario",
             "tempo_total_min", "tempo_medio_por_rota", "tempo_medio_diario"
         ]
-
         for col in colunas_numericas:
             df[col] = df[col].apply(
                 lambda x: f"{x:,.1f}".replace(",", "X").replace(".", ",").replace("X", ".") if pd.notna(x) else ""
