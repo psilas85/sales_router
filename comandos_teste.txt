@@ -16,5 +16,7 @@ docker exec -it sales_routing python3 -m src.sales_routing.cli.run_assign_vended
 
 docker exec -it sales_routing python3 -m src.sales_routing.visualization.plot_vendedores --tenant 1 --uf RJ
 
+docker exec -it sales_routing python3 -m src.sales_routing.reporting.export_pdv_vendedor --tenant 1
+
 
 
