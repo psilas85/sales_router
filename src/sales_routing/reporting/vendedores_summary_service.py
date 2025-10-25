@@ -42,18 +42,18 @@ class VendedoresSummaryService:
                     FROM sales_vendedor_base vb
                     LEFT JOIN sales_subcluster_vendedor sv
                         ON sv.vendedor_id = vb.vendedor_id
-                       AND sv.tenant_id = vb.tenant_id
-                       AND sv.assign_id = vb.assign_id
+                    AND sv.tenant_id = vb.tenant_id
+                    AND sv.assign_id = vb.assign_id
                     LEFT JOIN sales_subcluster s
                         ON s.tenant_id = sv.tenant_id
-                       AND s.cluster_id = sv.cluster_id
-                       AND s.subcluster_seq = sv.subcluster_seq
-                       AND s.vendedor_id = sv.vendedor_id
+                    AND s.cluster_id = sv.cluster_id
+                    AND s.subcluster_seq = sv.subcluster_seq
                     WHERE vb.tenant_id = %s
-                      AND vb.assign_id = %s
+                    AND vb.assign_id = %s
                     GROUP BY vb.vendedor_id, vb.base_cidade, vb.base_bairro, vb.total_pdvs
                     ORDER BY vb.vendedor_id;
                 """, (self.tenant_id, self.assign_id))
+
 
                 rows = cur.fetchall()
                 colnames = [desc[0] for desc in cur.description]

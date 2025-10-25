@@ -219,8 +219,8 @@ class SalesRoutingDatabaseReader:
     # =========================================================
     # 8️⃣ Rotas operacionais
     # =========================================================
-    def get_operational_routes(self, tenant_id: int, uf: str = None, cidade: str = None):
-        """Retorna as rotas operacionais, com filtros opcionais por UF e cidade."""
+    def get_operational_routes(self, tenant_id: int, routing_id: str, uf: str = None, cidade: str = None):
+        """Retorna as rotas operacionais filtradas por tenant_id e routing_id (UF/cidade opcionais)."""
         with get_connection_context() as conn:
             with conn.cursor() as cur:
                 sql = """
@@ -235,14 +235,17 @@ class SalesRoutingDatabaseReader:
                         AVG(p.lon) AS centro_lon
                     FROM sales_subcluster s
                     JOIN sales_subcluster_pdv p
-                      ON p.cluster_id = s.cluster_id
-                     AND p.subcluster_seq = s.subcluster_seq
-                     AND p.tenant_id = s.tenant_id
+                    ON p.cluster_id = s.cluster_id
+                    AND p.subcluster_seq = s.subcluster_seq
+                    AND p.tenant_id = s.tenant_id
+                    AND p.routing_id = s.routing_id
                     LEFT JOIN pdvs pd
-                      ON pd.id = p.pdv_id
+                    ON pd.id = p.pdv_id
                     WHERE s.tenant_id = %s
+                    AND s.routing_id = %s
                 """
-                params = [tenant_id]
+                params = [tenant_id, routing_id]
+
                 if uf:
                     sql += " AND pd.uf = %s"
                     params.append(uf)
@@ -261,12 +264,13 @@ class SalesRoutingDatabaseReader:
                 rows = cur.fetchall()
                 colnames = [desc[0] for desc in cur.description]
                 logger.info(
-                    f"📦 {len(rows)} rotas carregadas (tenant={tenant_id}"
+                    f"📦 {len(rows)} rotas carregadas (tenant={tenant_id} | routing_id={routing_id}"
                     + (f" | UF={uf}" if uf else "")
                     + (f" | Cidade={cidade}" if cidade else "")
                     + ")"
                 )
                 return [dict(zip(colnames, row)) for row in rows]
+
 
     # =========================================================
     # 9️⃣ Lista de cidades por UF
