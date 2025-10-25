@@ -1,25 +1,152 @@
-# src/sales_clusterization/application/cluster_use_case.py
-
 # ============================================================
 # 📦 src/sales_clusterization/application/cluster_use_case.py
 # ============================================================
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from loguru import logger
+import numpy as np
 from src.sales_clusterization.infrastructure.persistence.database_reader import carregar_pdvs
 from src.sales_clusterization.infrastructure.persistence.database_writer import (
     criar_run,
     finalizar_run,
     salvar_setores,
     salvar_mapeamento_pdvs,
+    salvar_outliers,
 )
 from src.sales_clusterization.infrastructure.logging.run_logger import snapshot_params
-from src.sales_clusterization.domain.k_estimator import estimar_k_inicial
+from src.sales_clusterization.domain.k_estimator import estimar_k_inicial, _haversine_km
 from src.sales_clusterization.domain.sector_generator import kmeans_setores
 from src.sales_clusterization.domain.sector_generator_hybrid import dbscan_kmeans_balanceado
 from src.sales_clusterization.domain.validators import checar_raio
+from src.sales_clusterization.domain.entities import PDV
 
 
+# ============================================================
+# 🧠 Detecção de Outliers Geográficos Adaptativa e Suavizada
+# ============================================================
+
+from typing import List, Optional
+import numpy as np
+from sklearn.neighbors import NearestNeighbors
+from loguru import logger
+from math import radians, sin, cos, sqrt, atan2
+
+
+# ---------------------------------------
+# Distância haversine (km)
+# ---------------------------------------
+def _haversine_km(a, b):
+    R = 6371.0
+    lat1, lon1, lat2, lon2 = map(radians, [a[0], a[1], b[0], b[1]])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    h = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
+    return 2 * R * atan2(sqrt(h), sqrt(1 - h))
+
+
+# ---------------------------------------
+# Função principal
+# ---------------------------------------
+def detectar_outliers_geograficos(
+    pdvs: List,
+    z_thresh: float = 2.0,
+    metodo: Optional[str] = None,
+    limite_urbano_km: Optional[float] = None,
+):
+    """
+    Detecta outliers geográficos com base na distância ao vizinho mais próximo.
+
+    🔹 Adaptativo — sem limite fixo:
+       O raio urbano é estimado automaticamente a partir da densidade local
+       (distância média até o 5º vizinho mais próximo).
+
+    🔹 Suavizado:
+       O limiar final combina estatísticas globais (Z-score/IQR) e densidade urbana,
+       reduzindo falsos positivos em regiões densas.
+    """
+    if len(pdvs) < 5:
+        logger.warning("⚠️ Poucos PDVs para detecção de outliers — nenhum removido.")
+        return [(p, False) for p in pdvs]
+
+    coords = np.array([[p.lat, p.lon] for p in pdvs])
+
+    # =====================================================
+    # 🧭 1️⃣ Densidade local → limite urbano dinâmico
+    # =====================================================
+    k = min(5, len(coords) - 1)
+    nn = NearestNeighbors(n_neighbors=k)
+    nn.fit(coords)
+    dist_k, _ = nn.kneighbors(coords)
+    media_k5 = np.mean(dist_k[:, -1]) * 111  # converte graus → km
+
+    # limite dinâmico adaptado ao contexto
+    limite_dinamico = np.clip(media_k5 * 7, 4, 12)
+    if limite_urbano_km is None:
+        limite_urbano_km = limite_dinamico
+
+    # =====================================================
+    # 📏 2️⃣ Cálculo da distância mínima entre vizinhos
+    # =====================================================
+    dists = []
+    for i, a in enumerate(coords):
+        vizinhos = [_haversine_km(a, b) for j, b in enumerate(coords) if i != j]
+        dists.append(min(vizinhos) if vizinhos else 0.0)
+
+    dist_mean = np.mean(dists)
+    dist_std = np.std(dists)
+    q1, q3 = np.percentile(dists, [25, 75])
+    iqr = q3 - q1
+
+    # =====================================================
+    # ⚙️ 3️⃣ Seleção automática de método (se não especificado)
+    # =====================================================
+    if metodo is None:
+        if dist_std < 2:
+            metodo = "iqr"
+        elif dist_std > 5:
+            metodo = "zscore"
+        else:
+            metodo = "hibrido"
+
+    # =====================================================
+    # 📊 4️⃣ Definição de limiar de outlier (com suavização)
+    # =====================================================
+    if metodo == "iqr":
+        limiar = q3 + 2.5 * iqr
+        metodo_desc = f"IQR adaptativo (Q3 + 2.5*IQR = {limiar:.2f} km)"
+    elif metodo == "zscore":
+        limiar = dist_mean + z_thresh * dist_std
+        metodo_desc = f"Z-score adaptativo (μ + {z_thresh}σ = {limiar:.2f} km)"
+    else:
+        limiar_z = dist_mean + z_thresh * dist_std
+        limiar_iqr = q3 + 2.5 * iqr
+
+        # suavização entre estatística e limite urbano
+        limiar = (min(limiar_z, limiar_iqr) * 0.7) + (limite_urbano_km * 0.3)
+
+        metodo_desc = (
+            f"Híbrido adaptativo suavizado (z={limiar_z:.2f}, iqr={limiar_iqr:.2f}, "
+            f"urbano={limite_urbano_km:.2f} → final={limiar:.2f} km)"
+        )
+
+    # =====================================================
+    # 🧹 5️⃣ Detecção final
+    # =====================================================
+    flags = [d > limiar for d in dists]
+    removidos = sum(flags)
+
+    logger.info(
+        f"🧹 Detecção de outliers [{metodo_desc}] | média={dist_mean:.2f} km | std={dist_std:.2f} | "
+        f"densidade média (k5)={media_k5:.2f} km | limite dinâmico={limite_dinamico:.2f} km | "
+        f"outliers detectados={removidos}/{len(pdvs)}"
+    )
+
+    return [(pdvs[i], flags[i]) for i in range(len(pdvs))]
+
+
+
+# ============================================================
+# 🧠 Execução principal da clusterização
+# ============================================================
 def executar_clusterizacao(
     tenant_id: int,
     uf: Optional[str],
@@ -37,13 +164,11 @@ def executar_clusterizacao(
     descricao: str,
     input_id: str,
     clusterization_id: str,
+    excluir_outliers: bool = False,
+    z_thresh: float = 3.0,
 ) -> Dict[str, Any]:
     """
-    Executa o fluxo completo de clusterização:
-    - Usa o input_id informado para buscar PDVs da base correta
-    - Cria um registro histórico no banco com clusterization_id e descrição
-    - Executa o algoritmo (KMeans ou DBSCAN balanceado)
-    - Persiste resultados completos sem sobrescrever dados anteriores
+    Executa o fluxo completo de clusterização com detecção robusta de outliers.
     """
 
     logger.info(
@@ -51,7 +176,7 @@ def executar_clusterizacao(
         f"| algo={algo} | input_id={input_id} | clusterization_id={clusterization_id}"
     )
 
-    # 1️⃣ Carrega PDVs da base vinculada ao input_id
+    # 1️⃣ Carrega PDVs
     pdvs = carregar_pdvs(tenant_id=tenant_id, input_id=input_id, uf=uf, cidade=cidade)
     if not pdvs:
         raise ValueError(
@@ -59,7 +184,26 @@ def executar_clusterizacao(
         )
     logger.info(f"✅ {len(pdvs)} PDVs carregados (input_id={input_id}).")
 
-    # 2️⃣ Snapshot de parâmetros
+    # 2️⃣ Detecta e salva outliers (modo híbrido)
+    pdv_flags = detectar_outliers_geograficos(pdvs, z_thresh=z_thresh, metodo="hibrido")
+    total_outliers = sum(1 for _, flag in pdv_flags if flag)
+
+    # Salva todos com flag no banco
+    try:
+        salvar_outliers(tenant_id, clusterization_id, pdv_flags)
+        logger.info(f"🗄️ {len(pdv_flags)} PDVs registrados com flag de outlier (total={total_outliers}).")
+    except Exception as e:
+        logger.warning(f"⚠️ Falha ao salvar tabela de outliers: {e}")
+
+    # 3️⃣ Filtra se o usuário optou por excluir
+    if excluir_outliers:
+        pdvs_filtrados = [p for p, flag in pdv_flags if not flag]
+        logger.info(f"📉 {total_outliers} outliers removidos | {len(pdvs_filtrados)} PDVs restantes.")
+        pdvs = pdvs_filtrados
+    else:
+        logger.info("✅ Outliers incluídos (nenhum removido).")
+
+    # 4️⃣ Snapshot de parâmetros
     params = snapshot_params(
         uf=uf,
         cidade=cidade,
@@ -79,7 +223,7 @@ def executar_clusterizacao(
         clusterization_id=clusterization_id,
     )
 
-    # 3️⃣ Cria registro de execução
+    # 5️⃣ Cria registro de execução
     run_id = criar_run(
         tenant_id=tenant_id,
         uf=uf,
@@ -93,7 +237,7 @@ def executar_clusterizacao(
     logger.info(f"🆕 Execução registrada | run_id={run_id} | clusterization_id={clusterization_id}")
 
     try:
-        # 4️⃣ Execução do algoritmo
+        # 6️⃣ Execução do algoritmo
         if algo == "kmeans":
             if k_forcado:
                 k0 = k_forcado
@@ -119,12 +263,12 @@ def executar_clusterizacao(
         else:
             raise ValueError("Algoritmo não suportado. Use 'kmeans' ou 'dbscan'.")
 
-        # 5️⃣ Salvar resultados
+        # 7️⃣ Persistência
         mapping = salvar_setores(tenant_id, run_id, setores)
         salvar_mapeamento_pdvs(tenant_id, run_id, mapping, labels, pdvs)
         logger.info(f"✅ Clusterização salva no banco (run_id={run_id}, clusterization_id={clusterization_id}).")
 
-        # 6️⃣ Finalizar run
+        # 8️⃣ Finaliza run
         finalizar_run(run_id, k_final=k0, status="done")
         logger.success(f"🏁 Clusterização concluída | run_id={run_id} | K={k0}")
 
@@ -136,6 +280,7 @@ def executar_clusterizacao(
             "k_final": k0,
             "n_pdvs": len(pdvs),
             "diagnostico": diag,
+            "outliers": total_outliers,
             "setores": [
                 {
                     "cluster_label": s.cluster_label,

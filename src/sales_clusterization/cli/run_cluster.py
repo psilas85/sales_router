@@ -43,8 +43,23 @@ def main():
         help="Máximo de PDVs permitidos por cluster (usado no balanceamento híbrido DBSCAN + KMeans)",
     )
 
-    # 🆕 Novo argumento: clusterization_id vindo do job principal
+    # 🆕 Novo argumento: opção de excluir outliers (padrão = incluir)
+    parser.add_argument(
+        "--excluir_outliers",
+        action="store_true",
+        help="Exclui PDVs outliers (pontos isolados geograficamente). Por padrão, outliers são incluídos.",
+    )
+
+    # 🆕 clusterization_id vindo do job principal (opcional)
     parser.add_argument("--clusterization_id", type=str, required=False, help="ID da clusterização (externo)")
+
+    parser.add_argument(
+    "--z_thresh",
+    type=float,
+    default=3.0,
+    help="Fator z-score para detecção de outliers (padrão=3.0). Valores menores tornam a detecção mais sensível (ex: 2.0 ou 1.5).",
+)
+
 
     args = parser.parse_args()
 
@@ -62,6 +77,7 @@ def main():
         f"input_id={args.input_id} | algoritmo={args.algo}"
     )
     logger.info(f"🆕 clusterization_id={clusterization_id} | descrição='{args.descricao}'")
+    logger.info(f"🔧 Excluir outliers: {args.excluir_outliers}")
 
     # ============================================================
     # 🧠 Execução principal
@@ -83,6 +99,8 @@ def main():
         descricao=args.descricao,
         input_id=args.input_id,
         clusterization_id=clusterization_id,  # 👈 Usa o mesmo ID
+        excluir_outliers=args.excluir_outliers,  # 👈 Novo parâmetro
+        z_thresh=args.z_thresh,
     )
 
     # ============================================================

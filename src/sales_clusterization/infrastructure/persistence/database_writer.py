@@ -7,6 +7,10 @@
 import json
 import numpy as np
 import psycopg2
+import os
+import csv
+from datetime import datetime
+from pathlib import Path
 from typing import List, Dict
 from src.sales_clusterization.domain.entities import Setor, PDV
 from src.database.db_connection import get_connection
@@ -203,3 +207,115 @@ def salvar_mapeamento_pdvs(
             conn.commit()
 
     logger.info(f"🧩 {count} PDVs mapeados em clusters (run_id={run_id})")
+
+# ============================================================
+# 🧾 Persistência e auditoria de outliers (versão final)
+# ============================================================
+
+import math
+from src.sales_clusterization.domain.k_estimator import _haversine_km
+
+def salvar_outliers(tenant_id: int, clusterization_id: str, pdv_flags: list):
+    """
+    Persiste lista de PDVs com flag de outlier (True/False) no banco,
+    calcula distância média ao vizinho mais próximo e exporta CSV de auditoria.
+    Inclui limpeza automática (DELETE) para reprocessamentos.
+    """
+    if not pdv_flags:
+        logger.warning("⚠️ Nenhum PDV recebido para salvar_outliers().")
+        return
+
+    conn = get_connection()
+    with conn.cursor() as cur:
+        # ============================================================
+        # 🔧 Garante estrutura e remove dados antigos (reprocessamento)
+        # ============================================================
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sales_clusterization_outliers (
+                id SERIAL PRIMARY KEY,
+                tenant_id INT NOT NULL,
+                clusterization_id UUID NOT NULL,
+                pdv_id BIGINT,
+                cnpj TEXT,
+                cidade TEXT,
+                lat DOUBLE PRECISION,
+                lon DOUBLE PRECISION,
+                distancia_media_km DOUBLE PRECISION,
+                is_outlier BOOLEAN DEFAULT FALSE,
+                criado_em TIMESTAMP DEFAULT NOW()
+            );
+        """)
+
+        # Remove registros anteriores do mesmo processamento
+        cur.execute(
+            "DELETE FROM sales_clusterization_outliers WHERE tenant_id = %s AND clusterization_id = %s;",
+            (tenant_id, clusterization_id),
+        )
+
+        # ============================================================
+        # 📏 Calcula distância média ao vizinho mais próximo (para auditoria)
+        # ============================================================
+        coords = [(p.lat, p.lon) for p, _ in pdv_flags]
+        dist_medias = []
+        for i, (lat_a, lon_a) in enumerate(coords):
+            vizinhos = [
+                _haversine_km((lat_a, lon_a), (lat_b, lon_b))
+                for j, (lat_b, lon_b) in enumerate(coords)
+                if i != j
+            ]
+            dist_medias.append(float(np.mean(vizinhos)) if vizinhos else 0.0)
+
+        # ============================================================
+        # 💾 Insere registros no banco
+        # ============================================================
+        rows = [
+            (
+                tenant_id,
+                clusterization_id,
+                p.id,
+                p.cnpj,
+                p.cidade,
+                p.lat,
+                p.lon,
+                dist_medias[i],
+                bool(flag),
+            )
+            for i, (p, flag) in enumerate(pdv_flags)
+        ]
+
+        cur.executemany("""
+            INSERT INTO sales_clusterization_outliers
+            (tenant_id, clusterization_id, pdv_id, cnpj, cidade, lat, lon, distancia_media_km, is_outlier)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+        """, rows)
+
+    conn.commit()
+    conn.close()
+
+    total_outliers = sum(1 for _, flag in pdv_flags if flag)
+    logger.info(f"🗄️ {len(rows)} registros de outliers gravados no banco para tenant={tenant_id}.")
+    logger.success(f"📊 Outliers detectados: {total_outliers} de {len(rows)} PDVs totais ({100*total_outliers/len(rows):.2f}%).")
+
+    # ============================================================
+    # 📤 Exporta CSV de auditoria
+    # ============================================================
+    try:
+        base_dir = Path("output/auditoria_outliers") / str(tenant_id)
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        data_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = base_dir / f"outliers_{tenant_id}_{clusterization_id}_{data_str}.csv"
+
+        with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow([
+                "tenant_id", "clusterization_id", "pdv_id", "cnpj", "cidade",
+                "lat", "lon", "distancia_media_km", "is_outlier"
+            ])
+            for r in rows:
+                writer.writerow(r)
+
+        logger.success(f"📁 CSV de auditoria salvo em: {csv_path}")
+
+    except Exception as e:
+        logger.warning(f"⚠️ Falha ao exportar CSV de outliers: {e}")
