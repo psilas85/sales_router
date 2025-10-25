@@ -127,7 +127,59 @@ class SalesRoutingDatabaseReader:
                 return dict(row)
 
     # =========================================================
-    # 5️⃣ Lista snapshots
+    # 5️⃣ Lista histórico de roteirizações (novo)
+    # =========================================================
+    def list_routings(self, tenant_id: int) -> List[Dict[str, Any]]:
+        """
+        Retorna o histórico de execuções de roteirização (historico_subcluster_jobs)
+        para o tenant informado.
+        """
+        with get_connection_context() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT 
+                        routing_id,
+                        clusterization_id,
+                        descricao,
+                        criado_por,
+                        criado_em
+                    FROM historico_subcluster_jobs
+                    WHERE tenant_id = %s
+                    ORDER BY criado_em DESC;
+                """, (tenant_id,))
+                rows = cur.fetchall()
+                logger.info(f"📜 {len(rows)} execuções encontradas no histórico (tenant={tenant_id})")
+                return [dict(row) for row in rows]
+
+    # =========================================================
+    # 6️⃣ Busca execução específica de roteirização (novo)
+    # =========================================================
+    def get_routing_by_id(self, tenant_id: int, routing_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Busca uma execução de roteirização específica pelo routing_id.
+        """
+        with get_connection_context() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT 
+                        routing_id,
+                        clusterization_id,
+                        descricao,
+                        criado_por,
+                        criado_em
+                    FROM historico_subcluster_jobs
+                    WHERE tenant_id = %s AND routing_id = %s
+                    LIMIT 1;
+                """, (tenant_id, routing_id))
+                row = cur.fetchone()
+                if not row:
+                    logger.warning(f"⚠️ Nenhuma execução encontrada com routing_id={routing_id} (tenant={tenant_id})")
+                    return None
+                logger.info(f"📦 Execução encontrada (routing_id={routing_id})")
+                return dict(row)
+
+    # =========================================================
+    # 7️⃣ Lista snapshots
     # =========================================================
     def list_snapshots(self, tenant_id, uf=None, cidade=None):
         """Lista snapshots do tenant, com filtros opcionais por UF e cidade."""
@@ -160,77 +212,6 @@ class SalesRoutingDatabaseReader:
                         "tags": r[4],
                         "uf": r[5],
                         "cidade": r[6],
-                    }
-                    for r in rows
-                ]
-
-    # =========================================================
-    # 6️⃣ Busca snapshot por nome
-    # =========================================================
-    def get_snapshot_by_name(self, tenant_id, nome):
-        """Busca um snapshot específico pelo nome."""
-        with get_connection_context() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id, nome, descricao, uf, cidade
-                    FROM sales_routing_snapshot
-                    WHERE tenant_id = %s AND nome = %s
-                    ORDER BY criado_em DESC
-                    LIMIT 1;
-                """, (tenant_id, nome))
-                row = cur.fetchone()
-                if not row:
-                    return None
-                return {
-                    "id": row[0],
-                    "nome": row[1],
-                    "descricao": row[2],
-                    "uf": row[3],
-                    "cidade": row[4],
-                }
-
-    # =========================================================
-    # 7️⃣ Subclusters e PDVs de snapshot
-    # =========================================================
-    def get_snapshot_subclusters(self, snapshot_id):
-        """Retorna subclusters de um snapshot específico."""
-        with get_connection_context() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT cluster_id, subcluster_seq, k_final, tempo_total_min,
-                           dist_total_km, n_pdvs
-                    FROM sales_routing_snapshot_subcluster
-                    WHERE snapshot_id = %s;
-                """, (snapshot_id,))
-                rows = cur.fetchall()
-                return [
-                    {
-                        "cluster_id": r[0],
-                        "subcluster_seq": r[1],
-                        "k_final": r[2],
-                        "tempo_total_min": r[3],
-                        "dist_total_km": r[4],
-                        "n_pdvs": r[5],
-                    }
-                    for r in rows
-                ]
-
-    def get_snapshot_pdvs(self, snapshot_id):
-        """Retorna PDVs de um snapshot específico."""
-        with get_connection_context() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT cluster_id, subcluster_seq, pdv_id, sequencia_ordem
-                    FROM sales_routing_snapshot_pdv
-                    WHERE snapshot_id = %s;
-                """, (snapshot_id,))
-                rows = cur.fetchall()
-                return [
-                    {
-                        "cluster_id": r[0],
-                        "subcluster_seq": r[1],
-                        "pdv_id": r[2],
-                        "sequencia_ordem": r[3],
                     }
                     for r in rows
                 ]

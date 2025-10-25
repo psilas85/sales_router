@@ -1,5 +1,9 @@
 #sales_router/src/sales_clusterization/visualization/cluster_plotting.py
 
+# =========================================================
+# 📦 src/sales_clusterization/visualization/cluster_plotting.py
+# =========================================================
+
 import folium
 import argparse
 import webbrowser
@@ -12,10 +16,27 @@ from src.database.db_connection import get_connection
 # 1️⃣ BUSCAS DE DADOS
 # =========================================================
 
+def buscar_run_por_clusterization_id(tenant_id: int, clusterization_id: str):
+    """
+    Retorna o run_id correspondente a um clusterization_id e tenant_id.
+    """
+    sql = """
+        SELECT id
+        FROM cluster_run
+        WHERE tenant_id = %s AND clusterization_id = %s
+        LIMIT 1;
+    """
+    conn = get_connection()
+    with conn.cursor() as cur:
+        cur.execute(sql, (tenant_id, clusterization_id))
+        row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
 def buscar_clusters(tenant_id: int, run_id: int):
     """
-    Busca clusters (setores) e seus PDVs vinculados ao tenant e run_id.
-    Inclui CNPJ e endereço completo do PDV.
+    Busca clusters (setores) e PDVs vinculados ao run_id informado.
     """
     sql = """
         SELECT 
@@ -42,24 +63,6 @@ def buscar_clusters(tenant_id: int, run_id: int):
     return rows
 
 
-def buscar_ultimo_run(tenant_id: int):
-    """
-    Busca o último run finalizado do tenant informado.
-    """
-    sql = """
-        SELECT id FROM cluster_run
-        WHERE tenant_id = %s AND status = 'done'
-        ORDER BY finished_at DESC
-        LIMIT 1;
-    """
-    conn = get_connection()
-    with conn.cursor() as cur:
-        cur.execute(sql, (tenant_id,))
-        row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
 # =========================================================
 # 2️⃣ FUNÇÃO DE PLOTAGEM
 # =========================================================
@@ -67,7 +70,7 @@ def buscar_ultimo_run(tenant_id: int):
 def gerar_mapa_clusters(dados, output_path: Path):
     """
     Gera mapa HTML com clusters (macrosetores) e PDVs colorindo por cluster_label.
-    Agora cada PDV exibe CNPJ e endereço completo no popup.
+    Cada PDV exibe CNPJ e endereço completo no popup.
     """
     import pandas as pd
     import random
@@ -77,9 +80,6 @@ def gerar_mapa_clusters(dados, output_path: Path):
         logger.warning("❌ Nenhum dado de clusterização encontrado.")
         return
 
-    # =====================================================
-    # 🔹 Centraliza o mapa com base na média dos PDVs
-    # =====================================================
     latitudes = [row[3] for row in dados if isinstance(row[3], (int, float)) and not math.isnan(row[3])]
     longitudes = [row[4] for row in dados if isinstance(row[4], (int, float)) and not math.isnan(row[4])]
 
@@ -91,9 +91,6 @@ def gerar_mapa_clusters(dados, output_path: Path):
 
     m = folium.Map(location=[lat_centro, lon_centro], zoom_start=6, tiles="CartoDB positron")
 
-    # =====================================================
-    # 🔹 Agrupar por cluster_label
-    # =====================================================
     clusters = {}
     for row in dados:
         label, _, _, lat, lon, cidade, uf, endereco, cnpj = row
@@ -112,18 +109,12 @@ def gerar_mapa_clusters(dados, output_path: Path):
         logger.warning("⚠️ Nenhum PDV válido encontrado para plotagem.")
         return
 
-    # =====================================================
-    # 🔹 Paleta de cores legível
-    # =====================================================
     random.seed(42)
     palette = [
         "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
         "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
     ]
 
-    # =====================================================
-    # 🔹 Plotagem dos PDVs com popups detalhados
-    # =====================================================
     for i, (label, pontos) in enumerate(sorted(clusters.items())):
         cor = palette[i % len(palette)]
         for lat, lon, cidade, uf, endereco, cnpj in pontos:
@@ -143,9 +134,6 @@ def gerar_mapa_clusters(dados, output_path: Path):
                 popup=folium.Popup(popup_html, max_width=320)
             ).add_to(m)
 
-    # =====================================================
-    # 🔹 Legenda
-    # =====================================================
     legend_html = """
     <div style="
         position: fixed; bottom: 50px; left: 50px; width: 180px;
@@ -159,9 +147,6 @@ def gerar_mapa_clusters(dados, output_path: Path):
     ]))
     m.get_root().html.add_child(folium.Element(legend_html))
 
-    # =====================================================
-    # 🔹 Salvar o mapa
-    # =====================================================
     if output_path.exists():
         output_path.unlink()
 
@@ -174,23 +159,23 @@ def gerar_mapa_clusters(dados, output_path: Path):
 # =========================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Gerar mapa de clusterização de PDVs (multi-tenant)")
+    parser = argparse.ArgumentParser(description="Gerar mapa de clusterização de PDVs (multi-tenant, via clusterization_id)")
     parser.add_argument("--tenant_id", type=int, required=True, help="ID do tenant")
-    parser.add_argument("--run_id", type=int, help="ID da execução (opcional, busca último se omitido)")
+    parser.add_argument("--clusterization_id", type=str, required=True, help="UUID da clusterização a ser plotada")
     parser.add_argument("--modo_interativo", action="store_true", help="Abre o mapa no navegador (somente fora do Docker)")
     args = parser.parse_args()
 
-    run_id = args.run_id or buscar_ultimo_run(args.tenant_id)
+    run_id = buscar_run_por_clusterization_id(args.tenant_id, args.clusterization_id)
     if not run_id:
-        logger.error(f"❌ Nenhum run_id encontrado para tenant_id={args.tenant_id}.")
+        logger.error(f"❌ Nenhum run encontrado para tenant_id={args.tenant_id} e clusterization_id={args.clusterization_id}.")
         return
 
-    logger.info(f"🗺️ Gerando mapa de clusterização | tenant_id={args.tenant_id} | run_id={run_id}")
+    logger.info(f"🗺️ Gerando mapa | tenant_id={args.tenant_id} | clusterization_id={args.clusterization_id} | run_id={run_id}")
 
     output_dir = Path(f"output/maps/{args.tenant_id}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    mapa_html = output_dir / "clusterization_atual.html"
+    mapa_html = output_dir / f"clusterization_{args.clusterization_id}.html"
 
     dados = buscar_clusters(args.tenant_id, run_id)
     gerar_mapa_clusters(dados, mapa_html)

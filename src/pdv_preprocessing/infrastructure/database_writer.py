@@ -1,3 +1,5 @@
+#sales_router/src/pdv_preprocessing/infrastructure/database_writer.py
+
 import logging
 import time
 from psycopg2.extras import execute_values
@@ -8,71 +10,52 @@ class DatabaseWriter:
         self.conn = conn
 
     # ============================================================
-    # 💾 Inserção / atualização de PDVs (com contagem e desempenho)
+    # 💾 Inserção de PDVs (com input_id e descricao)
     # ============================================================
     def inserir_pdvs(self, lista_pdvs):
         if not lista_pdvs:
             logging.warning("⚠️ Nenhum PDV para inserir.")
-            return 0, 0
+            return 0
 
         inicio = time.time()
         cur = self.conn.cursor()
 
-        # 🔹 Prepara valores
+        # 🔹 Prepara valores para o INSERT
         valores = [
             (
-                p.tenant_id, p.cnpj, p.logradouro, p.numero, p.bairro, p.cidade,
-                p.uf, p.cep, p.pdv_endereco_completo, p.pdv_lat, p.pdv_lon, p.status_geolocalizacao
+                p.tenant_id, p.input_id, p.descricao, p.cnpj, p.logradouro, p.numero, p.bairro,
+                p.cidade, p.uf, p.cep, p.pdv_endereco_completo,
+                p.pdv_lat, p.pdv_lon, p.status_geolocalizacao
             )
             for p in lista_pdvs
         ]
 
-        # ✅ Corrigido: removido 'atualizado_em' do INSERT
         sql = """
             INSERT INTO pdvs (
-                tenant_id, cnpj, logradouro, numero, bairro, cidade, uf, cep,
-                pdv_endereco_completo, pdv_lat, pdv_lon, status_geolocalizacao
+                tenant_id, input_id, descricao, cnpj, logradouro, numero, bairro,
+                cidade, uf, cep, pdv_endereco_completo,
+                pdv_lat, pdv_lon, status_geolocalizacao
             )
             VALUES %s
-            ON CONFLICT (tenant_id, cnpj)
-            DO UPDATE SET
-                logradouro = EXCLUDED.logradouro,
-                numero = EXCLUDED.numero,
-                bairro = EXCLUDED.bairro,
-                cidade = EXCLUDED.cidade,
-                uf = EXCLUDED.uf,
-                cep = EXCLUDED.cep,
-                pdv_endereco_completo = EXCLUDED.pdv_endereco_completo,
-                pdv_lat = EXCLUDED.pdv_lat,
-                pdv_lon = EXCLUDED.pdv_lon,
-                status_geolocalizacao = EXCLUDED.status_geolocalizacao,
-                atualizado_em = NOW()
-            RETURNING xmax = 0 AS inserido;
+            ON CONFLICT (tenant_id, input_id, cnpj)
+            DO NOTHING;
         """
 
         try:
             execute_values(cur, sql, valores)
-            resultados = cur.fetchall()
             self.conn.commit()
-
-            # 🔹 Contagem de novos e sobrescritos
-            inseridos = sum(1 for r in resultados if r[0])
-            sobrescritos = len(resultados) - inseridos
-
+            inseridos = cur.rowcount or len(valores)
             dur = time.time() - inicio
-            logging.info(
-                f"💾 [PDV_DB] {inseridos} novos / 🔁 {sobrescritos} sobrescritos "
-                f"({dur:.2f}s)"
-            )
-            return inseridos, sobrescritos
+            logging.info(f"💾 [PDV_DB] Inseridos {inseridos} PDVs ({dur:.2f}s)")
+            return inseridos
 
         except Exception as e:
             self.conn.rollback()
-            logging.error(f"❌ Erro ao inserir/atualizar PDVs: {e}", exc_info=True)
-            return 0, 0
-
+            logging.error(f"❌ Erro ao inserir PDVs: {e}", exc_info=True)
+            return 0
         finally:
             cur.close()
+
 
     # ============================================================
     # 🗺️ Inserção no cache de endereços
@@ -98,7 +81,6 @@ class DatabaseWriter:
     def salvar_historico_pdv_job(
         self,
         tenant_id: int,
-        job_id: str,
         arquivo: str,
         status: str,
         total_processados: int,
@@ -108,9 +90,15 @@ class DatabaseWriter:
         mensagem: str = None,
         inseridos: int = 0,
         sobrescritos: int = 0,
+        descricao: str = None,
+        input_id: str = None,
+        job_id: str = None,
     ):
         """Salva histórico de execução do pré-processamento de PDVs."""
         try:
+            # 🔁 fallback automático: se job_id não for informado, usa o input_id
+            job_id = job_id or input_id
+
             cur = self.conn.cursor()
             cur.execute("""
                 INSERT INTO historico_pdv_jobs (
@@ -125,9 +113,11 @@ class DatabaseWriter:
                     mensagem,
                     inseridos,
                     sobrescritos,
-                    criado_em
+                    criado_em,
+                    descricao,
+                    input_id
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW());
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s);
             """, (
                 tenant_id,
                 job_id,
@@ -139,15 +129,23 @@ class DatabaseWriter:
                 arquivo_invalidos,
                 mensagem,
                 inseridos,
-                sobrescritos
+                sobrescritos,
+                descricao,
+                input_id
             ))
             self.conn.commit()
             cur.close()
+
             logging.info(
-                f"🧾 Histórico salvo em historico_pdv_jobs "
-                f"(job_id={job_id}, status={status}, inseridos={inseridos}, sobrescritos={sobrescritos})"
+                f"🧾 Histórico salvo (tenant_id={tenant_id}, input_id={input_id}, "
+                f"descricao='{descricao}', status={status})"
             )
 
         except Exception as e:
             self.conn.rollback()
-            logging.error(f"❌ Erro ao salvar histórico do job {job_id}: {e}", exc_info=True)
+            logging.error(
+                f"❌ Erro ao salvar histórico (input_id={input_id}): {e}",
+                exc_info=True
+            )
+
+

@@ -103,15 +103,38 @@ class DatabaseReader:
             logging.warning(f"⚠️ [PDV_DB] Erro ao listar PDVs do tenant {tenant_id}: {e}")
             return pd.DataFrame()
 
-    def buscar_cnpjs_existentes(self, tenant_id: int) -> list[str]:
+    # ==========================================================
+    # 🧾 Busca CNPJs existentes (respeitando input_id)
+    # ==========================================================
+    def buscar_cnpjs_existentes(self, tenant_id: int, input_id: str | None = None) -> list[str]:
         """
-        Retorna todos os CNPJs já cadastrados para o tenant no banco.
+        Retorna os CNPJs já cadastrados para o tenant.
+        Se input_id for informado, filtra apenas por aquele input_id.
+        Isso evita bloquear CNPJs de outros processamentos.
         """
-        cur = self.conn.cursor()
-        cur.execute("SELECT cnpj FROM pdvs WHERE tenant_id = %s;", (tenant_id,))
-        cnpjs = [row[0] for row in cur.fetchall()]
-        cur.close()
-        return cnpjs
+        try:
+            cur = self.conn.cursor()
+
+            if input_id:
+                cur.execute(
+                    "SELECT cnpj FROM pdvs WHERE tenant_id = %s AND input_id = %s;",
+                    (tenant_id, input_id),
+                )
+            else:
+                cur.execute(
+                    "SELECT cnpj FROM pdvs WHERE tenant_id = %s;",
+                    (tenant_id,),
+                )
+
+            cnpjs = [row[0] for row in cur.fetchall()]
+            cur.close()
+            logging.debug(f"📋 [PDV_DB] {len(cnpjs)} CNPJs retornados para tenant={tenant_id}, input_id={input_id}")
+            return cnpjs
+
+        except Exception as e:
+            logging.warning(f"⚠️ [PDV_DB] Erro ao buscar CNPJs existentes (tenant={tenant_id}, input_id={input_id}): {e}")
+            return []
+
 
     def buscar_enderecos_cache(self, enderecos: list[str]) -> dict[str, tuple[float, float]]:
         """

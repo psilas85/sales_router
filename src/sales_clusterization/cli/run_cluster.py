@@ -1,19 +1,31 @@
 # sales_router/src/sales_clusterization/cli/run_cluster.py
 
+# ============================================================
+# 📦 src/sales_clusterization/cli/run_cluster.py
+# ============================================================
+
 import argparse
+import uuid
 from loguru import logger
 from src.sales_clusterization.application.cluster_use_case import executar_clusterizacao
-from src.database.cleanup_service import limpar_dados_operacionais
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Executa clusterização de PDVs (SalesRouter / multi-tenant)")
+    parser = argparse.ArgumentParser(
+        description="Executa clusterização de PDVs (SalesRouter / multi-tenant)"
+    )
 
     # =============================
-    # Parâmetros principais
+    # Parâmetros obrigatórios
     # =============================
     parser.add_argument("--tenant_id", type=int, required=True, help="ID do tenant (empresa)")
     parser.add_argument("--uf", required=True, help="UF dos PDVs (ex: SP, CE, RJ)")
+    parser.add_argument("--descricao", required=True, help="Descrição da clusterização (ex: 'Clusterização SP Outubro')")
+    parser.add_argument("--input_id", required=True, help="ID da base de PDVs (UUID gerado no preprocessing)")
+
+    # =============================
+    # Parâmetros opcionais
+    # =============================
     parser.add_argument("--cidade", required=False, help="Cidade opcional dos PDVs (ex: Fortaleza)")
     parser.add_argument("--algo", default="dbscan", choices=["kmeans", "dbscan"], help="Algoritmo de clusterização")
     parser.add_argument("--k", type=int, default=None, help="K forçado (apenas para KMeans)")
@@ -24,13 +36,15 @@ def main():
     parser.add_argument("--service", type=int, default=20, help="Tempo médio de visita por PDV (minutos)")
     parser.add_argument("--vel", type=float, default=30.0, help="Velocidade média (km/h)")
     parser.add_argument("--alpha", type=float, default=1.4, help="Fator de correção de caminho (curvas/ruas)")
-    parser.add_argument("--modo_forcar", action="store_true", help="Força reprocessamento completo, limpando dados anteriores")
     parser.add_argument(
         "--max_pdv_cluster",
         type=int,
         default=300,
         help="Máximo de PDVs permitidos por cluster (usado no balanceamento híbrido DBSCAN + KMeans)",
     )
+
+    # 🆕 Novo argumento: clusterization_id vindo do job principal
+    parser.add_argument("--clusterization_id", type=str, required=False, help="ID da clusterização (externo)")
 
     args = parser.parse_args()
 
@@ -39,18 +53,15 @@ def main():
     # ============================================================
     cidade = args.cidade if args.cidade not in (None, "", "None") else None
     msg_ref = f"{args.uf}-{cidade}" if cidade else f"{args.uf} (todas as cidades)"
-    logger.info(f"🚀 Iniciando clusterização | tenant_id={args.tenant_id} | {msg_ref} | algoritmo={args.algo}")
 
-    # ============================================================
-    # 🧹 Limpeza opcional se --modo_forcar
-    # ============================================================
-    if args.modo_forcar:
-        logger.warning("🧹 Modo forçar ativado — limpando dados anteriores de clusterização...")
-        try:
-            limpar_dados_operacionais("clusterization", tenant_id=args.tenant_id)
-            logger.success("✅ Limpeza concluída com sucesso antes da nova execução.")
-        except Exception as e:
-            logger.error(f"❌ Falha ao limpar dados anteriores: {e}")
+    # Usa o ID recebido ou cria novo se for chamado manualmente
+    clusterization_id = args.clusterization_id or str(uuid.uuid4())
+
+    logger.info(
+        f"🚀 Iniciando clusterização | tenant_id={args.tenant_id} | {msg_ref} | "
+        f"input_id={args.input_id} | algoritmo={args.algo}"
+    )
+    logger.info(f"🆕 clusterization_id={clusterization_id} | descrição='{args.descricao}'")
 
     # ============================================================
     # 🧠 Execução principal
@@ -69,12 +80,16 @@ def main():
         v_kmh=args.vel,
         alpha_path=args.alpha,
         max_pdv_cluster=args.max_pdv_cluster,
+        descricao=args.descricao,
+        input_id=args.input_id,
+        clusterization_id=clusterization_id,  # 👈 Usa o mesmo ID
     )
 
     # ============================================================
     # 📊 Resultado final
     # ============================================================
     print("\n=== RESULTADO FINAL ===")
+    print(f"clusterization_id: {result['clusterization_id']}")
     print(f"run_id: {result['run_id']}")
     print(f"clusters (K): {result['k_final']}")
     print(f"PDVs: {result['n_pdvs']}")
