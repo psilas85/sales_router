@@ -15,17 +15,19 @@ class PDVPreprocessingUseCase:
     """
     Caso de uso principal do pré-processamento de PDVs.
     Inclui:
-      - Normalização de colunas e valores
+      - Normalização e limpeza de dados
       - Validação cadastral
       - Geocodificação com cache
-      - Validação geográfica (UF × coordenadas)
-      - Inserção/atualização no banco com contagem de sobrescritos
+      - Validação UF × coordenadas
+      - Inserção no banco vinculada a um input_id (sem sobrescrita)
     """
 
-    def __init__(self, reader, writer, tenant_id):
+    def __init__(self, reader, writer, tenant_id, input_id=None, descricao=None):
         self.reader = reader
         self.writer = writer
         self.tenant_id = tenant_id
+        self.input_id = input_id
+        self.descricao = descricao
         self.validator = PDVValidationService(db_reader=reader)
         self.geo_service = GeolocationService(reader, writer)
 
@@ -97,7 +99,7 @@ class PDVPreprocessingUseCase:
     # ============================================================
     # 🔹 Execução principal
     # ============================================================
-    def execute(self, input_path: str, sep=";"):
+    def execute(self, input_path: str, sep=";", input_id=None, descricao=None):
         logging.info(f"📄 Lendo arquivo de entrada: {input_path}")
         df = pd.read_csv(input_path, sep=sep, dtype=str).fillna("")
         df = self.normalizar_colunas(df)
@@ -130,7 +132,7 @@ class PDVPreprocessingUseCase:
         df_validos, df_invalidos = self.validator.validar_dados(df, tenant_id=self.tenant_id)
         if df_validos.empty:
             logging.warning(f"⚠️ [{self.tenant_id}] Nenhum PDV válido para geolocalização.")
-            return df_validos, df_invalidos
+            return df_validos, df_invalidos, 0
 
         # ============================================================
         # ⚡ Busca prévia de endereços no cache
@@ -141,7 +143,6 @@ class PDVPreprocessingUseCase:
         df_validos["pdv_lat"] = None
         df_validos["pdv_lon"] = None
         df_validos["status_geolocalizacao"] = None
-
         enderecos_novos = []
 
         for i, row in df_validos.iterrows():
@@ -158,32 +159,25 @@ class PDVPreprocessingUseCase:
         logging.info(f"🌍 {len(enderecos_novos)} endereços novos para geocodificação.")
 
         # ============================================================
-        # 🌍 Geocodifica apenas endereços novos
+        # 🌍 Geocodificação dos endereços novos
         # ============================================================
         for i in enderecos_novos:
             row = df_validos.iloc[i]
             endereco = row["pdv_endereco_completo"]
             uf = row["uf"]
-
             lat, lon, origem = self.geo_service.buscar_coordenadas(endereco, uf)
             df_validos.at[i, "pdv_lat"] = lat
             df_validos.at[i, "pdv_lon"] = lon
             df_validos.at[i, "status_geolocalizacao"] = origem
 
-            # 💾 Salva no cache se válido
             if lat is not None and lon is not None:
                 try:
                     self.writer.inserir_localizacao(endereco, lat, lon)
                 except Exception as e:
                     logging.warning(f"⚠️ Falha ao salvar no cache: {e}")
 
-        logging.info("📊 Resumo de geocodificação:")
-        logging.info(f"   - Cache (banco): {len(cache_db)}")
-        logging.info(f"   - Novos geocodificados: {len(enderecos_novos)}")
-        logging.info(f"   - Total processados: {len(df_validos)}")
-
         # ============================================================
-        # 🧭 Validação UF × Coordenadas
+        # 🧭 Validação geográfica (UF × Coordenadas)
         # ============================================================
         def validar_limites_uf(row):
             if pd.isna(row["pdv_lat"]) or pd.isna(row["pdv_lon"]):
@@ -200,39 +194,30 @@ class PDVPreprocessingUseCase:
         df_invalidos_geo = df_validos[df_validos["motivo_invalidade"] != "ok"]
         df_validos = df_validos[df_validos["motivo_invalidade"] == "ok"]
 
-        # ============================================================
-        # 🧾 Consolidação de inválidos
-        # ============================================================
         df_invalidos_total = pd.concat([df_invalidos, df_invalidos_geo], ignore_index=True)
-        resumo_invalidade = df_invalidos_total["motivo_invalidade"].value_counts() if not df_invalidos_total.empty else {}
 
-        logging.info("⚠️ Motivos de invalidação:")
-        for motivo, qtd in resumo_invalidade.items():
-            logging.info(f"   - {motivo:<25} {qtd}")
-
-        if not df_invalidos_total.empty:
-            pasta_invalidos = os.path.join(os.path.dirname(input_path), "invalidos")
-            os.makedirs(pasta_invalidos, exist_ok=True)
-            caminho_csv_invalidos = os.path.join(pasta_invalidos, f"pdvs_invalidos_{self.tenant_id}.csv")
-            df_invalidos_total.to_csv(caminho_csv_invalidos, index=False, sep=";", encoding="utf-8-sig")
-            logging.warning(f"⚠️ {len(df_invalidos_total)} PDVs inválidos salvos em {caminho_csv_invalidos}")
-
-                # ============================================================
-        # 💾 Inserção no banco com contagem de sobrescritos
         # ============================================================
+        # 💾 Inserção no banco (sem sobrescrita)
+        # ============================================================
+        df_validos["tenant_id"] = self.tenant_id
+        df_validos["input_id"] = self.input_id
+        df_validos["descricao"] = self.descricao
+
+        # Mantém apenas colunas que correspondem a atributos do dataclass PDV
         campos_validos = PDV.__init__.__code__.co_varnames[1:]
         colunas_validas = [c for c in df_validos.columns if c in campos_validos]
-        df_validos["tenant_id"] = self.tenant_id
-        df_para_inserir = df_validos[colunas_validas + ["tenant_id"]]
+        df_para_inserir = df_validos[colunas_validas]
+
+        # Cria instâncias PDV sem repassar argumentos duplicados
         pdvs = [PDV(**row) for row in df_para_inserir.to_dict(orient="records")]
 
-        inseridos, sobrescritos = self.writer.inserir_pdvs(pdvs)
+        # Inserção no banco
+        inseridos = self.writer.inserir_pdvs(pdvs)
 
         logging.info(f"✅ [{self.tenant_id}] {len(df_validos)} válidos / {len(df_invalidos_total)} inválidos.")
-        logging.info(f"💾 [{self.tenant_id}] {inseridos} novos PDVs inseridos.")
-        logging.info(f"🔁 [{self.tenant_id}] {sobrescritos} CNPJs sobrescritos (atualizados).")
+        logging.info(f"💾 [{self.tenant_id}] {inseridos} PDVs inseridos (input_id={self.input_id}).")
 
         # ============================================================
-        # 📦 Retorno final (inclui contadores)
+        # 📦 Retorno final
         # ============================================================
-        return df_validos, df_invalidos_total, inseridos, sobrescritos
+        return df_validos, df_invalidos_total, inseridos

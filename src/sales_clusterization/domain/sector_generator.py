@@ -156,7 +156,7 @@ def dbscan_setores(
     logger.info(f"📊 DBSCAN terminou em {round(time.time() - start, 2)}s com {n_clusters} clusters e {ruido_count} PDVs de ruído.")
 
     # =======================================================
-    # 🔁 Reatribuição de ruídos
+    # 🔁 Reatribuição de ruídos (com tratamento para clusters vazios)
     # =======================================================
     if ruido_count > 0:
         ruido_idx = np.where(labels == -1)[0]
@@ -165,19 +165,32 @@ def dbscan_setores(
             if cid == -1:
                 continue
             pts = coords[labels == cid]
+            if len(pts) == 0:
+                continue
             c = (float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1])))
             cluster_centers.append((cid, c))
 
-        for i in ruido_idx:
-            pt = coords[i]
-            dist_min, cid_near = float("inf"), None
-            for cid, c in cluster_centers:
-                d = _haversine_km(pt, c)
-                if d < dist_min:
-                    dist_min, cid_near = d, cid
-            labels[i] = cid_near
+        if not cluster_centers:
+            # Nenhum cluster formado → cria um cluster único com todos os PDVs
+            labels[:] = 0
+            logger.warning("⚠️ Nenhum cluster DBSCAN formado — todos os PDVs agrupados em um único cluster.")
+        else:
+            reassigned = 0
+            for i in ruido_idx:
+                pt = coords[i]
+                dist_min, cid_near = float("inf"), None
+                for cid, c in cluster_centers:
+                    d = _haversine_km(pt, c)
+                    if d < dist_min:
+                        dist_min, cid_near = d, cid
+                if cid_near is not None:
+                    labels[i] = cid_near
+                    reassigned += 1
+                else:
+                    # Caso extremo: sem cluster próximo → cria um novo cluster isolado
+                    labels[i] = max([cid for cid in set(labels) if cid != -1], default=0) + 1
+            logger.info(f"🔁 {reassigned} PDVs de ruído reatribuídos ao cluster mais próximo.")
 
-        logger.info(f"🔁 {len(ruido_idx)} PDVs de ruído reatribuídos ao cluster mais próximo.")
 
     # =======================================================
     # 🏁 Recalcula clusters com todos os PDVs

@@ -1,7 +1,9 @@
+#sales_router/src/sales_routing/cli/run_routing.py
+
 import argparse
+import uuid
 from datetime import datetime
 from loguru import logger
-from src.database.cleanup_service import limpar_dados_operacionais
 from src.database.db_connection import get_connection_context
 from src.sales_routing.infrastructure.database_reader import SalesRoutingDatabaseReader
 from src.sales_routing.infrastructure.database_writer import SalesRoutingDatabaseWriter
@@ -10,20 +12,20 @@ from src.sales_routing.application.adaptive_subcluster_splitter import gerar_sub
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Executa geração, listagem, restauração ou exclusão de rotas diárias (subclusters) de vendas"
+        description="Executa geração de rotas diárias (subclusters) sem sobrescrever processamentos anteriores."
     )
 
-    # -----------------------
-    # Modos de operação
-    # -----------------------
-    parser.add_argument("--listar", action="store_true", help="Lista snapshots (carteiras) salvos")
-    parser.add_argument("--restaurar", type=str, help="Restaura uma carteira salva pelo nome exato")
-    parser.add_argument("--excluir", type=str, help="Exclui um snapshot (carteira) pelo nome exato")
+    # ======================================================
+    # 🔧 PARÂMETROS OBRIGATÓRIOS
+    # ======================================================
+    parser.add_argument("--tenant", type=int, required=True, help="Tenant ID (obrigatório)")
+    parser.add_argument("--clusterization_id", type=str, required=True, help="ID da clusterização associada (UUID)")
+    parser.add_argument("--descricao", type=str, required=True, help="Descrição da execução (máx. 60 caracteres)")
 
-    # -----------------------
-    # Parâmetros operacionais
-    # -----------------------
-    parser.add_argument("--uf", type=str, help="UF dos PDVs (ex: SP, CE, RJ)")
+    # ======================================================
+    # ⚙️ PARÂMETROS OPERACIONAIS
+    # ======================================================
+    parser.add_argument("--uf", type=str, required=True, help="UF dos PDVs (ex: SP, CE, RJ)")
     parser.add_argument("--cidade", type=str, help="Cidade dos PDVs (ex: Fortaleza)")
     parser.add_argument("--workday", type=int, default=600, help="Tempo máximo de trabalho diário (minutos)")
     parser.add_argument("--routekm", type=float, default=100.0, help="Distância máxima por rota (km)")
@@ -31,34 +33,35 @@ def main():
     parser.add_argument("--vel", type=float, default=30.0, help="Velocidade média (km/h)")
     parser.add_argument("--alpha", type=float, default=1.4, help="Fator de correção de caminho (curvas/ruas)")
     parser.add_argument("--twoopt", action="store_true", help="Ativa heurística 2-Opt para otimização fina da rota")
-
-    # -----------------------
-    # Snapshot (carteira)
-    # -----------------------
-    parser.add_argument("--salvar", type=str, help="Nome da carteira/snapshot (opcional)")
-    parser.add_argument("--descricao", type=str, help="Descrição da carteira (opcional)")
     parser.add_argument("--usuario", type=str, default="cli", help="Usuário responsável pela execução")
-    parser.add_argument("--tenant", type=int, required=True, help="Tenant ID (obrigatório)")
 
     args = parser.parse_args()
     tenant_id = args.tenant
 
     # ======================================================
-    # 🔄 Exporta parâmetros para acesso global (usados por serviços internos)
+    # ✅ VALIDAÇÕES
     # ======================================================
-    globals()["SERVICE_MIN_ARG"] = args.service
-    globals()["VEL_KMH_ARG"] = args.vel
-    globals()["ALPHA_PATH_ARG"] = args.alpha
+    descricao = args.descricao.strip()
+    if len(descricao) == 0 or len(descricao) > 60:
+        print("❌ A descrição deve ter entre 1 e 60 caracteres.")
+        return
+
+    try:
+        uuid.UUID(args.clusterization_id)
+    except ValueError:
+        print("❌ clusterization_id inválido (deve ser um UUID válido).")
+        return
 
     # ======================================================
-    # 🧹 LIMPEZA AUTOMÁTICA DE SIMULAÇÕES OPERACIONAIS
+    # 🆔 GERAÇÃO DO ROUTING_ID
     # ======================================================
-    logger.info(f"🧹 Limpando simulações operacionais do tenant_id={tenant_id} antes da nova roteirização...")
-    try:
-        limpar_dados_operacionais("routing", tenant_id=tenant_id)
-    except Exception as e:
-        logger.error(f"❌ Falha na limpeza automática: {e}")
-        return
+    routing_id = str(uuid.uuid4())
+    clusterization_id = args.clusterization_id.strip()
+    logger.info(f"🆕 Criando nova execução de roteirização:")
+    logger.info(f"   routing_id={routing_id}")
+    logger.info(f"   clusterization_id={clusterization_id}")
+    logger.info(f"   tenant_id={tenant_id}")
+    logger.info(f"   descricao={descricao}")
 
     # ======================================================
     # 🔧 Inicialização dos serviços de banco de dados
@@ -67,97 +70,35 @@ def main():
     db_writer = SalesRoutingDatabaseWriter()
 
     # ======================================================
-    # 1️⃣ LISTAR SNAPSHOTS
+    # 🧾 REGISTRO DO HISTÓRICO
     # ======================================================
-    if args.listar:
-        logger.info(f"📂 Listando snapshots para tenant={tenant_id}...")
-        snapshots = db_reader.list_snapshots(tenant_id, args.uf, args.cidade)
-        if not snapshots:
-            print("❌ Nenhum snapshot encontrado.")
-        else:
-            print(f"\n=== SNAPSHOTS ENCONTRADOS ({len(snapshots)}) ===\n")
-            for s in snapshots:
-                print(f"📦 {s['nome']} (ID={s['id']})")
-                print(f"   🗓️  Criado em: {s['criado_em']:%Y-%m-%d %H:%M}")
-                print(f"   🌍 {s.get('uf','-')}/{s.get('cidade','-')}")
-                if s.get('descricao'):
-                    print(f"   📝 {s['descricao']}")
-                print("-" * 60)
-        return
-
-    # ======================================================
-    # 2️⃣ RESTAURAR SNAPSHOT
-    # ======================================================
-    if args.restaurar:
-        nome = args.restaurar.strip()
-        logger.info(f"🔍 Buscando snapshot '{nome}' para tenant {tenant_id}...")
-        snapshot = db_reader.get_snapshot_by_name(tenant_id, nome)
-        if not snapshot:
-            print(f"❌ Nenhum snapshot encontrado com nome '{nome}'.")
-            return
-        subclusters = db_reader.get_snapshot_subclusters(snapshot["id"])
-        pdvs = db_reader.get_snapshot_pdvs(snapshot["id"])
-        if not subclusters or not pdvs:
-            print(f"⚠️ Snapshot '{nome}' está vazio ou corrompido.")
-            return
-        db_writer.restore_snapshot_operacional(tenant_id, subclusters, pdvs)
-        logger.success(f"✅ Snapshot '{nome}' restaurado com sucesso para tenant {tenant_id}")
-        return
-
-    # ======================================================
-    # 3️⃣ EXCLUIR SNAPSHOT
-    # ======================================================
-    if args.excluir:
-        nome = args.excluir.strip()
-        logger.info(f"🗑️ Solicitada exclusão do snapshot '{nome}' (tenant {tenant_id})...")
-        snapshot = db_reader.get_snapshot_by_name(tenant_id, nome)
-        if not snapshot:
-            print(f"❌ Nenhum snapshot encontrado com nome '{nome}'.")
-            return
-        confirm = input(f"⚠️ Confirmar exclusão permanente de '{nome}'? (s/N): ").strip().lower()
-        if confirm != "s":
-            print("❎ Exclusão cancelada pelo usuário.")
-            return
-        db_writer.delete_snapshot(snapshot["id"])
-        logger.success(f"✅ Snapshot '{nome}' excluído com sucesso.")
-        return
-
-    # ======================================================
-    # 4️⃣ EXECUTAR NOVA SIMULAÇÃO DE ROTAS
-    # ======================================================
-    if not args.uf:
-        print("❌ É necessário informar a UF (--uf).")
-        return
-
-    # ✅ Se cidade não informada, busca o último run da UF inteira
-    if not args.cidade:
-        logger.info(f"🌎 Nenhuma cidade especificada — buscando último run concluído da UF={args.uf}")
+    try:
         with get_connection_context() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT id, uf, cidade, algo, k_final, params
-                    FROM cluster_run
-                    WHERE status = 'done' AND UPPER(uf) = UPPER(%s)
-                    ORDER BY id DESC
-                    LIMIT 1;
-                """, (args.uf,))
-                row = cur.fetchone()
-                if not row:
-                    print(f"❌ Nenhum run concluído encontrado para UF={args.uf}.")
-                    return
-                colnames = [desc[0] for desc in cur.description]
-                run = dict(zip(colnames, row))
-                args.cidade = run.get("cidade")
-    else:
-        run = db_reader.get_last_run_by_location(args.uf, args.cidade)
-        if not run:
-            print(f"❌ Nenhum run concluído encontrado para {args.cidade}/{args.uf}.")
-            return
+                    INSERT INTO historico_subcluster_jobs (
+                        tenant_id, routing_id, clusterization_id, descricao, criado_por, criado_em
+                    ) VALUES (%s, %s, %s, %s, %s, NOW());
+                """, (tenant_id, routing_id, clusterization_id, descricao, args.usuario))
+                conn.commit()
+        logger.success(f"✅ Registro criado no histórico (routing_id={routing_id})")
+    except Exception as e:
+        logger.error(f"❌ Falha ao registrar histórico: {e}")
+        return
+
+    # ======================================================
+    # 🔍 BUSCAR CLUSTERS E PDVs DA CLUSTERIZAÇÃO
+    # ======================================================
+    run = db_reader.get_last_run_by_location(args.uf, args.cidade)
+    if not run:
+        print(f"❌ Nenhum run concluído encontrado para {args.cidade or 'UF inteira'} / {args.uf}.")
+        return
 
     run_id = run["id"]
     cidade_ref = args.cidade or "todas as cidades"
-    print(f"\n🚀 Iniciando geração de rotas diárias para {args.uf} ({cidade_ref})...")
-    print(f"✅ Run encontrado: ID={run_id} (K={run['k_final']})")
+    print(f"\n🚀 Iniciando roteirização para {args.uf} ({cidade_ref})...")
+    print(f"✅ Clusterização encontrada: ID={run_id} (K={run['k_final']})")
+    print(f"🆔 routing_id={routing_id}")
     print("------------------------------------------------------")
 
     clusters = db_reader.get_clusters(run_id)
@@ -165,6 +106,9 @@ def main():
     print(f"🔹 Clusters carregados: {len(clusters)}")
     print(f"🔹 PDVs carregados: {len(pdvs)}")
 
+    # ======================================================
+    # 🧠 GERAÇÃO DOS SUBCLUSTERS E ROTAS
+    # ======================================================
     resultados = gerar_subclusters_adaptativo(
         clusters=clusters,
         pdvs=pdvs,
@@ -176,23 +120,27 @@ def main():
         aplicar_two_opt=args.twoopt,
     )
 
+    # ======================================================
+    # 💾 SALVANDO RESULTADOS NO BANCO
+    # ======================================================
     print("\n💾 Salvando resultados no banco de dados...")
-    db_writer.salvar_operacional(resultados, tenant_id, run_id)
-
-    if args.salvar:
-        nome = args.salvar.strip()
-        descricao = args.descricao or f"Snapshot criado em {datetime.now():%d/%m/%Y %H:%M}"
-        db_writer.salvar_snapshot(
+    try:
+        db_writer.salvar_operacional(
             resultados=resultados,
             tenant_id=tenant_id,
-            nome=nome,
-            descricao=descricao,
-            criado_por=args.usuario,
-            tags={"uf": args.uf, "cidade": args.cidade},
+            run_id=run_id,
+            routing_id=routing_id,
         )
-        print(f"📦 Snapshot '{nome}' salvo com sucesso!\n")
+        print(f"✅ Resultados salvos com sucesso (routing_id={routing_id})")
+    except Exception as e:
+        logger.error(f"❌ Erro ao salvar resultados: {e}")
+        return
 
-    print("\n🏁 Execução concluída com sucesso!\n")
+    # ======================================================
+    # ✅ FINALIZAÇÃO
+    # ======================================================
+    print("\n🏁 Execução concluída com sucesso!")
+    print(f"📦 routing_id registrado: {routing_id}\n")
 
 
 if __name__ == "__main__":

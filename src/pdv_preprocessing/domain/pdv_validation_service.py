@@ -40,16 +40,15 @@ class PDVValidationService:
         cep = re.sub(r"[^0-9]", "", str(cep))
         return cep.zfill(8) if len(cep) in (5, 8) else None
 
-    # ============================================================
+        # ============================================================
     # 🔹 Validação principal
     # ============================================================
-    def validar_dados(self, df: pd.DataFrame, tenant_id: int = None):
+    def validar_dados(self, df: pd.DataFrame, tenant_id: int = None, input_id: str = None):
         """
-        Valida campos obrigatórios e duplicidades (CSV + banco).
+        Valida campos obrigatórios e duplicidades (CSV + banco, somente dentro do mesmo input_id).
         Retorna dois DataFrames: válidos e inválidos (com motivo).
         """
 
-        # ⚙️ 'bairro' agora é opcional
         campos_obrigatorios = ["cnpj", "logradouro", "numero", "cidade", "uf", "cep"]
 
         # 🔹 Normaliza strings vazias
@@ -60,7 +59,7 @@ class PDVValidationService:
             total_sem_bairro = df["bairro"].eq("").sum()
             logging.info(f"ℹ️ [{tenant_id}] {total_sem_bairro} PDV(s) sem bairro informado.")
         else:
-            logging.info(f"ℹ️ [{tenant_id}] Coluna 'bairro' não presente no arquivo (tratada como opcional).")
+            logging.info(f"ℹ️ [{tenant_id}] Coluna 'bairro' não presente (opcional).")
 
         # 🔹 Registros com campos obrigatórios faltando
         registros_invalidos = df[df[campos_obrigatorios].isna().any(axis=1)].copy()
@@ -69,9 +68,9 @@ class PDVValidationService:
                 lambda row: ", ".join([c for c in campos_obrigatorios if pd.isna(row[c])]),
                 axis=1,
             )
-            logging.warning(f"⚠️ [{tenant_id}] {len(registros_invalidos)} registro(s) com campos faltantes detectados.")
+            logging.warning(f"⚠️ [{tenant_id}] {len(registros_invalidos)} registro(s) com campos obrigatórios faltando.")
 
-        # 🔹 Mantém apenas válidos (sem campos obrigatórios faltando)
+        # 🔹 Mantém apenas válidos
         df_validos = df.dropna(subset=campos_obrigatorios).copy()
 
         # ============================================================
@@ -85,19 +84,20 @@ class PDVValidationService:
             logging.warning(f"⚠️ [{tenant_id}] {len(duplicados_csv)} CNPJs duplicados no arquivo CSV.")
 
         # ============================================================
-        # 2️⃣ Duplicados no banco (mesmo tenant)
+        # 2️⃣ Duplicados no banco — somente dentro do mesmo input_id
         # ============================================================
-        if self.db_reader is not None and tenant_id is not None:
+        if self.db_reader is not None and tenant_id is not None and input_id is not None:
             try:
-                cnpjs_existentes = self.db_reader.buscar_cnpjs_existentes(tenant_id)
-                duplicados_banco = df_validos[df_validos["cnpj"].isin(cnpjs_existentes)].copy()
-                if not duplicados_banco.empty:
-                    duplicados_banco["motivo_invalidade"] = "CNPJ já existente no banco"
-                    registros_invalidos = pd.concat([registros_invalidos, duplicados_banco])
-                    df_validos = df_validos[~df_validos["cnpj"].isin(duplicados_banco["cnpj"])]
-                    logging.warning(
-                        f"⚠️ [{tenant_id}] {len(duplicados_banco)} CNPJs já existentes no banco foram ignorados."
-                    )
+                cnpjs_existentes = self.db_reader.buscar_cnpjs_existentes(tenant_id, input_id)
+                if cnpjs_existentes:
+                    duplicados_banco = df_validos[df_validos["cnpj"].isin(cnpjs_existentes)].copy()
+                    if not duplicados_banco.empty:
+                        duplicados_banco["motivo_invalidade"] = "CNPJ duplicado neste input_id"
+                        registros_invalidos = pd.concat([registros_invalidos, duplicados_banco])
+                        df_validos = df_validos[~df_validos["cnpj"].isin(duplicados_banco["cnpj"])]
+                        logging.warning(
+                            f"⚠️ [{tenant_id}] {len(duplicados_banco)} CNPJs já existentes neste input_id foram ignorados."
+                        )
             except Exception as e:
                 logging.error(f"❌ [{tenant_id}] Erro ao verificar duplicados no banco: {e}")
 
@@ -109,3 +109,4 @@ class PDVValidationService:
 
         logging.info(f"✅ [{tenant_id}] {len(df_validos)} registros válidos / {len(registros_invalidos)} inválidos.")
         return df_validos, registros_invalidos
+

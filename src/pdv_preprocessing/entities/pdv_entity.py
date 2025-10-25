@@ -1,5 +1,3 @@
-# src/pdv_preprocessing/entities/pdv_entity.py
-
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -10,6 +8,8 @@ class PDV:
     Entidade PDV (Ponto de Venda)
     Representa um registro de cliente/endereço geolocalizado pertencente a um tenant.
     """
+
+    # Identificação e vinculação
     cnpj: str
     logradouro: str
     numero: str
@@ -18,17 +18,24 @@ class PDV:
     uf: str
     cep: str
 
+    # Metadados do processamento
+    input_id: Optional[str] = None
+    descricao: Optional[str] = None
+
+    # Dados de localização e status
     pdv_endereco_completo: Optional[str] = None
     pdv_lat: Optional[float] = None
     pdv_lon: Optional[float] = None
     status_geolocalizacao: Optional[str] = None
 
+    # Dados administrativos
     tenant_id: Optional[int] = field(default=None)
     id: Optional[int] = field(default=None)
     atualizado_em: Optional[str] = field(default=None)
 
     def __post_init__(self):
         """Normaliza e valida tipos logo após a criação da instância."""
+
         # Normaliza CNPJ e CEP
         self.cnpj = str(self.cnpj).strip()
         self.cep = str(self.cep).strip()

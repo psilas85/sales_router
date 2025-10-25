@@ -1,5 +1,9 @@
 #sales_router/src/sales_routing/visualization/route_plotting.py
 
+# =========================================================
+# 📦 src/sales_routing/visualization/route_plotting.py
+# =========================================================
+
 import folium
 import argparse
 import json
@@ -14,30 +18,41 @@ from src.database.db_connection import get_connection
 
 
 # =========================================================
-# 1. Leitura do banco
+# 1️⃣ Leitura do banco (filtrando por routing_id)
 # =========================================================
-def buscar_rotas_operacionais(tenant_id: int):
+def buscar_rotas_operacionais(tenant_id: int, routing_id: str):
+    """
+    Busca as rotas operacionais vinculadas ao routing_id informado.
+    """
     sql = """
-        SELECT s.cluster_id, s.subcluster_seq, s.rota_coord, 
-               p.lat, p.lon, p.sequencia_ordem
+        SELECT 
+            s.cluster_id, 
+            s.subcluster_seq, 
+            s.rota_coord, 
+            p.lat, 
+            p.lon, 
+            p.sequencia_ordem
         FROM sales_subcluster s
         JOIN sales_subcluster_pdv p
           ON p.cluster_id = s.cluster_id 
          AND p.subcluster_seq = s.subcluster_seq
+         AND p.routing_id = s.routing_id
+         AND p.tenant_id = s.tenant_id
         WHERE s.tenant_id = %s
+          AND s.routing_id = %s
         ORDER BY s.cluster_id, s.subcluster_seq, p.sequencia_ordem;
     """
     conn = get_connection()
     with conn.cursor() as cur:
-        cur.execute(sql, (tenant_id,))
+        cur.execute(sql, (tenant_id, routing_id))
         rows = cur.fetchall()
-        logger.info(f"📦 {len(rows)} registros de rota carregados para tenant {tenant_id}")
+        logger.info(f"📦 {len(rows)} registros de rota carregados (tenant={tenant_id}, routing_id={routing_id})")
     conn.close()
     return rows
 
 
 # =========================================================
-# 2. Conversão segura do campo rota_coord
+# 2️⃣ Conversão segura do campo rota_coord
 # =========================================================
 def converter_rota_coord(rota_coord):
     try:
@@ -71,7 +86,7 @@ def converter_rota_coord(rota_coord):
 
 
 # =========================================================
-# 3. Geração do mapa (visual idêntico ao HubRouter)
+# 3️⃣ Geração do mapa (visual idêntico ao HubRouter)
 # =========================================================
 def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: int = 9):
     if output_path.exists():
@@ -102,7 +117,7 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
     mapa = Map(
         location=[lat_centro, lon_centro],
         zoom_start=zoom,
-        prefer_canvas=False,  # ⚙️ usa SVG renderer (mais suave)
+        prefer_canvas=False,
         tiles="https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png",
         attr="© OpenStreetMap contributors"
     )
@@ -113,14 +128,12 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
     random.seed(42)
     cores = [f"#{random.randint(0, 0xFFFFFF):06x}" for _ in range(len(rotas))]
 
-    # Mapeia cada rota (Cluster/Sub) → cor
     legenda_rotas = {}
     for idx, (rota_id) in enumerate(rotas.keys()):
         cluster_id, sub_seq = rota_id
         cor = cores[idx % len(cores)]
         legenda_rotas[f"Cluster {cluster_id} / Sub {sub_seq}"] = cor
 
-    # === Legenda HTML por rota (subcluster) ===
     legenda_html = """
     {% macro html(this, kwargs) %}
     <div style="
@@ -157,7 +170,6 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
     legenda._template = Template(legenda_html)
     mapa.get_root().add_child(legenda)
 
-
     # === Desenha rotas ===
     for idx, ((cluster_id, sub_seq), info) in enumerate(rotas.items()):
         cor = cores[idx % len(cores)]
@@ -168,9 +180,6 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
             logger.debug(f"\n🧭 Cluster {cluster_id} / Sub {sub_seq}")
             logger.debug(f"   - Pontos PDV: {len(pontos_validos)}")
             logger.debug(f"   - Pontos rota_coord: {len(coords)}")
-            if coords:
-                logger.debug(f"   ↳ Início: {coords[0]}")
-                logger.debug(f"   ↳ Fim: {coords[-1]}")
 
         if len(coords) > 1:
             PolyLine(
@@ -178,7 +187,7 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
                 color=cor,
                 weight=3,
                 opacity=0.7,
-                smooth_factor=1.0,  # 👈 igual ao HubRouter
+                smooth_factor=1.0,
                 line_cap="round",
                 line_join="round"
             ).add_to(mapa)
@@ -191,7 +200,6 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
                 dash_array="5,5"
             ).add_to(mapa)
 
-        # Pontos de entrega
         for lat, lon in pontos_validos:
             CircleMarker(
                 location=(lat, lon),
@@ -227,23 +235,25 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
 
 
 # =========================================================
-# 4. Execução principal
+# 4️⃣ Execução principal
 # =========================================================
 def main():
-    parser = argparse.ArgumentParser(description="Gera mapa de rotas reais (vias) por tenant.")
+    parser = argparse.ArgumentParser(description="Gera mapa de rotas reais (vias) por routing_id.")
     parser.add_argument("--tenant", type=int, required=True, help="Tenant ID")
+    parser.add_argument("--routing_id", type=str, required=True, help="UUID do routing_id obrigatório")
     parser.add_argument("--modo_debug", action="store_true", help="Exibe logs detalhados")
     parser.add_argument("--zoom", type=int, default=9, help="Define o nível de zoom inicial (padrão=9)")
     args = parser.parse_args()
 
     output_dir = Path(f"output/maps/{args.tenant}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / "routing_operacional.html"
+    output_path = output_dir / f"routing_{args.routing_id}.html"
 
-    logger.info(f"🗺️ Gerando mapa de rotas reais para tenant {args.tenant}... (modo_debug={args.modo_debug}, zoom={args.zoom})")
-    dados = buscar_rotas_operacionais(args.tenant)
+    logger.info(f"🗺️ Gerando mapa para routing_id={args.routing_id} (tenant={args.tenant})...")
+    dados = buscar_rotas_operacionais(args.tenant, args.routing_id)
     gerar_mapa_rotas(dados, output_path, modo_debug=args.modo_debug, zoom=args.zoom)
 
 
 if __name__ == "__main__":
     main()
+
