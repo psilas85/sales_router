@@ -321,12 +321,15 @@ class AssignVendedoresService:
         from src.sales_routing.reporting.vendedores_summary_service import VendedoresSummaryService
 
         logger.info(f"🏁 Iniciando atribuição | tenant={self.tenant_id} | routing_id={self.routing_id}")
+        logger.info(f"📍 Filtrando rotas por routing_id={self.routing_id}")
+
 
         # 1️⃣ Registra histórico
         self._registrar_historico()
 
         # 2️⃣ Carrega rotas
-        rotas = self.db_reader.get_operational_routes(self.tenant_id, uf=uf, cidade=cidade)
+        rotas = self.db_reader.get_operational_routes(self.tenant_id, self.routing_id, uf=uf, cidade=cidade)
+
         if not rotas:
             logger.warning("❌ Nenhuma rota encontrada para este tenant.")
             return
