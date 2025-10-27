@@ -44,6 +44,7 @@ class ExportPDVVendedorService:
                 p.cnpj,
                 p.cidade,
                 p.uf,
+                p.pdv_vendas,          -- ✅ novo campo
                 p.criado_em AS pdv_criado_em,
                 p.pdv_lat,
                 p.pdv_lon,
@@ -68,7 +69,7 @@ class ExportPDVVendedorService:
             logger.warning(f"⚠️ Nenhum dado encontrado para assign_id={self.assign_id}.")
             return None
 
-        # 🧾 Corrige e formata o CNPJ com máscara (00.000.000/0000-00)
+        # 🧾 Corrige e formata o CNPJ com máscara
         if "cnpj" in df.columns:
             df["cnpj"] = (
                 df["cnpj"]
@@ -86,9 +87,6 @@ class ExportPDVVendedorService:
         return output_path
 
 
-# =========================================================
-# Execução via CLI
-# =========================================================
 if __name__ == "__main__":
     import argparse
 
