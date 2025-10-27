@@ -17,6 +17,7 @@ class PDV:
     cidade: str
     uf: str
     cep: str
+    pdv_vendas: Optional[float] = None
 
     # Metadados do processamento
     input_id: Optional[str] = None

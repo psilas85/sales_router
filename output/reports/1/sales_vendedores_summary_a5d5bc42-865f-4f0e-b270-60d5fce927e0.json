@@ -1,0 +1,47 @@
+[
+    {
+        "vendedor_id": 1,
+        "base_cidade": "COROMANDEL",
+        "base_bairro": "CENTRO",
+        "total_pdvs": "226,0",
+        "total_rotas": "20,0",
+        "km_total": "1.195,5",
+        "tempo_total_min": "5.912,6",
+        "vendas_total": "165.653,8",
+        "vendas_media": "733,0",
+        "km_medio_por_rota": "59,8",
+        "tempo_medio_por_rota": "295,6",
+        "km_medio_diario": "59,8",
+        "tempo_medio_diario": "295,6"
+    },
+    {
+        "vendedor_id": 2,
+        "base_cidade": "CONCEICAO DO MATO",
+        "base_bairro": "BANDEIRINHA",
+        "total_pdvs": "251,0",
+        "total_rotas": "20,0",
+        "km_total": "1.283,1",
+        "tempo_total_min": "6.734,9",
+        "vendas_total": "187.783,1",
+        "vendas_media": "748,1",
+        "km_medio_por_rota": "64,2",
+        "tempo_medio_por_rota": "336,7",
+        "km_medio_diario": "64,2",
+        "tempo_medio_diario": "336,7"
+    },
+    {
+        "vendedor_id": 3,
+        "base_cidade": "ENGENHEIRO CALDAS",
+        "base_bairro": "CENTRO",
+        "total_pdvs": "128,0",
+        "total_rotas": "14,0",
+        "km_total": "656,3",
+        "tempo_total_min": "3.405,5",
+        "vendas_total": "89.427,2",
+        "vendas_media": "698,6",
+        "km_medio_por_rota": "46,9",
+        "tempo_medio_por_rota": "243,2",
+        "km_medio_diario": "32,8",
+        "tempo_medio_diario": "170,3"
+    }
+]

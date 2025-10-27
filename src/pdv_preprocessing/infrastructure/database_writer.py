@@ -25,7 +25,8 @@ class DatabaseWriter:
             (
                 p.tenant_id, p.input_id, p.descricao, p.cnpj, p.logradouro, p.numero, p.bairro,
                 p.cidade, p.uf, p.cep, p.pdv_endereco_completo,
-                p.pdv_lat, p.pdv_lon, p.status_geolocalizacao
+                p.pdv_lat, p.pdv_lon, p.status_geolocalizacao,
+                p.pdv_vendas  # ✅ novo campo
             )
             for p in lista_pdvs
         ]
@@ -34,7 +35,7 @@ class DatabaseWriter:
             INSERT INTO pdvs (
                 tenant_id, input_id, descricao, cnpj, logradouro, numero, bairro,
                 cidade, uf, cep, pdv_endereco_completo,
-                pdv_lat, pdv_lon, status_geolocalizacao
+                pdv_lat, pdv_lon, status_geolocalizacao, pdv_vendas
             )
             VALUES %s
             ON CONFLICT (tenant_id, input_id, cnpj)

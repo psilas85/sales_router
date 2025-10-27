@@ -62,14 +62,23 @@ class PDVPreprocessingUseCase:
                 pass
             return re.sub(r"[^0-9]", "", v)
 
+        # ============================================================
+        # 🔹 Normalização de CNPJ e CEP
+        # ============================================================
         df["cnpj"] = df["cnpj"].apply(normalizar_cnpj)
         if "cep" in df.columns:
             df["cep"] = df["cep"].astype(str).str.replace(r"[^0-9]", "", regex=True)
 
+        # ============================================================
+        # 🔹 Normalização de campos de texto
+        # ============================================================
         for c in ["logradouro", "bairro", "cidade", "uf", "numero"]:
             if c in df.columns:
                 df[c] = df[c].astype(str).str.strip().replace({"nan": "", "None": ""})
 
+        # ============================================================
+        # 🔹 Normalização de UF
+        # ============================================================
         estados_validos = set(UF_BOUNDS.keys())
         if "uf" in df.columns:
             df["uf"] = df["uf"].str.upper().str.strip()
@@ -77,6 +86,9 @@ class PDVPreprocessingUseCase:
             if len(uf_invalidas) > 0:
                 logging.warning(f"⚠️ UFs inválidas detectadas: {', '.join(uf_invalidas)}")
 
+        # ============================================================
+        # 🔹 Normalização de cidade
+        # ============================================================
         if "cidade" in df.columns:
             df["cidade"] = df["cidade"].apply(
                 lambda x: unicodedata.normalize("NFKD", str(x))
@@ -86,15 +98,55 @@ class PDVPreprocessingUseCase:
                 .strip()
             )
 
+        ## ============================================================
+        # 🔹 Conversão segura da coluna pdv_vendas (se existir)
+        # ============================================================
+        if "pdv_vendas" in df.columns:
+            import math
+
+            def normalizar_vendas(valor):
+                if pd.isna(valor):
+                    return None
+                v = str(valor).strip()
+
+                # Remove símbolo de moeda e espaços
+                v = v.replace("R$", "").replace("r$", "").strip()
+
+                # Remove separador de milhar e ajusta vírgula decimal
+                # Ex: "R$ 39.893,23" -> "39893.23"
+                v = v.replace(".", "").replace(",", ".")
+
+                # Remove quaisquer caracteres que não sejam dígitos ou ponto
+                v = re.sub(r"[^0-9.]", "", v)
+
+                if v == "":
+                    return None
+
+                try:
+                    num = float(v)
+                    if math.isnan(num) or math.isinf(num):
+                        return None
+                    return num
+                except ValueError:
+                    return None
+
+            df["pdv_vendas"] = df["pdv_vendas"].apply(normalizar_vendas)
+            vendas_validas = df["pdv_vendas"].notna().sum()
+            logging.info(f"ℹ️ {vendas_validas} registros com valor de vendas numérico válido.")
+
+
         return df
+
 
     # ============================================================
     # 🔹 Filtra apenas as colunas relevantes
     # ============================================================
     def filtrar_colunas(self, df):
-        colunas_necessarias = ["cnpj", "logradouro", "numero", "bairro", "cidade", "uf", "cep"]
-        colunas_presentes = [c for c in colunas_necessarias if c in df.columns]
+        colunas_base = ["cnpj", "logradouro", "numero", "bairro", "cidade", "uf", "cep"]
+        colunas_opcionais = ["pdv_vendas"]
+        colunas_presentes = [c for c in (colunas_base + colunas_opcionais) if c in df.columns]
         return df[colunas_presentes].copy()
+
 
     # ============================================================
     # 🔹 Execução principal

@@ -37,27 +37,43 @@ def buscar_run_por_clusterization_id(tenant_id: int, clusterization_id: str):
 def buscar_clusters(tenant_id: int, run_id: int):
     """
     Busca clusters (setores) e PDVs vinculados ao run_id informado.
+    Se o pdv_endereco_completo estiver nulo em cluster_setor_pdv, reconstrói
+    automaticamente a partir dos campos da tabela pdvs.
     """
     sql = """
         SELECT 
             cs.cluster_label,
             cs.centro_lat,
             cs.centro_lon,
-            csp.lat,
-            csp.lon,
-            csp.cidade,
-            csp.uf,
-            csp.pdv_endereco_completo,
-            csp.cnpj
+            COALESCE(csp.lat, p.pdv_lat) AS lat,
+            COALESCE(csp.lon, p.pdv_lon) AS lon,
+            COALESCE(csp.cidade, p.cidade) AS cidade,
+            COALESCE(csp.uf, p.uf) AS uf,
+            COALESCE(
+                NULLIF(csp.pdv_endereco_completo, ''),
+                NULLIF(p.pdv_endereco_completo, ''),
+                CONCAT(
+                    COALESCE(p.logradouro, ''),
+                    CASE WHEN p.numero IS NOT NULL AND p.numero <> '' THEN CONCAT(', ', p.numero) ELSE '' END,
+                    CASE WHEN p.bairro IS NOT NULL AND p.bairro <> '' THEN CONCAT(' - ', p.bairro) ELSE '' END,
+                    CASE WHEN p.cidade IS NOT NULL AND p.cidade <> '' THEN CONCAT(', ', p.cidade) ELSE '' END,
+                    CASE WHEN p.uf IS NOT NULL AND p.uf <> '' THEN CONCAT('/', p.uf) ELSE '' END
+                )
+            ) AS pdv_endereco_completo,
+            COALESCE(csp.cnpj, p.cnpj) AS cnpj
         FROM cluster_setor cs
-        JOIN cluster_setor_pdv csp ON csp.cluster_id = cs.id
+        JOIN cluster_setor_pdv csp 
+            ON csp.cluster_id = cs.id 
+           AND csp.tenant_id = cs.tenant_id
+        LEFT JOIN pdvs p 
+            ON p.id = csp.pdv_id 
+           AND p.tenant_id = csp.tenant_id
         WHERE cs.run_id = %s 
-          AND cs.tenant_id = %s 
-          AND csp.tenant_id = %s;
+          AND cs.tenant_id = %s;
     """
     conn = get_connection()
     with conn.cursor() as cur:
-        cur.execute(sql, (run_id, tenant_id, tenant_id))
+        cur.execute(sql, (run_id, tenant_id))
         rows = cur.fetchall()
     conn.close()
     return rows
@@ -70,7 +86,7 @@ def buscar_clusters(tenant_id: int, run_id: int):
 def gerar_mapa_clusters(dados, output_path: Path):
     """
     Gera mapa HTML com clusters (macrosetores) e PDVs colorindo por cluster_label.
-    Cada PDV exibe CNPJ e endereço completo no popup.
+    Cada PDV exibe CNPJ e endereço completo no popup e tooltip.
     """
     import pandas as pd
     import random
@@ -118,6 +134,14 @@ def gerar_mapa_clusters(dados, output_path: Path):
     for i, (label, pontos) in enumerate(sorted(clusters.items())):
         cor = palette[i % len(palette)]
         for lat, lon, cidade, uf, endereco, cnpj in pontos:
+            # 🔧 Tratamento seguro de valores nulos
+            endereco = endereco if endereco and endereco.strip() else "Endereço não informado"
+            cidade = cidade if cidade and cidade.strip() else "Cidade não informada"
+            uf = uf if uf and uf.strip() else "--"
+            cnpj = cnpj if cnpj and cnpj.strip() else "CNPJ não informado"
+
+            tooltip_text = endereco if endereco != "Endereço não informado" else f"{cidade}/{uf}"
+
             popup_html = f"""
             <b>Cluster:</b> {label}<br>
             <b>CNPJ:</b> {cnpj}<br>
@@ -125,13 +149,15 @@ def gerar_mapa_clusters(dados, output_path: Path):
             <b>Cidade/UF:</b> {cidade}/{uf}<br>
             <b>Lat/Lon:</b> {lat:.6f}, {lon:.6f}
             """
+
             folium.CircleMarker(
                 location=(lat, lon),
                 radius=3,
                 color=cor,
                 fill=True,
                 fill_opacity=0.85,
-                popup=folium.Popup(popup_html, max_width=320)
+                popup=folium.Popup(popup_html, max_width=320),
+                tooltip=folium.Tooltip(tooltip_text, sticky=True)
             ).add_to(m)
 
     legend_html = """
