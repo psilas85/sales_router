@@ -130,3 +130,49 @@ def get_cidades_por_uf(tenant_id: int, uf: str, input_id: str) -> list[str]:
         f"🌎 {len(cidades)} cidades encontradas | tenant={tenant_id} | UF={uf} | input_id={input_id}"
     )
     return cidades
+
+
+# ============================================================
+# 🔄 Compatibilidade para uso em cluster_cep_use_case
+# ============================================================
+
+class DatabaseReader:
+    """
+    Wrapper compatível para chamadas padrão de leitura.
+    Encapsula as funções existentes neste módulo.
+    """
+    def __init__(self, conn):
+        self.conn = conn
+
+    def buscar_marketplace_ceps(self, tenant_id: int, uf: str, input_id: str, cidade: str = None):
+        """
+        Retorna lista de CEPs georreferenciados do marketplace.
+        Filtros:
+        - tenant_id (obrigatório)
+        - uf (obrigatório)
+        - input_id (obrigatório)
+        - cidade (opcional)
+        """
+        cur = self.conn.cursor()
+
+        sql = """
+            SELECT cep, lat, lon, clientes_total, clientes_target
+            FROM marketplace_cep
+            WHERE tenant_id = %s
+            AND uf = %s
+            AND input_id = %s
+            AND lat IS NOT NULL
+            AND lon IS NOT NULL
+        """
+        params = [tenant_id, uf, input_id]
+
+        if cidade:
+            sql += " AND UPPER(cidade) = UPPER(%s)"
+            params.append(cidade)
+
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+
+

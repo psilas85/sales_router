@@ -154,3 +154,77 @@ class DatabaseReader:
         resultados = {row[0].strip().lower(): (row[1], row[2]) for row in cur.fetchall()}
         cur.close()
         return resultados
+
+    def buscar_localizacoes_por_ceps(self, lista_ceps):
+        """
+        Retorna lat/lon de todos os CEPs informados que já existem no cache do banco.
+        """
+        if not lista_ceps:
+            return []
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT endereco, lat, lon
+                    FROM enderecos_cache
+                    WHERE endereco = ANY(%s)
+                    """,
+                    (lista_ceps,)
+                )
+                colunas = [desc[0] for desc in cur.description]
+                rows = cur.fetchall()
+                return [dict(zip(colunas, r)) for r in rows]
+        except Exception as e:
+            logging.error(f"❌ Erro ao buscar CEPs no cache: {e}", exc_info=True)
+            return []
+
+        # ============================================================
+    # 🔍 Busca coordenadas no cache MKP (por CEP individual)
+    # ============================================================
+    def buscar_localizacao_mkp(self, cep: str):
+        """
+        Retorna (lat, lon) para o CEP informado no cache de marketplace.
+        """
+        if not cep:
+            return None
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "SELECT lat, lon FROM mkp_enderecos_cache WHERE cep = %s LIMIT 1;",
+                    (str(cep).zfill(8),)
+                )
+                row = cur.fetchone()
+                if row and row[0] is not None and row[1] is not None:
+                    return (row[0], row[1])
+                return None
+        except Exception as e:
+            logging.warning(f"⚠️ [MKP_CACHE] Falha ao buscar CEP {cep}: {e}")
+            return None
+
+    # ============================================================
+    # 🔍 Busca múltiplos CEPs no cache MKP (batch)
+    # ============================================================
+    def buscar_localizacoes_mkp_por_ceps(self, lista_ceps):
+        """
+        Retorna todos os CEPs que já existem no cache MKP.
+        """
+        if not lista_ceps:
+            return []
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT cep, lat, lon
+                    FROM mkp_enderecos_cache
+                    WHERE cep = ANY(%s)
+                    """,
+                    (lista_ceps,)
+                )
+                colunas = [desc[0] for desc in cur.description]
+                rows = cur.fetchall()
+                return [dict(zip(colunas, r)) for r in rows]
+        except Exception as e:
+            logging.error(f"❌ Erro ao buscar CEPs no cache MKP: {e}", exc_info=True)
+            return []
+
+    

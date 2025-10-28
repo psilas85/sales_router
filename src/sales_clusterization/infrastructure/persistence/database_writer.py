@@ -319,3 +319,79 @@ def salvar_outliers(tenant_id: int, clusterization_id: str, pdv_flags: list):
 
     except Exception as e:
         logger.warning(f"⚠️ Falha ao exportar CSV de outliers: {e}")
+
+
+# ============================================================
+# 🔄 Classe compatível para uso no ClusterCEPUseCase
+# ============================================================
+
+class DatabaseWriter:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def inserir_mkp_cluster_cep(self, lista_clusters):
+        """
+        Insere resultado da clusterização de CEPs na tabela mkp_cluster_cep.
+        Cada execução tem clusterization_id único (sem sobrescrever execuções anteriores).
+        """
+        if not lista_clusters:
+            return 0
+
+        from psycopg2.extras import execute_values
+        import logging
+
+        cur = self.conn.cursor()
+
+        valores = [
+            (
+                c["tenant_id"],
+                c["input_id"],
+                c["clusterization_id"],  # ✅ agora obrigatório
+                c["uf"],
+                c["cep"],
+                c["cluster_id"],
+                c["clientes_total"],
+                c["clientes_target"],
+                c["cluster_lat"],
+                c["cluster_lon"],
+                c["distancia_km"],
+                c["tempo_min"],
+                c["is_outlier"]
+            )
+            for c in lista_clusters
+        ]
+
+        sql = """
+            INSERT INTO mkp_cluster_cep (
+                tenant_id, input_id, clusterization_id, uf, cep, cluster_id,
+                clientes_total, clientes_target,
+                cluster_lat, cluster_lon,
+                distancia_km, tempo_min, is_outlier
+            )
+            VALUES %s
+            ON CONFLICT (tenant_id, input_id, clusterization_id, cep) DO UPDATE SET
+                cluster_id = EXCLUDED.cluster_id,
+                cluster_lat = EXCLUDED.cluster_lat,
+                cluster_lon = EXCLUDED.cluster_lon,
+                distancia_km = EXCLUDED.distancia_km,
+                tempo_min = EXCLUDED.tempo_min,
+                is_outlier = EXCLUDED.is_outlier,
+                atualizado_em = NOW();
+        """
+
+
+
+        try:
+            logging.info(f"💾 Inserindo {len(valores)} linhas em mkp_cluster_cep "
+                         f"(clusterization_id={lista_clusters[0]['clusterization_id']})")
+            execute_values(cur, sql, valores)
+            self.conn.commit()
+            inseridos = cur.rowcount or len(valores)
+            cur.close()
+            return inseridos
+        except Exception as e:
+            self.conn.rollback()
+            logging.error(f"❌ Erro ao inserir mkp_cluster_cep: {e}", exc_info=True)
+            cur.close()
+            return 0
+
