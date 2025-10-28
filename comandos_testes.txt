@@ -1,0 +1,19 @@
+docker exec -it pdv_preprocessing   python3 -m src.pdv_preprocessing.main_pdv_preprocessing   --tenant 1   --arquivo data/pdvs_enderecos.csv   --descricao "SC_10K_251028"
+
+docker exec -it clusterization_jobs_worker python3 -m src.jobs.clusterization_jobs   --tenant 1   --uf SP   --usuario paulo  --descricao "SC_251028_SP"  --input_id c3256ec0-f63a-4264-86cf-f8714fe0eb7e  --excluir_outliers
+
+ocker exec -it sales_clusterization python3 -m src.sales_clusterization.visualization.cluster_plotting   --tenant_id 1   --clusterization_id 54ed2eb3-30c1-413c-824d-e0f5fd5bbadc   --modo_interativo
+
+docker exec -it clusterization_jobs_worker python3 -m src.jobs.routing_jobs   --tenant 1   --uf SP   --usuario paulo  --descricao "SC_251028_SP"  --clusterization_id 54ed2eb3-30c1-413c-824d-e0f5fd5bbadc
+
+docker exec -it sales_routing python3 -m src.sales_routing.visualization.route_plotting   --tenant 1   --routing_id ee1781f1-9a83-4795-bca4-a6756aec41ec
+
+docker exec -it sales_routing  python3 -m src.sales_routing.cli.run_assign_vendedores   --tenant 1   --uf SP   --usuario paulo  --descricao "SC_251028_SP"  --routing_id ee1781f1-9a83-4795-bca4-a6756aec41ec
+
+docker exec -it sales_routing  python3 -m src.sales_routing.visualization.plot_vendedores   --tenant 1 --assign_id 8ef90ab1-6295-4cd3-8f35-5d785461745f
+
+docker exec -it sales_routing  python3 -m src.sales_routing.reporting.export_pdv_vendedor  --tenant 1 --assign_id 8ef90ab1-
+6295-4cd3-8f35-5d785461745f
+
+docker exec -it sales_routing  python3 -m src.sales_routing.reporting.vendedores_summary_service  --tenant 1 --assign_id 8e
+f90ab1-6295-4cd3-8f35-5d785461745f
