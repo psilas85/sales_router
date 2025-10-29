@@ -5,6 +5,9 @@
 from typing import Optional, Dict, Any, List
 from loguru import logger
 import numpy as np
+from sklearn.neighbors import NearestNeighbors
+from math import radians, sin, cos, sqrt, atan2
+
 from src.sales_clusterization.infrastructure.persistence.database_reader import carregar_pdvs
 from src.sales_clusterization.infrastructure.persistence.database_writer import (
     criar_run,
@@ -14,7 +17,7 @@ from src.sales_clusterization.infrastructure.persistence.database_writer import 
     salvar_outliers,
 )
 from src.sales_clusterization.infrastructure.logging.run_logger import snapshot_params
-from src.sales_clusterization.domain.k_estimator import estimar_k_inicial, _haversine_km
+from src.sales_clusterization.domain.k_estimator import estimar_k_inicial
 from src.sales_clusterization.domain.sector_generator import kmeans_setores
 from src.sales_clusterization.domain.sector_generator_hybrid import dbscan_kmeans_balanceado
 from src.sales_clusterization.domain.validators import checar_raio
@@ -22,82 +25,53 @@ from src.sales_clusterization.domain.entities import PDV
 
 
 # ============================================================
-# 🧠 Detecção de Outliers Geográficos Adaptativa e Suavizada
+# 🧠 Detecção de Outliers Geográficos (versão otimizada)
 # ============================================================
 
-from typing import List, Optional
-import numpy as np
-from sklearn.neighbors import NearestNeighbors
-from loguru import logger
-from math import radians, sin, cos, sqrt, atan2
-
-
-# ---------------------------------------
-# Distância haversine (km)
-# ---------------------------------------
-def _haversine_km(a, b):
-    R = 6371.0
-    lat1, lon1, lat2, lon2 = map(radians, [a[0], a[1], b[0], b[1]])
-    dlat, dlon = lat2 - lat1, lon2 - lon1
-    h = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
-    return 2 * R * atan2(sqrt(h), sqrt(1 - h))
-
-
-# ---------------------------------------
-# Função principal
-# ---------------------------------------
 def detectar_outliers_geograficos(
-    pdvs: List,
+    pdvs: List[PDV],
     z_thresh: float = 2.0,
     metodo: Optional[str] = None,
     limite_urbano_km: Optional[float] = None,
 ):
     """
     Detecta outliers geográficos com base na distância ao vizinho mais próximo.
-
-    🔹 Adaptativo — sem limite fixo:
-       O raio urbano é estimado automaticamente a partir da densidade local
-       (distância média até o 5º vizinho mais próximo).
-
-    🔹 Suavizado:
-       O limiar final combina estatísticas globais (Z-score/IQR) e densidade urbana,
-       reduzindo falsos positivos em regiões densas.
+    🔹 Otimizada: usa NearestNeighbors (metric='haversine') para O(N log N)
+    🔹 Mantém comportamento híbrido adaptativo e suavizado do código original.
     """
     if len(pdvs) < 5:
         logger.warning("⚠️ Poucos PDVs para detecção de outliers — nenhum removido.")
         return [(p, False) for p in pdvs]
 
+    # Coordenadas e conversão para radianos
     coords = np.array([[p.lat, p.lon] for p in pdvs])
+    coords_rad = np.radians(coords)
 
     # =====================================================
     # 🧭 1️⃣ Densidade local → limite urbano dinâmico
     # =====================================================
     k = min(5, len(coords) - 1)
-    nn = NearestNeighbors(n_neighbors=k)
-    nn.fit(coords)
-    dist_k, _ = nn.kneighbors(coords)
-    media_k5 = np.mean(dist_k[:, -1]) * 111  # converte graus → km
+    nn = NearestNeighbors(n_neighbors=k + 1, metric="haversine")
+    nn.fit(coords_rad)
+    dist, _ = nn.kneighbors(coords_rad)
 
-    # limite dinâmico adaptado ao contexto
+    # Distância média até o 5º vizinho (em km)
+    media_k5 = np.mean(dist[:, -1]) * 6371.0
     limite_dinamico = np.clip(media_k5 * 7, 4, 12)
     if limite_urbano_km is None:
         limite_urbano_km = limite_dinamico
 
     # =====================================================
-    # 📏 2️⃣ Cálculo da distância mínima entre vizinhos
+    # 📏 2️⃣ Distância mínima até o vizinho mais próximo
     # =====================================================
-    dists = []
-    for i, a in enumerate(coords):
-        vizinhos = [_haversine_km(a, b) for j, b in enumerate(coords) if i != j]
-        dists.append(min(vizinhos) if vizinhos else 0.0)
-
-    dist_mean = np.mean(dists)
-    dist_std = np.std(dists)
-    q1, q3 = np.percentile(dists, [25, 75])
+    dist_min = dist[:, 1] * 6371.0  # ignora o próprio ponto
+    dist_mean = np.mean(dist_min)
+    dist_std = np.std(dist_min)
+    q1, q3 = np.percentile(dist_min, [25, 75])
     iqr = q3 - q1
 
     # =====================================================
-    # ⚙️ 3️⃣ Seleção automática de método (se não especificado)
+    # ⚙️ 3️⃣ Seleção automática de método (IQR, Z-score ou híbrido)
     # =====================================================
     if metodo is None:
         if dist_std < 2:
@@ -108,7 +82,7 @@ def detectar_outliers_geograficos(
             metodo = "hibrido"
 
     # =====================================================
-    # 📊 4️⃣ Definição de limiar de outlier (com suavização)
+    # 📊 4️⃣ Limiar de outlier (com suavização)
     # =====================================================
     if metodo == "iqr":
         limiar = q3 + 2.5 * iqr
@@ -119,10 +93,7 @@ def detectar_outliers_geograficos(
     else:
         limiar_z = dist_mean + z_thresh * dist_std
         limiar_iqr = q3 + 2.5 * iqr
-
-        # suavização entre estatística e limite urbano
         limiar = (min(limiar_z, limiar_iqr) * 0.7) + (limite_urbano_km * 0.3)
-
         metodo_desc = (
             f"Híbrido adaptativo suavizado (z={limiar_z:.2f}, iqr={limiar_iqr:.2f}, "
             f"urbano={limite_urbano_km:.2f} → final={limiar:.2f} km)"
@@ -131,8 +102,8 @@ def detectar_outliers_geograficos(
     # =====================================================
     # 🧹 5️⃣ Detecção final
     # =====================================================
-    flags = [d > limiar for d in dists]
-    removidos = sum(flags)
+    flags = dist_min > limiar
+    removidos = np.sum(flags)
 
     logger.info(
         f"🧹 Detecção de outliers [{metodo_desc}] | média={dist_mean:.2f} km | std={dist_std:.2f} | "
@@ -140,13 +111,13 @@ def detectar_outliers_geograficos(
         f"outliers detectados={removidos}/{len(pdvs)}"
     )
 
-    return [(pdvs[i], flags[i]) for i in range(len(pdvs))]
-
+    return [(pdvs[i], bool(flags[i])) for i in range(len(pdvs))]
 
 
 # ============================================================
 # 🧠 Execução principal da clusterização
 # ============================================================
+
 def executar_clusterizacao(
     tenant_id: int,
     uf: Optional[str],
@@ -188,7 +159,6 @@ def executar_clusterizacao(
     pdv_flags = detectar_outliers_geograficos(pdvs, z_thresh=z_thresh, metodo="hibrido")
     total_outliers = sum(1 for _, flag in pdv_flags if flag)
 
-    # Salva todos com flag no banco
     try:
         salvar_outliers(tenant_id, clusterization_id, pdv_flags)
         logger.info(f"🗄️ {len(pdv_flags)} PDVs registrados com flag de outlier (total={total_outliers}).")

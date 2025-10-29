@@ -85,7 +85,6 @@ def carregar_pdvs(
                     id=_id,
                     cnpj=cnpj,
                     nome=None,
-                    bairro=bairro,
                     cidade=cidade_,
                     uf=uf_,
                     lat=float(lat),

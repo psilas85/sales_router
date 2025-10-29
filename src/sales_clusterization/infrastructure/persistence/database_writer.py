@@ -15,6 +15,9 @@ from typing import List, Dict
 from src.sales_clusterization.domain.entities import Setor, PDV
 from src.database.db_connection import get_connection
 from loguru import logger
+import math
+from sklearn.neighbors import NearestNeighbors
+
 
 
 # ============================================================
@@ -166,7 +169,7 @@ def salvar_setores(tenant_id: int, run_id: int, setores: List[Setor]) -> Dict[in
 
 
 # ============================================================
-# 🧩 Salvamento do mapeamento PDV → Cluster
+# 🧩 Salvamento do mapeamento PDV → Cluster 
 # ============================================================
 def salvar_mapeamento_pdvs(
     tenant_id: int,
@@ -177,6 +180,7 @@ def salvar_mapeamento_pdvs(
 ):
     """
     Grava o relacionamento PDV → Setor (cluster_setor_pdv)
+    
     """
     sql = """
         INSERT INTO cluster_setor_pdv
@@ -208,28 +212,43 @@ def salvar_mapeamento_pdvs(
 
     logger.info(f"🧩 {count} PDVs mapeados em clusters (run_id={run_id})")
 
+
 # ============================================================
-# 🧾 Persistência e auditoria de outliers (versão final)
+# 🧾 Persistência e auditoria de outliers (versão otimizada)
 # ============================================================
 
-import math
-from src.sales_clusterization.domain.k_estimator import _haversine_km
 
 def salvar_outliers(tenant_id: int, clusterization_id: str, pdv_flags: list):
     """
-    Persiste lista de PDVs com flag de outlier (True/False) no banco,
-    calcula distância média ao vizinho mais próximo e exporta CSV de auditoria.
-    Inclui limpeza automática (DELETE) para reprocessamentos.
+    Persiste lista de PDVs com flag de outlier (True/False) no banco.
+    🔹 Otimizada: cálculo de distância média via NearestNeighbors (O(N log N))
     """
+
     if not pdv_flags:
         logger.warning("⚠️ Nenhum PDV recebido para salvar_outliers().")
         return
 
+    # ============================================================
+    # 📏 Cálculo eficiente das distâncias médias (em km)
+    # ============================================================
+    try:
+        coords = np.radians(np.array([(p.lat, p.lon) for p, _ in pdv_flags]))
+        n_neighbors = min(6, len(coords))  # até 5 vizinhos + o próprio
+        nn = NearestNeighbors(n_neighbors=n_neighbors, metric="haversine")
+        nn.fit(coords)
+        dist, _ = nn.kneighbors(coords)
+        dist_medias = dist[:, 1:].mean(axis=1) * 6371.0  # média dos vizinhos (km)
+        logger.info(f"📐 Distâncias médias calculadas via NearestNeighbors para {len(coords)} PDVs.")
+    except Exception as e:
+        logger.error(f"❌ Falha no cálculo de distâncias médias: {e}")
+        dist_medias = np.zeros(len(pdv_flags))
+
+    # ============================================================
+    # 🧩 Inserção no banco
+    # ============================================================
     conn = get_connection()
     with conn.cursor() as cur:
-        # ============================================================
-        # 🔧 Garante estrutura e remove dados antigos (reprocessamento)
-        # ============================================================
+        # Garante estrutura da tabela
         cur.execute("""
             CREATE TABLE IF NOT EXISTS sales_clusterization_outliers (
                 id SERIAL PRIMARY KEY,
@@ -246,28 +265,13 @@ def salvar_outliers(tenant_id: int, clusterization_id: str, pdv_flags: list):
             );
         """)
 
-        # Remove registros anteriores do mesmo processamento
+        # Remove registros antigos para mesmo tenant e clusterization_id
         cur.execute(
             "DELETE FROM sales_clusterization_outliers WHERE tenant_id = %s AND clusterization_id = %s;",
             (tenant_id, clusterization_id),
         )
 
-        # ============================================================
-        # 📏 Calcula distância média ao vizinho mais próximo (para auditoria)
-        # ============================================================
-        coords = [(p.lat, p.lon) for p, _ in pdv_flags]
-        dist_medias = []
-        for i, (lat_a, lon_a) in enumerate(coords):
-            vizinhos = [
-                _haversine_km((lat_a, lon_a), (lat_b, lon_b))
-                for j, (lat_b, lon_b) in enumerate(coords)
-                if i != j
-            ]
-            dist_medias.append(float(np.mean(vizinhos)) if vizinhos else 0.0)
-
-        # ============================================================
-        # 💾 Insere registros no banco
-        # ============================================================
+        # Prepara registros para inserção
         rows = [
             (
                 tenant_id,
@@ -277,7 +281,7 @@ def salvar_outliers(tenant_id: int, clusterization_id: str, pdv_flags: list):
                 p.cidade,
                 p.lat,
                 p.lon,
-                dist_medias[i],
+                float(dist_medias[i]),
                 bool(flag),
             )
             for i, (p, flag) in enumerate(pdv_flags)
@@ -294,7 +298,10 @@ def salvar_outliers(tenant_id: int, clusterization_id: str, pdv_flags: list):
 
     total_outliers = sum(1 for _, flag in pdv_flags if flag)
     logger.info(f"🗄️ {len(rows)} registros de outliers gravados no banco para tenant={tenant_id}.")
-    logger.success(f"📊 Outliers detectados: {total_outliers} de {len(rows)} PDVs totais ({100*total_outliers/len(rows):.2f}%).")
+    logger.success(
+        f"📊 Outliers detectados: {total_outliers} de {len(rows)} PDVs totais "
+        f"({100 * total_outliers / len(rows):.2f}%)."
+    )
 
     # ============================================================
     # 📤 Exporta CSV de auditoria
@@ -312,13 +319,13 @@ def salvar_outliers(tenant_id: int, clusterization_id: str, pdv_flags: list):
                 "tenant_id", "clusterization_id", "pdv_id", "cnpj", "cidade",
                 "lat", "lon", "distancia_media_km", "is_outlier"
             ])
-            for r in rows:
-                writer.writerow(r)
+            writer.writerows(rows)
 
         logger.success(f"📁 CSV de auditoria salvo em: {csv_path}")
 
     except Exception as e:
         logger.warning(f"⚠️ Falha ao exportar CSV de outliers: {e}")
+
 
 
 # ============================================================
@@ -394,4 +401,6 @@ class DatabaseWriter:
             logging.error(f"❌ Erro ao inserir mkp_cluster_cep: {e}", exc_info=True)
             cur.close()
             return 0
+    
+    
 
