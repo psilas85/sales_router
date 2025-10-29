@@ -19,7 +19,7 @@ class GeolocationService:
     """
     Serviço de georreferenciamento unificado:
       - Cache em memória e banco
-      - Fallback: Cache → Nominatim público → Google
+      - Fallback: Cache → Nominatim local → Nominatim público → Google
       - Execução paralela com retries e backoff
       - Compatível com PDV e MKP
     """
@@ -28,42 +28,42 @@ class GeolocationService:
         self.reader = reader
         self.writer = writer
         self.GOOGLE_KEY = os.getenv("GMAPS_API_KEY")
-        self.cache_mem = {}
+        self.NOMINATIM_LOCAL = os.getenv("NOMINATIM_LOCAL_URL", "http://nominatim:8080/reverse")
+        self.NOMINATIM_PUBLIC = "https://nominatim.openstreetmap.org/search"
         self.timeout = 10
         self.max_workers = max_workers
-        self.NOMINATIM_PUBLIC = "https://nominatim.openstreetmap.org/search"
 
+        self.cache_mem = {}
+        
         self.stats = {
             "cache_mem": 0,
             "cache_db": 0,
             "nominatim_public": 0,
+            "nominatim_local": 0,
             "google": 0,
             "falha": 0,
             "total": 0,
         }
 
     # ============================================================
-    # 🧭 Validador de coordenadas genéricas (tolerância segura)
+    # 🧭 Validador de coordenadas genéricas
     # ============================================================
     def _is_generic_location(self, lat: float, lon: float) -> bool:
-        """Evita descartar endereços válidos no centro das capitais."""
         if lat is None or lon is None:
             return True
-
         pontos_genericos = [
             (-23.5506507, -46.6333824),  # São Paulo/SP
             (-22.908333, -43.196388),    # Rio de Janeiro/RJ
             (-15.7801, -47.9292),        # Brasília/DF
             (-19.9167, -43.9345),        # Belo Horizonte/MG
         ]
-
         for ref_lat, ref_lon in pontos_genericos:
             if abs(lat - ref_lat) < 0.0005 and abs(lon - ref_lon) < 0.0005:
                 return True
         return False
 
     # ============================================================
-    # 🌍 Busca coordenadas (com retry, fallback e origem)
+    # 🌍 Buscar coordenadas (PDV ou MKP)
     # ============================================================
     def buscar_coordenadas(self, endereco: str | None, cep: str | None = None) -> tuple[float, float, str]:
         if not endereco and not cep:
@@ -86,7 +86,7 @@ class GeolocationService:
             self.cache_mem[query] = (lat, lon)
             return lat, lon, "cache_db"
 
-        # Função auxiliar com retry e backoff exponencial
+        # Função auxiliar com retry e backoff
         def _get_with_retry(url, headers=None, max_retries=3):
             for tent in range(max_retries):
                 try:
@@ -109,8 +109,6 @@ class GeolocationService:
                 self.cache_mem[query] = (lat, lon)
                 self.writer.salvar_cache(endereco or cep, lat, lon, tipo="mkp" if cep else "pdv")
                 return lat, lon, "nominatim_public"
-            else:
-                logging.debug(f"⚠️ Coordenada genérica ignorada: {query} ({lat}, {lon})")
 
         # 4️⃣ Google Maps fallback
         if self.GOOGLE_KEY:
@@ -125,10 +123,6 @@ class GeolocationService:
                     self.cache_mem[query] = (lat, lon)
                     self.writer.salvar_cache(endereco or cep, lat, lon, tipo="mkp" if cep else "pdv")
                     return lat, lon, "google"
-                else:
-                    logging.debug(f"⚠️ Coordenada genérica ignorada (Google): {query} ({lat}, {lon})")
-            else:
-                logging.debug(f"📭 Google sem resultado para {query}")
 
         # ❌ Nenhum resultado
         self.stats["falha"] += 1
@@ -136,14 +130,14 @@ class GeolocationService:
         return None, None, "falha"
 
     # ============================================================
-    # ⚡ Processamento paralelo adaptativo
+    # ⚡ Geocodificação em lote (threads)
     # ============================================================
     def geocodificar_em_lote(self, entradas: list[str], tipo: str = "PDV") -> dict[str, tuple[float, float]]:
         if not entradas:
             return {}
 
         total = len(entradas)
-        max_workers = min(self.max_workers, max(5, total // 50))  # ajuste adaptativo
+        max_workers = min(self.max_workers, max(5, total // 50))
         inicio_total = time.time()
         resultados = {}
 
@@ -182,67 +176,6 @@ class GeolocationService:
         return resultados
 
     # ============================================================
-    # 🔹 Busca específica por CEP (MKP)
-    # ============================================================
-    def buscar_coordenadas_por_cep_mkp(self, cep: str, cidade: str = None, uf: str = None):
-        if not cep:
-            self.stats["falha"] += 1
-            return None, None, "cep_vazio"
-
-        cep_norm = str(cep).strip().zfill(8)
-        self.stats["total"] += 1
-
-        # Cache em memória
-        if cep_norm in self.cache_mem:
-            self.stats["cache_mem"] += 1
-            lat, lon = self.cache_mem[cep_norm]
-            return lat, lon, "cache_mem"
-
-        # Cache no banco
-        cache_db = self.reader.buscar_localizacao_mkp(cep_norm)
-        if cache_db:
-            lat, lon = cache_db
-            self.cache_mem[cep_norm] = (lat, lon)
-            self.stats["cache_db"] += 1
-            return lat, lon, "cache_db"
-
-        # Nominatim público com postalcode
-        headers = {"User-Agent": "SalesRouter-Geocoder/1.0"}
-        url_pub = f"{self.NOMINATIM_PUBLIC}?postalcode={cep_norm}&countrycodes=br&format=json"
-        dados = requests.get(url_pub, headers=headers, timeout=self.timeout).json()
-        if isinstance(dados, list) and len(dados) > 0:
-            lat, lon = float(dados[0]["lat"]), float(dados[0]["lon"])
-            if not self._is_generic_location(lat, lon):
-                self.stats["nominatim_public"] += 1
-                self.cache_mem[cep_norm] = (lat, lon)
-                self.writer.inserir_localizacao_mkp(cep_norm, lat, lon)
-                return lat, lon, "nominatim_public"
-
-        # Google fallback
-        if self.GOOGLE_KEY:
-            from urllib.parse import quote
-            components = f"postal_code:{cep_norm}|country:BR"
-            if uf:
-                components += f"|administrative_area:{uf}"
-            if cidade:
-                components += f"|locality:{cidade}"
-            url = f"https://maps.googleapis.com/maps/api/geocode/json?components={quote(components)}&key={self.GOOGLE_KEY}"
-            resp = requests.get(url, timeout=self.timeout)
-            dados = resp.json()
-            if dados.get("status") == "OK" and dados.get("results"):
-                loc = dados["results"][0]["geometry"]["location"]
-                lat, lon = loc["lat"], loc["lng"]
-                if not self._is_generic_location(lat, lon):
-                    self.stats["google"] += 1
-                    self.writer.inserir_localizacao_mkp(cep_norm, lat, lon)
-                    self.cache_mem[cep_norm] = (lat, lon)
-                    return lat, lon, "google"
-
-        self.stats["falha"] += 1
-        logging.debug(f"💀 Nenhuma coordenada encontrada para {cep_norm}")
-        return None, None, "falha"
-
-    # ============================================================
     # 📊 Resumo de logs
     # ============================================================
     def exibir_resumo_logs(self):
@@ -251,3 +184,4 @@ class GeolocationService:
             if origem != "total":
                 logging.info(f"   {origem:<18}: {count}")
         logging.info(f"   total               : {self.stats['total']}")
+

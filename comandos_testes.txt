@@ -2,7 +2,7 @@ docker exec -it pdv_preprocessing   python3 -m src.pdv_preprocessing.main_pdv_pr
 
 docker exec -it clusterization_jobs_worker python3 -m src.jobs.clusterization_jobs   --tenant 1   --uf SP   --usuario paulo  --descricao "SC_251028_SP"  --input_id c3256ec0-f63a-4264-86cf-f8714fe0eb7e  --excluir_outliers
 
-ocker exec -it sales_clusterization python3 -m src.sales_clusterization.visualization.cluster_plotting   --tenant_id 1   --clusterization_id 54ed2eb3-30c1-413c-824d-e0f5fd5bbadc   --modo_interativo
+docker exec -it sales_clusterization python3 -m src.sales_clusterization.visualization.cluster_plotting   --tenant_id 1   --clusterization_id 54ed2eb3-30c1-413c-824d-e0f5fd5bbadc   --modo_interativo
 
 docker exec -it clusterization_jobs_worker python3 -m src.jobs.routing_jobs   --tenant 1   --uf SP   --usuario paulo  --descricao "SC_251028_SP"  --clusterization_id 54ed2eb3-30c1-413c-824d-e0f5fd5bbadc
 

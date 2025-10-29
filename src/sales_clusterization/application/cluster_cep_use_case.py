@@ -8,6 +8,7 @@ import numpy as np
 import uuid
 from sklearn.cluster import KMeans
 from sales_clusterization.domain.haversine_utils import haversine
+from pdv_preprocessing.domain.geolocation_service import GeolocationService
 
 
 class ClusterCEPUseCase:
@@ -37,10 +38,13 @@ class ClusterCEPUseCase:
         self.cidade = cidade
         self.ajustar_coordenadas = ajustar_coordenadas
 
+        # GeolocationService agora com reader e writer injetados
+        self.geo_service = GeolocationService(reader=self.reader, writer=self.writer)
+
     # ------------------------------------------------------------
     # Execução principal
     # ------------------------------------------------------------
-    def execute(self):
+    def execute(self, ceps_max_cluster: int = None):
         # ============================================================
         # 🆕 clusterization_id
         # ============================================================
@@ -62,8 +66,36 @@ class ClusterCEPUseCase:
             registros,
             columns=["cep", "lat", "lon", "clientes_total", "clientes_target"]
         )
-        coluna_peso = "clientes_target" if self.usar_clientes_target else "clientes_total"
-        logging.info(f"📊 Utilizando coluna de peso: {coluna_peso}")
+
+        total_inicial = len(df)
+
+        # ============================================================
+        # 🏘️ (Etapa desativada) Preenchimento de bairros
+        # ============================================================
+        logging.info("🏘️ Etapa de preenchimento de bairros desativada — seguindo apenas com cidade, UF e coordenadas.")
+        # Nenhuma chamada de reverse geocode será feita nesta etapa.
+
+        # ============================================================
+        # 🎯 Seleção de peso e filtro condicional
+        # ============================================================
+        if self.usar_clientes_target:
+            df = df[df["clientes_target"].fillna(0) > 0].copy()
+            coluna_peso = "clientes_target"
+            logging.info(f"📊 Utilizando coluna de peso: {coluna_peso} (filtrando apenas clientes_target > 0)")
+        else:
+            df = df[df["clientes_total"].fillna(0) > 0].copy()
+            coluna_peso = "clientes_total"
+            logging.info(f"📊 Utilizando coluna de peso: {coluna_peso}")
+
+        total_pos_filtro = len(df)
+        logging.info(f"📦 Registros antes do filtro: {total_inicial} → após filtro: {total_pos_filtro}")
+
+        # ============================================================
+        # ⚖️ Normalização de pesos (0–1)
+        # ============================================================
+        df["peso"] = df[coluna_peso].astype(float)
+        df["peso_norm"] = df["peso"] / df["peso"].max() if df["peso"].max() > 0 else 1.0
+        logging.info(f"⚖️ Pesos normalizados entre {df['peso_norm'].min():.2f} e {df['peso_norm'].max():.2f}")
 
         # ============================================================
         # 🌍 Aplica jitter leve em coordenadas duplicadas (±0.002°)
@@ -97,25 +129,64 @@ class ClusterCEPUseCase:
         )
 
         # ============================================================
-        # 🤖 KMeans inicial
+        # 🔁 Loop adaptativo: tempo e quantidade de CEPs
         # ============================================================
-        coords = df[["lat", "lon"]].values
-        kmeans = KMeans(n_clusters=k_inicial, random_state=42, n_init=10)
-        df["cluster_id"] = kmeans.fit_predict(coords)
-        centros = kmeans.cluster_centers_
+        k_atual = k_inicial
+        max_iter = 10
+        for tentativa in range(max_iter):
+            logging.info(f"🔄 Tentativa {tentativa+1}/{max_iter}: executando KMeans com k={k_atual}")
+            coords = df[["lat", "lon"]].values
+            kmeans = KMeans(n_clusters=k_atual, random_state=42, n_init=10)
+            df["cluster_id"] = kmeans.fit_predict(coords)
 
-        logging.info(f"📈 Clusters únicos identificados: {df['cluster_id'].nunique()}")
+            tempo_max_global = 0
+            ceps_max_global = 0
+
+            for cluster_id in sorted(df["cluster_id"].unique()):
+                grupo = df[df["cluster_id"] == cluster_id].copy()
+                centro_lat = np.average(grupo["lat"], weights=grupo["peso_norm"])
+                centro_lon = np.average(grupo["lon"], weights=grupo["peso_norm"])
+                grupo["distancia_km"] = grupo.apply(
+                    lambda r: haversine((r["lat"], r["lon"]), (centro_lat, centro_lon)), axis=1
+                )
+                grupo["tempo_min"] = (grupo["distancia_km"] / self.velocidade_media) * 60
+                tempo_max_cluster = grupo["tempo_min"].max()
+                tempo_max_global = max(tempo_max_global, tempo_max_cluster)
+                ceps_max_global = max(ceps_max_global, len(grupo))
+
+            tempo_ok = tempo_max_global <= self.tempo_max_min
+            ceps_ok = (ceps_max_cluster is None) or (ceps_max_global <= ceps_max_cluster)
+
+            logging.info(
+                f"⏱️ Tempo máx global={tempo_max_global:.2f} min | "
+                f"CEPs máx cluster={ceps_max_global} | k={k_atual}"
+            )
+
+            if tempo_ok and ceps_ok:
+                logging.info("✅ Critérios atendidos: tempo e quantidade de CEPs.")
+                break
+
+            if tentativa == max_iter - 1:
+                logging.warning(f"⚠️ Limite de iterações atingido (k={k_atual}) — encerrando.")
+                break
+
+            k_atual += 1
+            logging.info(f"⚙️ Aumentando K para {k_atual} e recalculando...")
 
         # ============================================================
-        # 🔁 Cálculo de distâncias e tempos
+        # 💾 Geração e gravação final
         # ============================================================
         lista_clusters = []
         for cluster_id in sorted(df["cluster_id"].unique()):
             grupo = df[df["cluster_id"] == cluster_id].copy()
-            centro = centros[int(cluster_id)]
+            centro_lat = np.average(grupo["lat"], weights=grupo["peso_norm"])
+            centro_lon = np.average(grupo["lon"], weights=grupo["peso_norm"])
 
+            # ============================================================
+            # 🧭 Cálculo de distâncias e métricas do cluster
+            # ============================================================
             grupo["distancia_km"] = grupo.apply(
-                lambda r: haversine((r["lat"], r["lon"]), centro), axis=1
+                lambda r: haversine((r["lat"], r["lon"]), (centro_lat, centro_lon)), axis=1
             )
             grupo["tempo_min"] = (grupo["distancia_km"] / self.velocidade_media) * 60
             grupo["is_outlier"] = grupo["tempo_min"] > self.tempo_max_min
@@ -124,30 +195,26 @@ class ClusterCEPUseCase:
             outliers = grupo["is_outlier"].sum()
             logging.info(
                 f"📍 Cluster {cluster_id}: {qtd_ceps} CEPs | "
-                f"Centro=({centro[0]:.5f}, {centro[1]:.5f}) | "
-                f"Outliers={outliers}"
+                f"Centro=({centro_lat:.5f}, {centro_lon:.5f}) | Outliers={outliers}"
             )
 
             for _, row in grupo.iterrows():
                 lista_clusters.append({
                     "tenant_id": self.tenant_id,
                     "input_id": self.input_id,
-                    "clusterization_id": clusterization_id,  # ✅ novo campo
+                    "clusterization_id": clusterization_id,
                     "uf": self.uf,
                     "cep": row["cep"],
                     "cluster_id": int(cluster_id),
                     "clientes_total": int(row["clientes_total"]),
                     "clientes_target": int(row["clientes_target"]),
-                    "cluster_lat": float(centro[0]),
-                    "cluster_lon": float(centro[1]),
+                    "cluster_lat": float(centro_lat),
+                    "cluster_lon": float(centro_lon),
                     "distancia_km": float(row["distancia_km"]),
                     "tempo_min": float(row["tempo_min"]),
                     "is_outlier": bool(row["is_outlier"]),
                 })
 
-        # ============================================================
-        # 💾 Salva resultado no banco
-        # ============================================================
         inseridos = self.writer.inserir_mkp_cluster_cep(lista_clusters)
         total_clusters = df["cluster_id"].nunique()
         total_ceps = len(df)
@@ -158,5 +225,15 @@ class ClusterCEPUseCase:
             f"Clusters={total_clusters} | CEPs={total_ceps} | Outliers={total_outliers}"
         )
         logging.success(f"🏁 Clusterização finalizada com sucesso | clusterization_id={clusterization_id}")
+
+        # ============================================================
+        # 📊 Gera resumo automático (CSV)
+        # ============================================================
+        try:
+            from sales_clusterization.reporting.export_resumo_clusters_cep import exportar_resumo_clusters
+            logging.info("📈 Gerando resumo de clusters (CSV)...")
+            exportar_resumo_clusters(self.tenant_id, clusterization_id)
+        except Exception as e:
+            logging.warning(f"⚠️ Falha ao gerar resumo automático: {e}")
 
         return clusterization_id

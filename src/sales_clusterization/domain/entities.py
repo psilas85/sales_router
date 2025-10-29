@@ -10,7 +10,6 @@ class PDV:
     id: int
     cnpj: str
     nome: Optional[str]
-    bairro: Optional[str]
     cidade: Optional[str]
     uf: Optional[str]
     lat: float
