@@ -54,3 +54,5 @@ folium==0.17.0
 rq==1.16.2
 
 psutil 
+
+polyline==2.0.0

@@ -1,5 +1,3 @@
-#sales_router/src/sales_routing/visualization/route_plotting.py
-
 # =========================================================
 # 📦 src/sales_routing/visualization/route_plotting.py
 # =========================================================
@@ -31,7 +29,9 @@ def buscar_rotas_operacionais(tenant_id: int, routing_id: str):
             s.rota_coord, 
             p.lat, 
             p.lon, 
-            p.sequencia_ordem
+            p.sequencia_ordem,
+            s.centro_lat,
+            s.centro_lon
         FROM sales_subcluster s
         JOIN sales_subcluster_pdv p
           ON p.cluster_id = s.cluster_id 
@@ -99,11 +99,11 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
     rotas = {}
     todas_coords = []
 
-    for cluster_id, sub_seq, rota_coord, lat, lon, ordem in dados:
+    for cluster_id, sub_seq, rota_coord, lat, lon, ordem, centro_lat, centro_lon in dados:
         coords = converter_rota_coord(rota_coord)
         if lat is None or lon is None:
             continue
-        rotas.setdefault((cluster_id, sub_seq), {"coord": coords, "pontos": []})
+        rotas.setdefault((cluster_id, sub_seq), {"coord": coords, "pontos": [], "centro": (centro_lat, centro_lon)})
         rotas[(cluster_id, sub_seq)]["pontos"].append((lat, lon))
         todas_coords.extend(coords)
 
@@ -127,8 +127,8 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
     # ============================================================
     random.seed(42)
     cores = [f"#{random.randint(0, 0xFFFFFF):06x}" for _ in range(len(rotas))]
-
     legenda_rotas = {}
+
     for idx, (rota_id) in enumerate(rotas.keys()):
         cluster_id, sub_seq = rota_id
         cor = cores[idx % len(cores)]
@@ -150,7 +150,6 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
     <h4 style="margin-top: 0;">Legenda - Rotas</h4>
     <ul style="list-style: none; padding: 0; margin: 0;">
     """
-
     for nome, cor in legenda_rotas.items():
         legenda_html += f"""
         <li>
@@ -159,25 +158,25 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
             {nome}
         </li>
         """
-
     legenda_html += """
     </ul>
     </div>
     {% endmacro %}
     """
-
     legenda = MacroElement()
     legenda._template = Template(legenda_html)
     mapa.get_root().add_child(legenda)
 
-    # === Desenha rotas ===
+    # ============================================================
+    # 🧭 Desenha as rotas e PDVs
+    # ============================================================
     for idx, ((cluster_id, sub_seq), info) in enumerate(rotas.items()):
         cor = cores[idx % len(cores)]
         coords = info["coord"]
         pontos_validos = [(lat, lon) for lat, lon in info["pontos"] if lat and lon]
 
         if modo_debug:
-            logger.debug(f"\n🧭 Cluster {cluster_id} / Sub {sub_seq}")
+            logger.debug(f"🧭 Cluster {cluster_id} / Sub {sub_seq}")
             logger.debug(f"   - Pontos PDV: {len(pontos_validos)}")
             logger.debug(f"   - Pontos rota_coord: {len(coords)}")
 
@@ -186,18 +185,10 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
                 locations=coords,
                 color=cor,
                 weight=3,
-                opacity=0.7,
+                opacity=0.8,
                 smooth_factor=1.0,
                 line_cap="round",
                 line_join="round"
-            ).add_to(mapa)
-        elif pontos_validos:
-            PolyLine(
-                locations=pontos_validos,
-                color=cor,
-                weight=2,
-                opacity=0.5,
-                dash_array="5,5"
             ).add_to(mapa)
 
         for lat, lon in pontos_validos:
@@ -209,10 +200,35 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
                 fill_opacity=0.9
             ).add_to(mapa)
 
+    # ============================================================
+    # 🏠 Centro operacional (sem linhas tracejadas)
+    # ============================================================
+    for (cluster_id, sub_seq), info in rotas.items():
+        centro_lat, centro_lon = info.get("centro", (None, None))
+        pontos_validos = info.get("pontos", [])
+
+        if centro_lat is not None and centro_lon is not None:
+            # 🏠 Marcador do centro operacional
+            folium.Marker(
+                location=[centro_lat, centro_lon],
+                icon=folium.Icon(color="darkblue", icon="glyphicon-home"),
+                popup=f"Centro do Cluster {cluster_id} / Sub {sub_seq}",
+                tooltip=f"Centro Operacional (Cluster {cluster_id} / Sub {sub_seq})"
+            ).add_to(mapa)
+
+            logger.debug(
+                f"📍 Centro do cluster {cluster_id}/{sub_seq}: ({centro_lat:.6f}, {centro_lon:.6f}) | PDVs={len(pontos_validos)}"
+            )
+        else:
+            logger.warning(f"⚠️ Centro ausente para Cluster {cluster_id}/{sub_seq}")
+
+
+    # ============================================================
+    # 💾 Exporta mapa HTML e PNG
+    # ============================================================
     mapa.save(output_path)
     logger.success(f"✅ Mapa HTML salvo: {output_path}")
 
-    # === PNG (backup estático) ===
     png_path = str(output_path).replace(".html", ".png")
     plt.figure(figsize=(10, 8))
     for idx, ((cluster_id, sub_seq), info) in enumerate(rotas.items()):
@@ -222,7 +238,6 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
             plt.plot(lons, lats, marker="o", linewidth=1.5,
                      color=cores[idx % len(cores)],
                      label=f"C{cluster_id}-S{sub_seq}")
-
     plt.xlabel("Longitude")
     plt.ylabel("Latitude")
     plt.title("Rotas Last-Mile (SalesRouter)")
@@ -256,4 +271,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

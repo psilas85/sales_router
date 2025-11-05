@@ -131,6 +131,85 @@ def get_cidades_por_uf(tenant_id: int, uf: str, input_id: str) -> list[str]:
     return cidades
 
 
+
+def carregar_clusters(tenant_id: int, run_id: int):
+        """
+        Lê os clusters principais (centros) gerados pela clusterização.
+        Retorna lista de dicionários com centro_lat/lon e id do cluster.
+        """
+        sql = """
+            SELECT 
+                id AS cluster_id,
+                cluster_label,
+                centro_lat,
+                centro_lon,
+                n_pdvs
+            FROM cluster_setor
+            WHERE tenant_id = %s AND run_id = %s
+            ORDER BY cluster_label;
+        """
+
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (tenant_id, run_id))
+                rows = cur.fetchall()
+
+        clusters = [
+            {
+                "cluster_id": r[0],
+                "cluster_label": r[1],
+                "centro_lat": float(r[2]),
+                "centro_lon": float(r[3]),
+                "n_pdvs": int(r[4]),
+            }
+            for r in rows
+        ]
+
+        logger.info(f"📍 {len(clusters)} clusters carregados (tenant={tenant_id}, run_id={run_id})")
+        return clusters
+
+
+def carregar_pdvs_por_clusters(tenant_id: int, run_id: int):
+        """
+        Retorna lista de PDVs agrupados por cluster_id.
+        Campos: pdv_id, cluster_id, lat, lon, cidade, uf
+        """
+        sql = """
+            SELECT 
+                pdv_id,
+                cluster_id,
+                lat,
+                lon,
+                cidade,
+                uf
+            FROM cluster_setor_pdv
+            WHERE tenant_id = %s AND run_id = %s
+            AND lat IS NOT NULL AND lon IS NOT NULL;
+        """
+
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (tenant_id, run_id))
+                rows = cur.fetchall()
+
+        pdvs = [
+            {
+                "pdv_id": int(r[0]),
+                "cluster_id": int(r[1]),
+                "lat": float(r[2]),
+                "lon": float(r[3]),
+                "cidade": r[4],
+                "uf": r[5],
+            }
+            for r in rows
+        ]
+
+        logger.info(f"🧩 {len(pdvs)} PDVs carregados (tenant={tenant_id}, run_id={run_id})")
+        return pdvs
+
+
+
+
 # ============================================================
 # 🔄 Compatibilidade para uso em cluster_cep_use_case
 # ============================================================
@@ -174,4 +253,4 @@ class DatabaseReader:
         cur.close()
         return rows
 
-
+    

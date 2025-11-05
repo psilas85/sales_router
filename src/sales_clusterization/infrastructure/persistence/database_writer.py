@@ -120,13 +120,32 @@ def finalizar_run(run_id: int, k_final: int, status: str = "done", error: str | 
 # ============================================================
 def salvar_setores(tenant_id: int, run_id: int, setores: List[Setor]) -> Dict[int, int]:
     """
-    Insere setores (macroclusters) e retorna o mapping cluster_label -> cluster_setor.id
+    Insere setores (macroclusters) e retorna o mapping cluster_label -> cluster_setor.id.
+
+    ✅ Armazena métricas operacionais em colunas dedicadas e também no JSON metrics:
+      - raio_med_km / raio_p95_km
+      - tempo_medio_min / tempo_max_min
+      - distancia_media_km / dist_max_km
     """
+
     mapping = {}
     sql = """
-        INSERT INTO cluster_setor
-            (tenant_id, run_id, cluster_label, nome, centro_lat, centro_lon, n_pdvs, metrics)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO cluster_setor (
+            tenant_id,
+            run_id,
+            cluster_label,
+            nome,
+            centro_lat,
+            centro_lon,
+            n_pdvs,
+            metrics,
+            tempo_medio_min,
+            tempo_max_min,
+            distancia_media_km,
+            dist_max_km,
+            subclusters
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id;
     """
 
@@ -137,9 +156,48 @@ def salvar_setores(tenant_id: int, run_id: int, setores: List[Setor]) -> Dict[in
                 centro_lat = float(s.centro_lat)
                 centro_lon = float(s.centro_lon)
                 n_pdvs = int(s.n_pdvs)
-                raio_med_km = float(s.raio_med_km)
-                raio_p95_km = float(s.raio_p95_km)
 
+                # ============================================================
+                # 🧩 Extração de métricas operacionais com fallback seguro
+                # ============================================================
+                raio_med_km = float(getattr(s, "raio_med_km", 0.0))
+                raio_p95_km = float(getattr(s, "raio_p95_km", 0.0))
+
+                # Caso os tempos/distâncias não estejam setados no objeto Setor,
+                # calcula dinamicamente com base nos subclusters.
+                subclusters = getattr(s, "subclusters", [])
+                if subclusters and isinstance(subclusters, list):
+                    tempos = [sc.get("tempo_min", 0.0) for sc in subclusters]
+                    distancias = [sc.get("dist_km", 0.0) for sc in subclusters]
+                    tempo_medio_min = float(np.mean(tempos)) if tempos else 0.0
+                    tempo_max_min = float(np.max(tempos)) if tempos else 0.0
+                    distancia_media_km = float(np.mean(distancias)) if distancias else 0.0
+                    dist_max_km = float(np.max(distancias)) if distancias else 0.0
+                else:
+                    tempo_medio_min = float(getattr(s, "tempo_medio_min", 0.0))
+                    tempo_max_min = float(getattr(s, "tempo_max_min", 0.0))
+                    distancia_media_km = float(getattr(s, "distancia_media_km", 0.0))
+                    dist_max_km = float(getattr(s, "dist_max_km", 0.0))
+
+                # ============================================================
+                # 🧮 JSON consolidado
+                # ============================================================
+                metrics_json = json.dumps(
+                    {
+                        "raio_med_km": raio_med_km,
+                        "raio_p95_km": raio_p95_km,
+                        "tempo_medio_min": tempo_medio_min,
+                        "tempo_max_min": tempo_max_min,
+                        "distancia_media_km": distancia_media_km,
+                        "dist_max_km": dist_max_km,
+                        "subclusters": subclusters,
+                    },
+                    ensure_ascii=False,
+                )
+
+                # ============================================================
+                # 💾 Inserção no banco
+                # ============================================================
                 cur.execute(
                     sql,
                     (
@@ -150,37 +208,39 @@ def salvar_setores(tenant_id: int, run_id: int, setores: List[Setor]) -> Dict[in
                         centro_lat,
                         centro_lon,
                         n_pdvs,
-                        json.dumps(
-                            {
-                                "raio_med_km": raio_med_km,
-                                "raio_p95_km": raio_p95_km,
-                            },
-                            ensure_ascii=False,
-                        ),
+                        metrics_json,
+                        tempo_medio_min,
+                        tempo_max_min,
+                        distancia_media_km,
+                        dist_max_km,
+                        json.dumps(subclusters),
                     ),
                 )
+
                 cid = cur.fetchone()[0]
                 mapping[cluster_label] = cid
 
             conn.commit()
 
-    logger.info(f"💾 {len(mapping)} setores salvos no banco (run_id={run_id})")
+    logger.info(
+        f"💾 {len(mapping)} setores salvos no banco com métricas operacionais "
+        f"(run_id={run_id}, tenant={tenant_id})"
+    )
     return mapping
 
 
+
 # ============================================================
-# 🧩 Salvamento do mapeamento PDV → Cluster 
+# 🧩 Salvamento do mapeamento PDV → Cluster (ajustada)
 # ============================================================
 def salvar_mapeamento_pdvs(
     tenant_id: int,
     run_id: int,
-    mapping_cluster_id: Dict[int, int],
-    labels: List[int],
     pdvs: List[PDV],
 ):
     """
     Grava o relacionamento PDV → Setor (cluster_setor_pdv)
-    
+    usando o atributo `cluster_id` já atribuído no PDV.
     """
     sql = """
         INSERT INTO cluster_setor_pdv
@@ -191,20 +251,19 @@ def salvar_mapeamento_pdvs(
     with get_connection() as conn:
         with conn.cursor() as cur:
             count = 0
-            for pdv, label in zip(pdvs, labels):
-                cluster_id = mapping_cluster_id.get(int(label)) if label is not None else None
-                if cluster_id:
+            for p in pdvs:
+                if getattr(p, "cluster_id", None):
                     cur.execute(
                         sql,
                         (
                             int(tenant_id),
                             int(run_id),
-                            int(cluster_id),
-                            int(pdv.id),
-                            float(pdv.lat) if pdv.lat is not None else None,
-                            float(pdv.lon) if pdv.lon is not None else None,
-                            pdv.cidade,
-                            pdv.uf,
+                            int(p.cluster_id),
+                            int(p.id),
+                            float(p.lat) if p.lat is not None else None,
+                            float(p.lon) if p.lon is not None else None,
+                            p.cidade,
+                            p.uf,
                         ),
                     )
                     count += 1
@@ -214,14 +273,16 @@ def salvar_mapeamento_pdvs(
 
 
 # ============================================================
-# 🧾 Persistência e auditoria de outliers (versão otimizada)
+# 🧾 Persistência e auditoria de outliers (versão compatível)
 # ============================================================
-
 
 def salvar_outliers(tenant_id: int, clusterization_id: str, pdv_flags: list):
     """
     Persiste lista de PDVs com flag de outlier (True/False) no banco.
-    🔹 Otimizada: cálculo de distância média via NearestNeighbors (O(N log N))
+    🔹 Suporta dois formatos:
+       1️⃣ [(PDV, flag)] — modo antigo com objetos PDV
+       2️⃣ [{"pdv_id", "lat", "lon", "is_outlier"}] — modo novo normalizado
+    🔹 Cálculo de distância média via NearestNeighbors (O(N log N))
     """
 
     if not pdv_flags:
@@ -229,11 +290,47 @@ def salvar_outliers(tenant_id: int, clusterization_id: str, pdv_flags: list):
         return
 
     # ============================================================
+    # 🧩 Normalização universal do formato de entrada
+    # ============================================================
+    try:
+        if isinstance(pdv_flags[0], tuple):
+            # Formato antigo: (PDV, flag)
+            rows_dict = [
+                {
+                    "pdv_id": getattr(p, "id", None),
+                    "cnpj": getattr(p, "cnpj", None),
+                    "cidade": getattr(p, "cidade", None),
+                    "lat": p.lat,
+                    "lon": p.lon,
+                    "is_outlier": bool(flag),
+                }
+                for p, flag in pdv_flags
+            ]
+        else:
+            # Formato novo: já é lista de dicionários
+            rows_dict = [
+                {
+                    "pdv_id": r.get("pdv_id"),
+                    "cnpj": r.get("cnpj"),
+                    "cidade": r.get("cidade"),
+                    "lat": r.get("lat"),
+                    "lon": r.get("lon"),
+                    "is_outlier": bool(r.get("is_outlier", False)),
+                }
+                for r in pdv_flags
+            ]
+
+        logger.info(f"🧾 Outliers normalizados: {len(rows_dict)} registros prontos para gravação.")
+    except Exception as e:
+        logger.error(f"❌ Erro ao normalizar lista de outliers: {e}")
+        return
+
+    # ============================================================
     # 📏 Cálculo eficiente das distâncias médias (em km)
     # ============================================================
     try:
-        coords = np.radians(np.array([(p.lat, p.lon) for p, _ in pdv_flags]))
-        n_neighbors = min(6, len(coords))  # até 5 vizinhos + o próprio
+        coords = np.radians(np.array([(r["lat"], r["lon"]) for r in rows_dict if r["lat"] and r["lon"]]))
+        n_neighbors = min(6, len(coords))
         nn = NearestNeighbors(n_neighbors=n_neighbors, metric="haversine")
         nn.fit(coords)
         dist, _ = nn.kneighbors(coords)
@@ -241,14 +338,13 @@ def salvar_outliers(tenant_id: int, clusterization_id: str, pdv_flags: list):
         logger.info(f"📐 Distâncias médias calculadas via NearestNeighbors para {len(coords)} PDVs.")
     except Exception as e:
         logger.error(f"❌ Falha no cálculo de distâncias médias: {e}")
-        dist_medias = np.zeros(len(pdv_flags))
+        dist_medias = np.zeros(len(rows_dict))
 
     # ============================================================
     # 🧩 Inserção no banco
     # ============================================================
     conn = get_connection()
     with conn.cursor() as cur:
-        # Garante estrutura da tabela
         cur.execute("""
             CREATE TABLE IF NOT EXISTS sales_clusterization_outliers (
                 id SERIAL PRIMARY KEY,
@@ -265,26 +361,24 @@ def salvar_outliers(tenant_id: int, clusterization_id: str, pdv_flags: list):
             );
         """)
 
-        # Remove registros antigos para mesmo tenant e clusterization_id
         cur.execute(
             "DELETE FROM sales_clusterization_outliers WHERE tenant_id = %s AND clusterization_id = %s;",
             (tenant_id, clusterization_id),
         )
 
-        # Prepara registros para inserção
         rows = [
             (
                 tenant_id,
                 clusterization_id,
-                p.id,
-                p.cnpj,
-                p.cidade,
-                p.lat,
-                p.lon,
-                float(dist_medias[i]),
-                bool(flag),
+                r["pdv_id"],
+                r.get("cnpj"),
+                r.get("cidade"),
+                r["lat"],
+                r["lon"],
+                float(dist_medias[i]) if i < len(dist_medias) else 0.0,
+                bool(r["is_outlier"]),
             )
-            for i, (p, flag) in enumerate(pdv_flags)
+            for i, r in enumerate(rows_dict)
         ]
 
         cur.executemany("""
@@ -296,7 +390,7 @@ def salvar_outliers(tenant_id: int, clusterization_id: str, pdv_flags: list):
     conn.commit()
     conn.close()
 
-    total_outliers = sum(1 for _, flag in pdv_flags if flag)
+    total_outliers = sum(1 for r in rows_dict if r["is_outlier"])
     logger.info(f"🗄️ {len(rows)} registros de outliers gravados no banco para tenant={tenant_id}.")
     logger.success(
         f"📊 Outliers detectados: {total_outliers} de {len(rows)} PDVs totais "
@@ -325,6 +419,7 @@ def salvar_outliers(tenant_id: int, clusterization_id: str, pdv_flags: list):
 
     except Exception as e:
         logger.warning(f"⚠️ Falha ao exportar CSV de outliers: {e}")
+
 
 
 

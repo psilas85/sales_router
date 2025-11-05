@@ -108,8 +108,15 @@ def gerar_mapa_clusters(dados, output_path: Path):
     m = folium.Map(location=[lat_centro, lon_centro], zoom_start=6, tiles="CartoDB positron")
 
     clusters = {}
+    centros = {}
+
     for row in dados:
-        label, _, _, lat, lon, cidade, uf, endereco, cnpj = row
+        label, centro_lat, centro_lon, lat, lon, cidade, uf, endereco, cnpj = row
+
+        # 🔹 Armazena o centro do cluster (uma vez por label)
+        if label not in centros and centro_lat and centro_lon:
+            centros[label] = (centro_lat, centro_lon)
+
         if (
             lat is None or lon is None
             or not isinstance(lat, (int, float))
@@ -120,6 +127,7 @@ def gerar_mapa_clusters(dados, output_path: Path):
             logger.debug(f"⚠️ Coordenadas inválidas ignoradas: Cluster {label} | {cidade}/{uf} | ({lat}, {lon})")
             continue
         clusters.setdefault(label, []).append((lat, lon, cidade, uf, endereco, cnpj))
+
 
     if not clusters:
         logger.warning("⚠️ Nenhum PDV válido encontrado para plotagem.")
@@ -159,6 +167,34 @@ def gerar_mapa_clusters(dados, output_path: Path):
                 popup=folium.Popup(popup_html, max_width=320),
                 tooltip=folium.Tooltip(tooltip_text, sticky=True)
             ).add_to(m)
+
+    # =========================================================
+    # 📍 Adiciona marcador dos centros dos clusters
+    # =========================================================
+    for label, (centro_lat, centro_lon) in centros.items():
+        folium.CircleMarker(
+            location=(centro_lat, centro_lon),
+            radius=8,
+            color="#0047AB",
+            fill=True,
+            fill_color="#0047AB",
+            fill_opacity=0.9,
+            popup=folium.Popup(
+                f"<b>Centro do Cluster {label}</b><br>Lat/Lon: {centro_lat:.6f}, {centro_lon:.6f}",
+                max_width=300,
+            ),
+            tooltip=f"Centro do Cluster {label}"
+        ).add_to(m)
+
+        folium.map.Marker(
+            [centro_lat, centro_lon],
+            icon=folium.DivIcon(
+                html=f"<div style='font-size: 12px; color:#0047AB; font-weight:bold;'>C{label}</div>"
+            ),
+        ).add_to(m)
+
+
+
 
     legend_html = """
     <div style="

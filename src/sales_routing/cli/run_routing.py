@@ -1,4 +1,6 @@
-#sales_router/src/sales_routing/cli/run_routing.py
+# ============================================================
+# 📦 src/sales_routing/cli/run_routing.py
+# ============================================================
 
 import argparse
 import uuid
@@ -8,11 +10,12 @@ from src.database.db_connection import get_connection_context
 from src.sales_routing.infrastructure.database_reader import SalesRoutingDatabaseReader
 from src.sales_routing.infrastructure.database_writer import SalesRoutingDatabaseWriter
 from src.sales_routing.application.adaptive_subcluster_splitter import gerar_subclusters_adaptativo
+from src.sales_routing.application.fixed_subcluster_splitter import gerar_subclusters_fixos
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Executa geração de rotas diárias (subclusters) sem sobrescrever processamentos anteriores."
+        description="🚚 Executa geração de rotas diárias (subclusters) com base em capacidade mensal (dias úteis × frequência)."
     )
 
     # ======================================================
@@ -27,19 +30,45 @@ def main():
     # ======================================================
     parser.add_argument("--uf", type=str, required=True, help="UF dos PDVs (ex: SP, CE, RJ)")
     parser.add_argument("--cidade", type=str, help="Cidade dos PDVs (ex: Fortaleza)")
-    parser.add_argument("--workday", type=int, default=600, help="Tempo máximo de trabalho diário (minutos)")
-    parser.add_argument("--routekm", type=float, default=100.0, help="Distância máxima por rota (km)")
-    parser.add_argument("--service", type=float, default=20.0, help="Tempo médio de visita por PDV (minutos)")
-    parser.add_argument("--vel", type=float, default=30.0, help="Velocidade média (km/h)")
-    parser.add_argument("--alpha", type=float, default=1.4, help="Fator de correção de caminho (curvas/ruas)")
+    parser.add_argument("--service_min", type=float, default=20.0, help="⏱️ Tempo médio de visita por PDV (minutos)")
+    parser.add_argument("--v_kmh", type=float, default=30.0, help="🚚 Velocidade média operacional (km/h)")
+    parser.add_argument("--alpha_path", type=float, default=1.3, help="📐 Fator de alongamento de rota (α)")
     parser.add_argument("--twoopt", action="store_true", help="Ativa heurística 2-Opt para otimização fina da rota")
     parser.add_argument("--usuario", type=str, default="cli", help="Usuário responsável pela execução")
 
+    # ======================================================
+    # 🧮 PARÂMETROS DE CAPACIDADE
+    # ======================================================
+    parser.add_argument("--dias_uteis", type=int, default=21, help="Dias úteis no mês (padrão=21)")
+    parser.add_argument("--frequencia_visita", type=int, default=1, help="Frequência de visita mensal (1=mensal, 2=quinzenal, 4=semanal)")
+
+    # ======================================================
+    # 🧠 MODO DE SUBCLUSTERIZAÇÃO
+    # ======================================================
+    parser.add_argument(
+        "--modo",
+        choices=["adaptativo", "fixo"],
+        default="fixo",
+        help="Define o modo de subclusterização: 'adaptativo' (avalia tempo/distância) ou 'fixo' (KMeans direto por dias úteis/frequência)."
+    )
+
+    # ======================================================
+    # 🔢 MODO DE CÁLCULO DO NÚMERO DE ROTAS
+    # ======================================================
+    parser.add_argument(
+        "--modo_calculo",
+        type=str,
+        choices=["proporcional", "fixo"],
+        default="proporcional",
+        help="Modo de cálculo do nº de rotas por cluster: proporcional (padrão) ou fixo (dias_uteis)."
+    )
+
+    # ✅ PARSE FINAL
     args = parser.parse_args()
     tenant_id = args.tenant
 
     # ======================================================
-    # ✅ VALIDAÇÕES
+    # ✅ VALIDAÇÕES BÁSICAS
     # ======================================================
     descricao = args.descricao.strip()
     if len(descricao) == 0 or len(descricao) > 60:
@@ -57,11 +86,12 @@ def main():
     # ======================================================
     routing_id = str(uuid.uuid4())
     clusterization_id = args.clusterization_id.strip()
-    logger.info(f"🆕 Criando nova execução de roteirização:")
+    logger.info(f"🆕 Criando execução de roteirização (modo={args.modo})")
     logger.info(f"   routing_id={routing_id}")
     logger.info(f"   clusterization_id={clusterization_id}")
     logger.info(f"   tenant_id={tenant_id}")
     logger.info(f"   descricao={descricao}")
+    logger.info(f"   parâmetros: vel={args.v_kmh} km/h | α={args.alpha_path} | service={args.service_min} min")
 
     # ======================================================
     # 🔧 Inicialização dos serviços de banco de dados
@@ -109,16 +139,31 @@ def main():
     # ======================================================
     # 🧠 GERAÇÃO DOS SUBCLUSTERS E ROTAS
     # ======================================================
-    resultados = gerar_subclusters_adaptativo(
-        clusters=clusters,
-        pdvs=pdvs,
-        workday_min=args.workday,
-        route_km_max=args.routekm,
-        service_min=args.service,
-        v_kmh=args.vel,
-        alpha_path=args.alpha,
-        aplicar_two_opt=args.twoopt,
-    )
+    print(f"\n🧮 Modo selecionado: {args.modo.upper()}")
+
+    if args.modo == "fixo":
+        resultados = gerar_subclusters_fixos(
+            clusters=clusters,
+            pdvs=pdvs,
+            dias_uteis=args.dias_uteis,
+            freq_padrao=args.frequencia_visita,
+            v_kmh=args.v_kmh,
+            service_min=args.service_min,
+            alpha_path=args.alpha_path,
+            aplicar_two_opt=args.twoopt,
+            modo_calculo=args.modo_calculo,
+        )
+    else:
+        resultados = gerar_subclusters_adaptativo(
+            clusters=clusters,
+            pdvs=pdvs,
+            dias_uteis=args.dias_uteis,
+            freq_padrao=args.frequencia_visita,
+            v_kmh=args.v_kmh,
+            service_min=args.service_min,
+            alpha_path=args.alpha_path,
+            aplicar_two_opt=args.twoopt,
+        )
 
     # ======================================================
     # 💾 SALVANDO RESULTADOS NO BANCO
@@ -141,6 +186,9 @@ def main():
     # ======================================================
     print("\n🏁 Execução concluída com sucesso!")
     print(f"📦 routing_id registrado: {routing_id}\n")
+    print(f"📅 Configuração usada: {args.dias_uteis} dias úteis / {args.frequencia_visita}x por mês\n")
+    print(f"⚙️ Parâmetros operacionais: {args.v_kmh} km/h | {args.service_min} min/PDV | α={args.alpha_path}\n")
+    print(f"🧭 Modo de subclusterização: {args.modo.upper()} | cálculo: {args.modo_calculo.upper()}\n")
 
 
 if __name__ == "__main__":
