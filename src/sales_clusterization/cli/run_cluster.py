@@ -20,30 +20,56 @@ def main():
     # =============================
     parser.add_argument("--tenant_id", type=int, required=True, help="ID do tenant (empresa)")
     parser.add_argument("--uf", required=True, help="UF dos PDVs (ex: SP, CE, RJ)")
-    parser.add_argument("--descricao", required=True, help="Descrição da clusterização (ex: 'Clusterização SP Outubro')")
-    parser.add_argument("--input_id", required=True, help="ID da base de PDVs (UUID gerado no preprocessing)")
+    parser.add_argument(
+        "--descricao",
+        required=True,
+        help="Descrição da clusterização (ex: 'Clusterização SP Outubro')",
+    )
+    parser.add_argument(
+        "--input_id",
+        required=True,
+        help="ID da base de PDVs (UUID gerado no preprocessing)",
+    )
 
     # =============================
     # Parâmetros opcionais
     # =============================
     parser.add_argument("--cidade", required=False, help="Cidade opcional dos PDVs (ex: Fortaleza)")
-    parser.add_argument("--algo", default="dbscan", choices=["kmeans", "dbscan"], help="Algoritmo de clusterização")
+    parser.add_argument(
+        "--algo",
+        default="kmeans",  # 👈 agora é o padrão
+        choices=["kmeans_simples", "kmeans", "dbscan", "hibrido"],
+        help="Algoritmo de clusterização: kmeans_simples (padrão), kmeans, dbscan ou hibrido."
+    )
+
+
     parser.add_argument("--k", type=int, default=None, help="K forçado (apenas para KMeans)")
+
     parser.add_argument("--dias_uteis", type=int, default=20, help="Dias úteis no ciclo")
     parser.add_argument("--freq", type=int, default=1, help="Frequência mensal de visitas")
-    parser.add_argument("--workday", type=int, default=600, help="Tempo máximo de trabalho diário (minutos)")
-    parser.add_argument("--routekm", type=float, default=100.0, help="Distância máxima por rota (km)")
+
+    parser.add_argument("--workday", type=int, default=480, help="Tempo máximo de trabalho diário (minutos)")
+    parser.add_argument("--routekm", type=float, default=120.0, help="Distância máxima por rota (km)")
     parser.add_argument("--service", type=int, default=20, help="Tempo médio de visita por PDV (minutos)")
     parser.add_argument("--vel", type=float, default=30.0, help="Velocidade média (km/h)")
     parser.add_argument("--alpha", type=float, default=1.4, help="Fator de correção de caminho (curvas/ruas)")
+
     parser.add_argument(
         "--max_pdv_cluster",
         type=int,
-        default=300,
+        default=200,
         help="Máximo de PDVs permitidos por cluster (usado no balanceamento híbrido DBSCAN + KMeans)",
     )
 
-    # 🆕 Novo argumento: opção de excluir outliers (padrão = incluir)
+    # 🆕 Novo: número máximo de iterações do refinamento
+    parser.add_argument(
+        "--max_iter",
+        type=int,
+        default=10,
+        help="Número máximo de iterações para refinamento global (padrão=20)",
+    )
+
+    # 🧹 Controle de outliers
     parser.add_argument(
         "--excluir_outliers",
         action="store_true",
@@ -54,11 +80,12 @@ def main():
     parser.add_argument("--clusterization_id", type=str, required=False, help="ID da clusterização (externo)")
 
     parser.add_argument(
-    "--z_thresh",
-    type=float,
-    default=3.0,
-    help="Fator z-score para detecção de outliers (padrão=3.0). Valores menores tornam a detecção mais sensível (ex: 2.0 ou 1.5).",
-)
+        "--z_thresh",
+        type=float,
+        default=1.5,
+        help="Fator z-score para detecção de outliers (padrão=3.0). Valores menores tornam a detecção mais sensível (ex: 2.0 ou 1.5).",
+    )
+
 
 
     args = parser.parse_args()
@@ -68,8 +95,6 @@ def main():
     # ============================================================
     cidade = args.cidade if args.cidade not in (None, "", "None") else None
     msg_ref = f"{args.uf}-{cidade}" if cidade else f"{args.uf} (todas as cidades)"
-
-    # Usa o ID recebido ou cria novo se for chamado manualmente
     clusterization_id = args.clusterization_id or str(uuid.uuid4())
 
     logger.info(
@@ -78,6 +103,15 @@ def main():
     )
     logger.info(f"🆕 clusterization_id={clusterization_id} | descrição='{args.descricao}'")
     logger.info(f"🔧 Excluir outliers: {args.excluir_outliers}")
+
+    # Log dos parâmetros operacionais
+    logger.debug(
+        f"⚙️ Parâmetros operacionais: "
+        f"dias_uteis={args.dias_uteis}, freq={args.freq}, "
+        f"workday={args.workday}, routekm={args.routekm}, "
+        f"service={args.service}, vel={args.vel}, "
+        f"alpha={args.alpha}, max_pdv_cluster={args.max_pdv_cluster}, max_iter={args.max_iter}"
+    )
 
     # ============================================================
     # 🧠 Execução principal
@@ -98,8 +132,8 @@ def main():
         max_pdv_cluster=args.max_pdv_cluster,
         descricao=args.descricao,
         input_id=args.input_id,
-        clusterization_id=clusterization_id,  # 👈 Usa o mesmo ID
-        excluir_outliers=args.excluir_outliers,  # 👈 Novo parâmetro
+        clusterization_id=clusterization_id,
+        excluir_outliers=args.excluir_outliers,
         z_thresh=args.z_thresh,
     )
 

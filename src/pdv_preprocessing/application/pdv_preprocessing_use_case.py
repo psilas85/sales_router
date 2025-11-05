@@ -211,22 +211,37 @@ class PDVPreprocessingUseCase:
         logging.info(f"🌍 {len(enderecos_novos)} endereços novos para geocodificação.")
 
         # ============================================================
-        # 🌍 Geocodificação dos endereços novos
+        # ⚡ Geocodificação paralela (até 20 threads)
         # ============================================================
-        for i in enderecos_novos:
-            row = df_validos.iloc[i]
-            endereco = row["pdv_endereco_completo"]
-            uf = row["uf"]
-            lat, lon, origem = self.geo_service.buscar_coordenadas(endereco, uf)
-            df_validos.at[i, "pdv_lat"] = lat
-            df_validos.at[i, "pdv_lon"] = lon
-            df_validos.at[i, "status_geolocalizacao"] = origem
+        if enderecos_novos:
+            enderecos_para_geo = [
+                df_validos.iloc[i]["pdv_endereco_completo"] for i in enderecos_novos
+            ]
 
-            if lat is not None and lon is not None:
-                try:
-                    self.writer.inserir_localizacao(endereco, lat, lon)
-                except Exception as e:
-                    logging.warning(f"⚠️ Falha ao salvar no cache: {e}")
+            # 🚀 Executa busca paralela em lote (Nominatim + Google fallback)
+            resultados_geo = self.geo_service.geocodificar_em_lote(enderecos_para_geo, tipo="PDV")
+
+            # Atualiza dataframe com resultados
+            for i in enderecos_novos:
+                endereco = df_validos.iloc[i]["pdv_endereco_completo"]
+                if endereco in resultados_geo:
+                    lat, lon, origem = resultados_geo[endereco]
+                    df_validos.at[i, "pdv_lat"] = lat
+                    df_validos.at[i, "pdv_lon"] = lon
+                    df_validos.at[i, "status_geolocalizacao"] = origem
+                    try:
+                        self.writer.inserir_localizacao(endereco, lat, lon)
+                    except Exception as e:
+                        logging.warning(f"⚠️ Falha ao salvar no cache: {e}")
+                else:
+                    df_validos.at[i, "status_geolocalizacao"] = "falha"
+                    df_validos.at[i, "motivo_invalidade"] = "falha_geolocalizacao"
+
+            logging.info(f"✅ Geocodificação paralela concluída: {len(resultados_geo)} endereços resolvidos.")
+        else:
+            logging.info("⚡ Nenhum endereço novo para geocodificação.")
+
+
 
         # ============================================================
         # 🧭 Validação geográfica (UF × Coordenadas)
@@ -268,6 +283,12 @@ class PDVPreprocessingUseCase:
 
         logging.info(f"✅ [{self.tenant_id}] {len(df_validos)} válidos / {len(df_invalidos_total)} inválidos.")
         logging.info(f"💾 [{self.tenant_id}] {inseridos} PDVs inseridos (input_id={self.input_id}).")
+
+        # ============================================================
+        # 📊 Resumo final de geocodificação
+        # ============================================================
+        self.geo_service.exibir_resumo_logs()
+
 
         # ============================================================
         # 📦 Retorno final

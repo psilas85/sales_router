@@ -1,12 +1,16 @@
 #sales_router/src/sales_routing/infrastructure/database_writer.py
 
+# ============================================================
+# 📦 src/sales_routing/infrastructure/database_writer.py
+# ============================================================
+
 import json
+import os
+import csv
 from psycopg2.extras import execute_values
 from datetime import datetime
 from loguru import logger
-import os
 from src.database.db_connection import get_connection_context
-from src.sales_routing.application.route_distance_service import RouteDistanceService
 
 
 class SalesRoutingDatabaseWriter:
@@ -19,106 +23,125 @@ class SalesRoutingDatabaseWriter:
     # =========================================================
     # 1️⃣ Salva simulação operacional (modelo VISITAÇÃO)
     # =========================================================
-    def salvar_operacional(self, resultados, tenant_id: int, run_id: int, routing_id: str):
+    def salvar_operacional(
+        self,
+        resultados,
+        tenant_id: int,
+        run_id: int,
+        routing_id: str,
+    ):
         """
-        Grava nova simulação operacional no banco.
-        Nenhum dado anterior é sobrescrito — cada routing_id representa uma execução única.
+        Grava nova simulação operacional no banco e gera resumo por cluster.
+        Cada routing_id representa uma execução única.
+        O tempo e distância mensais são a soma total das rotas (subclusters).
         """
-        distance_service = RouteDistanceService()
         try:
             logger.info(
                 f"💾 Gravando simulação operacional | tenant={tenant_id} | run_id={run_id} | routing_id={routing_id}"
             )
 
-            # Recupera parâmetros globais herdados do CLI
-            service_min = float(os.getenv("SERVICE_MIN", 0)) or globals().get("SERVICE_MIN_ARG", 20.0)
-            velocidade_kmh = float(os.getenv("VEL_KMH", 0)) or globals().get("VEL_KMH_ARG", 30.0)
-            logger.info(
-                f"🕒 Parâmetros ativos → Serviço={service_min:.1f} min/PDV | Velocidade={velocidade_kmh:.1f} km/h"
-            )
-
-            subcluster_rows, pdv_rows = [], []
+            subcluster_rows, pdv_rows, resumo_rows = [], [], []
 
             for r in resultados:
                 cluster_id = r["cluster_id"]
+                k_final = r.get("k_final", 0)
+                centro_lat = r.get("centro_lat")
+                centro_lon = r.get("centro_lon")
+
+                dist_total_cluster = 0.0
+                tempo_total_cluster = 0.0
+                total_pdvs_cluster = 0
+                qtd_subclusters = len(r["subclusters"])
+
                 for sub in r["subclusters"]:
-                    pdvs = sub["pdvs"]
-                    centro_lat = r.get("centro_lat")
-                    centro_lon = r.get("centro_lon")
-
-                    # Corrige inversões lat/lon (segurança)
-                    for p in pdvs:
-                        if abs(p["lat"]) > abs(p["lon"]):
-                            p["lat"], p["lon"] = p["lon"], p["lat"]
-
-                    coords = [
-                        (float(p["lat"]), float(p["lon"])) for p in pdvs if p.get("lat") and p.get("lon")
-                    ]
-                    if len(coords) == 1 and centro_lat and centro_lon:
-                        coords = [(centro_lat, centro_lon)] + coords
-
-                    # Cálculo de rota
-                    if len(coords) < 2:
-                        rota_coord = [{"lat": coords[0][0], "lon": coords[0][1]}] if coords else []
-                        dist_km, tempo_transito, fonte_rota = 0.0, 10.0, "haversine"
-                    else:
-                        try:
-                            rota_final = distance_service.get_full_route(coords)
-                            rota_coord = rota_final["rota_coord"]
-                            dist_km = rota_final["distancia_km"]
-                            tempo_transito = rota_final["tempo_min"]
-                            fonte_rota = rota_final.get("fonte", "osrm")
-                        except Exception as e:
-                            logger.warning(
-                                f"⚠️ Sub {sub['subcluster_id']}: falha OSRM ({e}) → fallback haversine."
-                            )
-                            dist_km = distance_service._haversine_km(coords[0], coords[-1])
-                            tempo_transito = (dist_km / velocidade_kmh) * 60
-                            rota_coord = [{"lat": c[0], "lon": c[1]} for c in coords]
-                            fonte_rota = "haversine"
-
+                    sub_id = sub["subcluster_id"]
                     n_pdvs = sub["n_pdvs"]
-                    tempo_total = tempo_transito + (n_pdvs * service_min)
-                    rota_coord_json = json.dumps(rota_coord, ensure_ascii=False)
+                    tempo_total = sub.get("tempo_total_min", 0.0)
+                    dist_total = sub.get("dist_total_km", 0.0)
+                    rota_coord = sub.get("rota_coord", [])
+                    pdvs = sub.get("pdvs", [])
 
-                    logger.debug(
-                        f"🗺️ Cluster {cluster_id}/Sub {sub['subcluster_id']}: {dist_km:.2f} km | "
-                        f"{tempo_total:.1f} min (fonte={fonte_rota})"
-                    )
+                    # ✅ Corrigido: prioriza o centro do subcluster, fallback no cluster
+                    centro_lat = sub.get("centro_lat", r.get("centro_lat"))
+                    centro_lon = sub.get("centro_lon", r.get("centro_lon"))
+
+                    dist_total_cluster += dist_total
+                    tempo_total_cluster += tempo_total
+                    total_pdvs_cluster += n_pdvs
+
+                    rota_coord_json = json.dumps(rota_coord, ensure_ascii=False)
 
                     subcluster_rows.append(
                         (
                             tenant_id,
                             run_id,
-                            routing_id,  # mantém ambos iguais
+                            routing_id,
                             cluster_id,
-                            sub["subcluster_id"],
-                            r["k_final"],
+                            sub_id,
+                            k_final,
                             tempo_total,
-                            dist_km,
-                            sub["n_pdvs"],
+                            dist_total,
+                            n_pdvs,
                             rota_coord_json,
+                            centro_lat,
+                            centro_lon,
                             datetime.now(),
                         )
                     )
 
                     for seq, pdv in enumerate(pdvs, start=1):
+                        lat = pdv.get("lat")
+                        lon = pdv.get("lon")
+                        pdv_id = pdv.get("pdv_id")
+                        if lat is None or lon is None:
+                            continue
+
                         pdv_rows.append(
                             (
                                 tenant_id,
                                 run_id,
                                 routing_id,
                                 cluster_id,
-                                sub["subcluster_id"],
-                                pdv["pdv_id"],
+                                sub_id,
+                                pdv_id,
                                 seq,
-                                pdv.get("lat"),
-                                pdv.get("lon"),
+                                lat,
+                                lon,
                                 datetime.now(),
                             )
                         )
 
-            # Inserções em batch
+                # =========================================================
+                # 📊 Resumo por cluster
+                # =========================================================
+                if qtd_subclusters > 0:
+                    resumo_rows.append(
+                        (
+                            tenant_id,
+                            run_id,
+                            routing_id,
+                            cluster_id,
+                            qtd_subclusters,
+                            total_pdvs_cluster,
+                            dist_total_cluster,
+                            tempo_total_cluster,
+                            dist_total_cluster / qtd_subclusters,
+                            tempo_total_cluster / qtd_subclusters,
+                            dist_total_cluster,   # total mês = soma total
+                            tempo_total_cluster,  # total mês = soma total
+                            datetime.now(),
+                        )
+                    )
+
+                    logger.info(
+                        f"📦 Cluster {cluster_id}: {qtd_subclusters} rotas | "
+                        f"{total_pdvs_cluster} PDVs | {dist_total_cluster:.1f} km | "
+                        f"{tempo_total_cluster:.1f} min (total mensal)"
+                    )
+
+            # =========================================================
+            # 💾 Inserções em batch no banco
+            # =========================================================
             with get_connection_context() as conn:
                 with conn.cursor() as cur:
                     if subcluster_rows:
@@ -128,7 +151,7 @@ class SalesRoutingDatabaseWriter:
                             INSERT INTO sales_subcluster (
                                 tenant_id, run_id, routing_id, cluster_id, subcluster_seq,
                                 k_final, tempo_total_min, dist_total_km, n_pdvs,
-                                rota_coord, criado_em
+                                rota_coord, centro_lat, centro_lon, criado_em
                             ) VALUES %s
                             """,
                             subcluster_rows,
@@ -145,21 +168,58 @@ class SalesRoutingDatabaseWriter:
                             """,
                             pdv_rows,
                         )
+
+                    if resumo_rows:
+                        execute_values(
+                            cur,
+                            """
+                            INSERT INTO sales_routing_resumo (
+                                tenant_id, run_id, routing_id, cluster_id,
+                                qtd_subclusters, qtd_pdvs,
+                                dist_total_km, tempo_total_min,
+                                dist_media_km, tempo_medio_min,
+                                dist_total_mes_km, tempo_total_mes_min,
+                                criado_em
+                            ) VALUES %s
+                            """,
+                            resumo_rows,
+                        )
+
                     conn.commit()
 
-            logger.success(
-                f"✅ Simulação salva | tenant={tenant_id} | routing_id={routing_id} | "
-                f"{len(subcluster_rows)} subclusters | {len(pdv_rows)} PDVs."
-            )
+            # =========================================================
+            # 💾 Exportar resumo CSV (seguro)
+            # =========================================================
+            try:
+                pasta_output = os.path.join("output", "reports", str(tenant_id))
+                os.makedirs(pasta_output, exist_ok=True)
+                caminho_csv = os.path.join(pasta_output, f"routing_resumo_{routing_id}.csv")
+
+                with open(caminho_csv, "w", newline="", encoding="utf-8") as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow([
+                        "tenant_id", "run_id", "routing_id", "cluster_id",
+                        "qtd_subclusters", "qtd_pdvs",
+                        "dist_total_km", "tempo_total_min",
+                        "dist_media_km", "tempo_medio_min",
+                        "dist_total_mes_km", "tempo_total_mes_min", "criado_em"
+                    ])
+                    writer.writerows(resumo_rows)
+
+                logger.success(
+                    f"✅ Simulação salva | tenant={tenant_id} | routing_id={routing_id} | "
+                    f"{len(subcluster_rows)} subclusters | {len(pdv_rows)} PDVs | "
+                    f"Resumo exportado → {caminho_csv}"
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ Falha ao exportar CSV de resumo: {e}")
 
         except Exception as e:
             logger.error(f"❌ Erro ao salvar simulação operacional: {e}")
             raise
-        finally:
-            distance_service.close()
 
     # =========================================================
-    # 2️⃣ Cria snapshot (sem alteração relevante)
+    # 2️⃣ Cria snapshot (mantido sem alteração)
     # =========================================================
     def salvar_snapshot(self, resultados, tenant_id, nome, descricao, criado_por=None, tags=None):
         with get_connection_context() as conn:
@@ -200,14 +260,14 @@ class SalesRoutingDatabaseWriter:
                                     snapshot_id,
                                     r["cluster_id"],
                                     sub["subcluster_id"],
-                                    sub["tempo_total_min"],
-                                    sub["dist_total_km"],
-                                    sub["n_pdvs"],
+                                    sub.get("tempo_total_min", 0.0),
+                                    sub.get("dist_total_km", 0.0),
+                                    sub.get("n_pdvs", 0),
                                     rota_json,
                                 ),
                             )
 
-                            for ordem, p in enumerate(sub["pdvs"], start=1):
+                            for ordem, p in enumerate(sub.get("pdvs", []), start=1):
                                 cur.execute(
                                     """
                                     INSERT INTO sales_routing_snapshot_pdv (
@@ -220,7 +280,7 @@ class SalesRoutingDatabaseWriter:
                                         snapshot_id,
                                         r["cluster_id"],
                                         sub["subcluster_id"],
-                                        p["pdv_id"],
+                                        p.get("pdv_id"),
                                         ordem,
                                         p.get("lat"),
                                         p.get("lon"),
@@ -247,6 +307,7 @@ class SalesRoutingDatabaseWriter:
             logger.warning("⚠️ Nenhuma rota válida para atualização (faltando id ou vendedor_id).")
             return
 
+        from psycopg2.extras import execute_values
         with get_connection_context() as conn:
             with conn.cursor() as cur:
                 try:

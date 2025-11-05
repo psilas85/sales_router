@@ -1,113 +1,186 @@
-# src/sales_clusterization/domain/sector_generator_hybrid.py
+# ==========================================================
+# 📦 src/sales_clusterization/domain/sector_generator_hybrid.py
+# ==========================================================
 
-import math
-import time
 import numpy as np
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, DBSCAN
 from loguru import logger
-from typing import List, Tuple
-from src.sales_clusterization.domain.entities import PDV, Setor
-from src.sales_clusterization.domain.k_estimator import _haversine_km
-from src.sales_clusterization.domain.sector_generator import dbscan_setores, _raios_cluster
+from math import ceil
+from .entities import PDV, Setor
+from .k_estimator import _haversine_km
+from .sector_generator import _raios_cluster
+
+RANDOM_STATE = 42
 
 
+# ==========================================================
+# 🧩 DBSCAN → KMeans → Subclusterização diária iterativa
+# ==========================================================
 def dbscan_kmeans_balanceado(
-    pdvs: List[PDV],
-    max_pdv_cluster: int = 300,
-    eps_km: float = None,
-    min_samples: int = None,
-) -> Tuple[List[Setor], np.ndarray]:
+    pdvs: list,
+    eps_km: float = 1.0,       # 🔹 antes 1.5 — mais sensível
+    min_samples: int = 25,     # 🔹 antes 50 — mais sensível
+    max_pdv_cluster: int = 200,
+    frequencia_visita: int = 1,
+    dias_uteis: int = 20,
+    workday_min: int = 600,
+    tempo_servico_min: int = 30,
+    tempo_descarregamento_min: float = 0.4,
+    v_kmh: float = 30.0,
+):
+
     """
-    Pipeline híbrido de clusterização:
-    1️⃣ Executa DBSCAN adaptativo (com reatribuição de ruídos)
-    2️⃣ Aplica KMeans corretivo nos clusters com mais de max_pdv_cluster PDVs
-    3️⃣ Garante que 100% dos PDVs sejam incluídos em clusters finais
+    Combina DBSCAN e KMeans de forma hierárquica:
+      1️⃣ DBSCAN: detecta regiões naturais (macroclusters)
+      2️⃣ KMeans: subdivide cada macrocluster conforme max_pdv_cluster e frequencia_visita
+      3️⃣ Subclusterização diária iterativa: cria rotas diárias (k_diario = dias_uteis / frequencia)
+          - Se tempo_total > workday_min, subdivide novamente (k+1)
     """
 
     if not pdvs:
-        logger.warning("⚠️ Nenhum PDV recebido para clusterização híbrida.")
+        logger.warning("⚠️ Nenhum PDV informado para DBSCAN + KMeans.")
         return [], []
 
-    inicio_total = time.time()
-    logger.info(f"🚀 Iniciando DBSCAN híbrido | total PDVs={len(pdvs)} | limite={max_pdv_cluster} PDVs/cluster")
+    coords = np.array([[p.lat, p.lon] for p in pdvs if p.lat and p.lon], dtype=np.float64)
+    # ==========================================================
+    # 🔧 Ajuste adaptativo de sensibilidade do DBSCAN
+    # ==========================================================
+    if len(pdvs) < 500:
+        eps_km, min_samples = 0.8, 15
+    elif len(pdvs) < 2000:
+        eps_km, min_samples = 1.0, 25
+    else:
+        eps_km, min_samples = 1.2, 35
 
-    # ------------------------------------------------------
-    # 1️⃣ DBSCAN inicial (já reatribui ruídos automaticamente)
-    # ------------------------------------------------------
-    setores, labels = dbscan_setores(pdvs, eps_km=eps_km, min_samples=min_samples)
-    coords = np.array([[p.lat, p.lon] for p in pdvs], dtype=np.float64)
-    labels = np.array(labels)
+    eps_deg = eps_km / 111.0
 
-    n_clusters_iniciais = len(set(labels))
-    ruido_inicial = np.sum(labels == -1)
-    logger.info(f"📊 DBSCAN inicial: {n_clusters_iniciais} clusters | {ruido_inicial} PDVs de ruído (reatrib.)")
 
-    # ------------------------------------------------------
-    # 2️⃣ KMeans balanceador — subdivide clusters grandes
-    # ------------------------------------------------------
-    novos_labels = labels.copy()
-    cluster_id_offset = int(max(labels)) + 1 if len(labels) > 0 else 0
-    subdivisoes_realizadas = 0
-    total_pdv_redistribuido = 0
+    # ==========================================================
+    # 1️⃣ DBSCAN global (macroclusters)
+    # ==========================================================
+    db = DBSCAN(eps=eps_deg, min_samples=min_samples)
+    labels_db = db.fit_predict(coords)
+    n_db_clusters = len(set(labels_db)) - (1 if -1 in labels_db else 0)
+    ruido_count = np.sum(labels_db == -1)
 
-    for s in setores:
-        if s.n_pdvs > max_pdv_cluster:
-            idx_cluster = np.where(labels == s.cluster_label)[0]
-            subset_coords = coords[idx_cluster]
-            n_pdv = len(subset_coords)
-            n_split = math.ceil(n_pdv / max_pdv_cluster)
+    logger.info(f"🧠 DBSCAN detectou {n_db_clusters} clusters válidos ({ruido_count} ruídos).")
 
-            logger.warning(
-                f"⚖️ Cluster {s.cluster_label} excede {max_pdv_cluster} PDVs "
-                f"({n_pdv} PDVs) → aplicando KMeans (n_clusters={n_split})"
-            )
+    setores_finais = []
+    labels_finais = np.full(len(pdvs), -1)
 
-            km = KMeans(n_clusters=n_split, random_state=42, n_init="auto")
-            sub_labels = km.fit_predict(subset_coords)
-
-            for i, local_label in zip(idx_cluster, sub_labels):
-                novos_labels[i] = cluster_id_offset + local_label
-
-            cluster_id_offset += n_split
-            subdivisoes_realizadas += 1
-            total_pdv_redistribuido += n_pdv
-
-    # ------------------------------------------------------
-    # 3️⃣ Recalcula centros e raios
-    # ------------------------------------------------------
-    setores_final: List[Setor] = []
-    for cid in sorted(set(novos_labels)):
-        idx = np.where(novos_labels == cid)[0]
-        pts = [coords[i] for i in idx]
-        if not pts:
+    # ==========================================================
+    # 2️⃣ Processamento de cada macrocluster DBSCAN
+    # ==========================================================
+    for label in sorted(set(labels_db)):
+        if label == -1:
             continue
-        c = (float(np.mean([p[0] for p in pts])), float(np.mean([p[1] for p in pts])))
-        med, p95 = _raios_cluster(c, pts)
-        setores_final.append(
-            Setor(
-                cluster_label=int(cid),
-                centro_lat=c[0],
-                centro_lon=c[1],
-                n_pdvs=len(pts),
-                raio_med_km=float(med),
-                raio_p95_km=float(p95),
-            )
+
+        idx = np.where(labels_db == label)[0]
+        cluster_pdvs = [pdvs[i] for i in idx]
+        n_cluster = len(cluster_pdvs)
+        if n_cluster == 0:
+            continue
+
+        logger.info(f"📍 Macrocluster DBSCAN {label}: {n_cluster} PDVs")
+
+        # ======================================================
+        # 2.1️⃣ Cálculo do k_interno (KMeans interno)
+        # ======================================================
+        k_interno = max(1, int(ceil(n_cluster / (max_pdv_cluster / max(1, frequencia_visita)))))
+        logger.info(
+            f"🔹 Subdividindo cluster {label} via KMeans (k_interno={k_interno}) "
+            f"| max_pdv_cluster={max_pdv_cluster} | freq={frequencia_visita}"
         )
 
-    # ------------------------------------------------------
-    # 4️⃣ Logs consolidados de diagnóstico
-    # ------------------------------------------------------
-    tempo_total = round(time.time() - inicio_total, 2)
-    logger.info("📊 Resumo do balanceamento híbrido:")
-    logger.info(f"   - Clusters iniciais (DBSCAN): {n_clusters_iniciais}")
-    logger.info(f"   - Clusters finais (após balanceamento): {len(setores_final)}")
-    logger.info(f"   - Clusters subdivididos: {subdivisoes_realizadas}")
-    logger.info(f"   - PDVs redistribuídos via KMeans: {total_pdv_redistribuido}")
-    logger.info(f"   - Tempo total de execução: {tempo_total}s")
+        X_local = np.array([[p.lat, p.lon] for p in cluster_pdvs], dtype=np.float64)
+        km = KMeans(n_clusters=k_interno, random_state=RANDOM_STATE, n_init="auto")
+        km_labels = km.fit_predict(X_local)
+        centers = km.cluster_centers_
+
+        # ======================================================
+        # 3️⃣ Subclusterização diária iterativa (rotas)
+        # ======================================================
+        for k in range(k_interno):
+            idx_sub = np.where(km_labels == k)[0]
+            pdvs_sub = [cluster_pdvs[i] for i in idx_sub]
+            pts = [(p.lat, p.lon) for p in pdvs_sub]
+            if not pts:
+                continue
+
+            centro_lat, centro_lon = map(float, centers[k])
+            med, p95 = _raios_cluster((centro_lat, centro_lon), pts)
+            n_pdvs_sub = len(pdvs_sub)
+
+            # ==================================================
+            # 3.1️⃣ Cálculo do número de microclusters (rotas diárias)
+            # ==================================================
+            k_diario = max(1, int(ceil(dias_uteis / max(1, frequencia_visita))))
+            # ✅ Proteção contra clusters pequenos
+            k_diario = min(k_diario, len(pts))
+
+            logger.info(f"🕒 Cluster {label}-{k}: criando {k_diario} rotas diárias iniciais...")
+
+            # ==================================================
+            # 3.2️⃣ Avaliação iterativa por tempo e distância
+            # ==================================================
+            iteracao = 0
+            tempo_estimado = 99999.0
+            while tempo_estimado > workday_min and iteracao < 10:
+                km_daily = KMeans(n_clusters=k_diario, random_state=RANDOM_STATE, n_init="auto").fit(pts)
+                centers_daily = km_daily.cluster_centers_
+                tempo_total = []
+                dist_total = []
+
+                for i in range(k_diario):
+                    pts_daily = [pts[j] for j in range(len(pts)) if km_daily.labels_[j] == i]
+                    if len(pts_daily) < 2:
+                        continue
+
+                    # ✅ Correção: _haversine_km recebe tuplas (lat, lon)
+                    dist_km = np.mean(
+                        [_haversine_km(pts_daily[j], pts_daily[j - 1]) for j in range(1, len(pts_daily))]
+                    )
+
+                    tempo_transito = (dist_km / max(v_kmh, 1)) * 60
+                    tempo_paradas = len(pts_daily) * tempo_servico_min
+                    tempo_descarregamento = len(pts_daily) * tempo_descarregamento_min
+                    tempo_total_min = tempo_transito + tempo_paradas + tempo_descarregamento
+
+                    tempo_total.append(tempo_total_min)
+                    dist_total.append(dist_km)
+
+                tempo_estimado = np.mean(tempo_total) if tempo_total else 0
+                logger.debug(
+                    f"🔁 Iter {iteracao} | Cluster {label}-{k} | "
+                    f"Rotas={k_diario} | Tempo médio={tempo_estimado:.1f} min"
+                )
+
+                if tempo_estimado > workday_min:
+                    k_diario += 1
+                    iteracao += 1
+                else:
+                    break
+
+            # ==================================================
+            # 3.3️⃣ Registro final do setor
+            # ==================================================
+            setor = Setor(
+                cluster_label=int(len(setores_finais)),
+                centro_lat=centro_lat,
+                centro_lon=centro_lon,
+                n_pdvs=n_pdvs_sub,
+                raio_med_km=med,
+                raio_p95_km=p95,
+                pdvs=pdvs_sub,
+                coords=pts,
+            )
+            setores_finais.append(setor)
+
+            for i in idx[idx_sub]:
+                labels_finais[i] = setor.cluster_label
 
     logger.success(
-        f"✅ Híbrido concluído: {len(setores_final)} clusters finais "
-        f"({max_pdv_cluster} PDVs/cluster máx.) | Duração total {tempo_total}s"
+        f"✅ DBSCAN → KMeans finalizado: {len(setores_finais)} clusters "
+        f"(freq={frequencia_visita}, dias_uteis={dias_uteis})"
     )
-
-    return setores_final, novos_labels
+    return setores_finais, labels_finais
