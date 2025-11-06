@@ -48,10 +48,10 @@ def main():
     parser.add_argument("--dias_uteis", type=int, default=20, help="Dias úteis no ciclo")
     parser.add_argument("--freq", type=int, default=1, help="Frequência mensal de visitas")
 
-    parser.add_argument("--workday", type=int, default=480, help="Tempo máximo de trabalho diário (minutos)")
-    parser.add_argument("--routekm", type=float, default=120.0, help="Distância máxima por rota (km)")
-    parser.add_argument("--service", type=int, default=20, help="Tempo médio de visita por PDV (minutos)")
-    parser.add_argument("--vel", type=float, default=30.0, help="Velocidade média (km/h)")
+    parser.add_argument("--workday", type=int, default=5000, help="Tempo máximo de trabalho diário (minutos)")
+    parser.add_argument("--routekm", type=float, default=200.0, help="Distância máxima por rota (km)")
+    parser.add_argument("--service", type=int, default=30, help="Tempo médio de visita por PDV (minutos)")
+    parser.add_argument("--vel", type=float, default=35.0, help="Velocidade média (km/h)")
     parser.add_argument("--alpha", type=float, default=1.4, help="Fator de correção de caminho (curvas/ruas)")
 
     parser.add_argument(

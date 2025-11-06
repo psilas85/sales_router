@@ -230,24 +230,42 @@ def dbscan_setores(
 # ==========================================================
 # ⚖️ KMEANS balanceado com refinamento adaptativo por limites
 # ==========================================================
-def kmeans_balanceado(pdvs: List[PDV], max_pdv_cluster: int, v_kmh: float, max_dist_km: float, max_time_min: float, tempo_servico_min: float):
+def kmeans_balanceado(
+    pdvs: List[PDV],
+    max_pdv_cluster: int,
+    v_kmh: float,
+    max_dist_km: float,
+    max_time_min: float,
+    tempo_servico_min: float,
+):
     """
-    Executa KMeans balanceado:
-    - Define k inicial = ceil(N / max_pdv_cluster)
-    - Distribui PDVs de forma homogênea em clusters equilibrados
-    - Ajusta clusters que violam tempo/distância, subdividindo-os recursivamente
+    Executa KMeans balanceado com controle de tamanho máximo de cluster.
+    1️⃣ Calcula K inicial = ceil(N / max_pdv_cluster)
+    2️⃣ Executa KMeans normal
+    3️⃣ Subdivide clusters que excederem o limite de PDVs
+    4️⃣ Só depois calcula rotas simuladas (Haversine) e tempos
     """
-    from sklearn.cluster import KMeans
     import numpy as np
+    from sklearn.cluster import KMeans
     import math
     from src.sales_clusterization.domain.k_estimator import _haversine_km
 
+    def subdividir_por_tamanho(coords, max_pdv_cluster):
+        """Divide um cluster grande em subclusters menores até respeitar o limite."""
+        if len(coords) <= max_pdv_cluster:
+            return [coords]
+        k_sub = math.ceil(len(coords) / max_pdv_cluster)
+        km = KMeans(n_clusters=k_sub, random_state=42, n_init=10)
+        labels_sub = km.fit_predict(coords)
+        subclusters = [coords[labels_sub == i] for i in range(k_sub) if np.sum(labels_sub == i) > 0]
+        logger.warning(f"⚠️ Cluster excedido ({len(coords)} PDVs) → subdividido em {len(subclusters)} partes.")
+        return subclusters
+
     def avaliar_cluster(coords, centro):
-        """Retorna distância total (km) e tempo total (min)."""
+        """Calcula distância total e tempo de rota simulada (vizinho mais próximo simples)."""
         if len(coords) == 0:
-            return 0, 0
-        # Rota simulada aproximada (vizinho mais próximo simples)
-        dist_total = 0
+            return 0.0, 0.0
+        dist_total = 0.0
         atual = np.array(centro)
         visitados = np.zeros(len(coords), dtype=bool)
         for _ in range(len(coords)):
@@ -260,66 +278,59 @@ def kmeans_balanceado(pdvs: List[PDV], max_pdv_cluster: int, v_kmh: float, max_d
         tempo_total = (dist_total / max(v_kmh, 1e-3)) * 60 + len(coords) * tempo_servico_min
         return dist_total, tempo_total
 
-    def subdividir(coords, k):
-        """Executa KMeans sobre coordenadas e retorna subclusters [(subcoords, centro), ...]."""
-        X = np.array(coords, dtype=np.float64)
-        km = KMeans(n_clusters=k, init="k-means++", random_state=42, n_init=10)
-        labels = km.fit_predict(X)
-        subs = []
-        for i in range(k):
-            subcoords = X[labels == i]
-            if len(subcoords) == 0:
-                continue
-            centro = tuple(map(float, km.cluster_centers_[i]))
-            subs.append((subcoords, centro))
-        return subs
-
-    def refinar_recursivo(coords):
-        """Avalia e subdivide clusters até atender limites operacionais."""
-        centro = tuple(map(float, np.mean(coords, axis=0)))
-        dist_km, tempo_min = avaliar_cluster(coords, centro)
-        if (dist_km > max_dist_km or tempo_min > max_time_min) and len(coords) > max_pdv_cluster:
-            k_sub = math.ceil(len(coords) / max_pdv_cluster)
-            logger.warning(f"⚠️ Cluster excede limites ({dist_km:.1f} km / {tempo_min:.1f} min) → subdividindo em {k_sub}")
-            resultado = []
-            for subcoords, _ in subdividir(coords, k_sub):
-                resultado.extend(refinar_recursivo(subcoords))
-            return resultado
-        else:
-            return [(coords, centro, dist_km, tempo_min)]
-
     # ==========================================================
-    # 🔹 Etapa inicial: clusterização balanceada global
+    # 🔹 Etapa 1: K inicial pelo número máximo de PDVs
     # ==========================================================
     n = len(pdvs)
     if n == 0:
         return []
 
     k_inicial = max(1, math.ceil(n / max_pdv_cluster))
+
+    # 🔒 Garante que bases maiores que o limite gerem pelo menos 2 clusters
+    if n > max_pdv_cluster and k_inicial == 1:
+        logger.warning(
+            f"⚠️ Total de PDVs ({n}) excede o limite ({max_pdv_cluster}), "
+            "mas K inicial foi 1 — ajustando para K=2."
+        )
+        k_inicial = 2
+
     logger.info(f"⚙️ Iniciando KMeans balanceado (N={n}, max_pdv_cluster={max_pdv_cluster}, k_inicial={k_inicial})")
 
     coords = np.array([[p.lat, p.lon] for p in pdvs])
-    kmeans = KMeans(n_clusters=k_inicial, init="k-means++", random_state=42, n_init=10)
+    kmeans = KMeans(n_clusters=k_inicial, random_state=42, n_init=10)
     labels = kmeans.fit_predict(coords)
 
-    clusters_refinados = []
+    # ==========================================================
+    # 🔹 Etapa 2: Rebalanceamento por tamanho
+    # ==========================================================
+    clusters_validos = []
     for i in range(k_inicial):
         subset = coords[labels == i]
         if len(subset) == 0:
             continue
-        clusters_refinados.extend(refinar_recursivo(subset))
 
-    # Converte clusters em entidades Setor
+        # se cluster excede o limite de PDVs, subdivide antes de qualquer cálculo
+        subclusters = subdividir_por_tamanho(subset, max_pdv_cluster)
+        clusters_validos.extend(subclusters)
+
+    logger.info(f"✅ Todos os clusters ajustados por tamanho. Total final: {len(clusters_validos)}")
+
+    # ==========================================================
+    # 🔹 Etapa 3: Avaliação de rota (Haversine + tempo)
+    # ==========================================================
     setores = []
-    for idx, (coords_sub, centro, dist_km, tempo_min) in enumerate(clusters_refinados):
-        pts = [(float(x[0]), float(x[1])) for x in coords_sub]
+    for idx, subset in enumerate(clusters_validos):
+        centro = tuple(map(float, np.mean(subset, axis=0)))
+        dist_km, tempo_min = avaliar_cluster(subset, centro)
+        pts = [(float(x[0]), float(x[1])) for x in subset]
         med, p95 = _raios_cluster(centro, pts)
 
-        # 🆕 Mapeia PDVs originais correspondentes
+        # associa PDVs originais
         pdvs_sub = []
         for p in pdvs:
             if any(abs(p.lat - c[0]) < 1e-6 and abs(p.lon - c[1]) < 1e-6 for c in pts):
-                p.cluster_label = idx            # 🔹 <<< adiciona esta linha
+                p.cluster_label = idx
                 pdvs_sub.append(p)
 
         setores.append(
@@ -327,14 +338,20 @@ def kmeans_balanceado(pdvs: List[PDV], max_pdv_cluster: int, v_kmh: float, max_d
                 cluster_label=idx,
                 centro_lat=centro[0],
                 centro_lon=centro[1],
-                n_pdvs=len(coords_sub),
+                n_pdvs=len(subset),
                 raio_med_km=med,
                 raio_p95_km=p95,
-                pdvs=pdvs_sub,  # ✅ garante compatibilidade com refinador
+                pdvs=pdvs_sub,
                 coords=pts,
-                metrics={"dist_km": dist_km, "tempo_min": tempo_min},
+                metrics={
+                    "dist_km": dist_km,
+                    "tempo_min": tempo_min,
+                    "status": "EXCEDIDO"
+                    if (dist_km > max_dist_km or tempo_min > max_time_min)
+                    else "OK",
+                },
             )
         )
 
-    logger.success(f"✅ KMeans balanceado concluído: {len(setores)} clusters finais.")
+    logger.success(f"✅ KMeans balanceado concluído com {len(setores)} clusters finais (todos <= {max_pdv_cluster} PDVs).")
     return setores
