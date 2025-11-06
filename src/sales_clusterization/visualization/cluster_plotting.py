@@ -1,5 +1,3 @@
-#sales_router/src/sales_clusterization/visualization/cluster_plotting.py
-
 # =========================================================
 # 📦 src/sales_clusterization/visualization/cluster_plotting.py
 # =========================================================
@@ -69,7 +67,8 @@ def buscar_clusters(tenant_id: int, run_id: int):
             ON p.id = csp.pdv_id 
            AND p.tenant_id = csp.tenant_id
         WHERE cs.run_id = %s 
-          AND cs.tenant_id = %s;
+          AND cs.tenant_id = %s
+        ORDER BY cs.cluster_label, csp.pdv_id;  -- 🔥 Garante agrupamento estável
     """
     conn = get_connection()
     with conn.cursor() as cur:
@@ -105,7 +104,7 @@ def gerar_mapa_clusters(dados, output_path: Path):
     if pd.isna(lat_centro) or pd.isna(lon_centro):
         lat_centro, lon_centro = -15.78, -47.93  # fallback genérico (centro do Brasil)
 
-    m = folium.Map(location=[lat_centro, lon_centro], zoom_start=6, tiles="CartoDB positron")
+    m = folium.Map(location=[lat_centro, lon_centro], zoom_start=7, tiles="CartoDB positron")
 
     clusters = {}
     centros = {}
@@ -117,6 +116,7 @@ def gerar_mapa_clusters(dados, output_path: Path):
         if label not in centros and centro_lat and centro_lon:
             centros[label] = (centro_lat, centro_lon)
 
+        # 🔸 Validação das coordenadas
         if (
             lat is None or lon is None
             or not isinstance(lat, (int, float))
@@ -126,8 +126,10 @@ def gerar_mapa_clusters(dados, output_path: Path):
         ):
             logger.debug(f"⚠️ Coordenadas inválidas ignoradas: Cluster {label} | {cidade}/{uf} | ({lat}, {lon})")
             continue
+
         clusters.setdefault(label, []).append((lat, lon, cidade, uf, endereco, cnpj))
 
+    logger.info(f"📊 Clusters detectados para plotagem: {list(clusters.keys())}")
 
     if not clusters:
         logger.warning("⚠️ Nenhum PDV válido encontrado para plotagem.")
@@ -139,10 +141,12 @@ def gerar_mapa_clusters(dados, output_path: Path):
         "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"
     ]
 
+    # =========================================================
+    # 🔹 Plotagem dos pontos por cluster
+    # =========================================================
     for i, (label, pontos) in enumerate(sorted(clusters.items())):
         cor = palette[i % len(palette)]
         for lat, lon, cidade, uf, endereco, cnpj in pontos:
-            # 🔧 Tratamento seguro de valores nulos
             endereco = endereco if endereco and endereco.strip() else "Endereço não informado"
             cidade = cidade if cidade and cidade.strip() else "Cidade não informada"
             uf = uf if uf and uf.strip() else "--"
@@ -193,9 +197,9 @@ def gerar_mapa_clusters(dados, output_path: Path):
             ),
         ).add_to(m)
 
-
-
-
+    # =========================================================
+    # 📘 Legenda
+    # =========================================================
     legend_html = """
     <div style="
         position: fixed; bottom: 50px; left: 50px; width: 180px;
