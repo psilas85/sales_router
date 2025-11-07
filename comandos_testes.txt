@@ -46,4 +46,11 @@ python3 -m src.sales_clusterization.reporting.export_resumo_clusters_cep \
     --clusterization_id 8fbe9f27-451e-42b8-be92-9222b87bf2ac
 "
 
-ubuntu@ip-172-31-16-114:~/sales_router$ docker exec -it sales_clusterization python3 -m src.sales_clusterization.cli.run_cluster   --tenant_id 1   --uf RJ   --descricao "SC_2K_rj"   --input_id 7f229750-14ea-4913-bfa8-6eeb448c154b  --dias_uteis 20
+ubuntu@ip-172-31-16-114:~/sales_router$ docker exec -it sales_clusterization python3 -m src.sales_clusterization.cli.run_cluster
+   --tenant_id 1   --uf RJ   --descricao "SC_2K_rj"   --input_id 7f229750-14ea-4913-bfa8-6eeb448c154b  --dias_uteis 20
+
+docker exec -it sales_clusterization python3 -m src.sales_clusterization.reporting.export_cluster_resumo_xlsx     --tenant_id 1     --clusterization_id 9ef6a8c1-32d4-465e-a123-ca71f092cd1a
+
+docker exec -it sales_clusterization python3 -m src.sales_clusterization.reporting.export_cluster_pdv_detalhado_xlsx \
+    --tenant_id 1 \
+    --clusterization_id 9ef6a8c1-32d4-465e-a123-ca71f092cd1a

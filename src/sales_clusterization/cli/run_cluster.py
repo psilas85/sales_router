@@ -37,10 +37,30 @@ def main():
     parser.add_argument("--cidade", required=False, help="Cidade opcional dos PDVs (ex: Fortaleza)")
     parser.add_argument(
         "--algo",
-        default="kmeans",  # 👈 agora é o padrão
-        choices=["kmeans_simples", "kmeans", "dbscan", "hibrido"],
-        help="Algoritmo de clusterização: kmeans_simples (padrão), kmeans, dbscan ou hibrido."
+        default="kmeans",  # 👈 padrão permanece
+                choices=[
+            "kmeans_simples",
+            "kmeans",
+            "dbscan",
+            "hibrido",
+            "kmeans_geo",
+            "radial_geo",
+            "radial_geo_continuous",
+            "capacitated_kmeans",
+            "capacitated_sweep",  # 🆕 novo modo
+        ],
+
+        help=(
+            "Algoritmo de clusterização: "
+            "kmeans_simples, kmeans, dbscan, hibrido, kmeans_geo, radial_geo, "
+            "radial_geo_continuous, capacitated_kmeans ou capacitated_sweep "
+            "(linear e contínuo por capacidade máxima)."
+        ),
+
+
     )
+
+
 
 
     parser.add_argument("--k", type=int, default=None, help="K forçado (apenas para KMeans)")
