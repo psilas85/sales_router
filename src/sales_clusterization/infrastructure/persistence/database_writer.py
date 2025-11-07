@@ -440,25 +440,17 @@ class DatabaseWriter:
             return 0
 
         from psycopg2.extras import execute_values
-        import logging
+        from loguru import logger
 
         cur = self.conn.cursor()
 
         valores = [
             (
-                c["tenant_id"],
-                c["input_id"],
-                c["clusterization_id"],  # ✅ agora obrigatório
-                c["uf"],
-                c["cep"],
-                c["cluster_id"],
-                c["clientes_total"],
-                c["clientes_target"],
-                c["cluster_lat"],
-                c["cluster_lon"],
-                c["distancia_km"],
-                c["tempo_min"],
-                c["is_outlier"]
+                c["tenant_id"], c["input_id"], c["clusterization_id"], c["uf"], c["cep"],
+                c["cluster_id"], c["clientes_total"], c["clientes_target"],
+                c["lat"], c["lon"],               # 🆕 incluído
+                c["cluster_lat"], c["cluster_lon"],
+                c["distancia_km"], c["tempo_min"], c["is_outlier"]
             )
             for c in lista_clusters
         ]
@@ -467,11 +459,14 @@ class DatabaseWriter:
             INSERT INTO mkp_cluster_cep (
                 tenant_id, input_id, clusterization_id, uf, cep, cluster_id,
                 clientes_total, clientes_target,
+                lat, lon,                     -- 🆕 novas colunas
                 cluster_lat, cluster_lon,
                 distancia_km, tempo_min, is_outlier
             )
             VALUES %s
             ON CONFLICT (tenant_id, input_id, clusterization_id, cep) DO UPDATE SET
+                lat = EXCLUDED.lat,           
+                lon = EXCLUDED.lon,           
                 cluster_id = EXCLUDED.cluster_id,
                 cluster_lat = EXCLUDED.cluster_lat,
                 cluster_lon = EXCLUDED.cluster_lon,
@@ -481,21 +476,33 @@ class DatabaseWriter:
                 atualizado_em = NOW();
         """
 
-
-
         try:
-            logging.info(f"💾 Inserindo {len(valores)} linhas em mkp_cluster_cep "
-                         f"(clusterization_id={lista_clusters[0]['clusterization_id']})")
+            logger.info(
+                f"💾 Inserindo {len(valores)} linhas em mkp_cluster_cep "
+                f"(clusterization_id={lista_clusters[0]['clusterization_id']})"
+            )
             execute_values(cur, sql, valores)
             self.conn.commit()
-            inseridos = cur.rowcount or len(valores)
+
+            cur.execute(
+                "SELECT COUNT(*) FROM mkp_cluster_cep WHERE clusterization_id = %s;",
+                (lista_clusters[0]["clusterization_id"],)
+            )
+            inseridos = cur.fetchone()[0]
+
+            logger.success(
+                f"✅ {inseridos} registros gravados em mkp_cluster_cep "
+                f"(clusterization_id={lista_clusters[0]['clusterization_id']})"
+            )
+
             cur.close()
             return inseridos
+
         except Exception as e:
             self.conn.rollback()
-            logging.error(f"❌ Erro ao inserir mkp_cluster_cep: {e}", exc_info=True)
+            logger.error(f"❌ Erro ao inserir mkp_cluster_cep: {e}", exc_info=True)
             cur.close()
             return 0
-    
+
     
 
