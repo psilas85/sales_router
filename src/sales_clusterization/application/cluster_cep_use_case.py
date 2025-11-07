@@ -208,6 +208,8 @@ class ClusterCEPUseCase:
                     "cluster_id": int(cluster_id),
                     "clientes_total": int(row["clientes_total"]),
                     "clientes_target": int(row["clientes_target"]),
+                    "lat": float(row["lat"]),       # 🆕 coordenada real
+                    "lon": float(row["lon"]),       # 🆕 coordenada real
                     "cluster_lat": float(centro_lat),
                     "cluster_lon": float(centro_lon),
                     "distancia_km": float(row["distancia_km"]),

@@ -4,6 +4,7 @@
 
 import os
 import time
+import random
 import pandas as pd
 import argparse
 import requests
@@ -11,26 +12,33 @@ from loguru import logger
 from database.db_connection import get_connection
 
 
+import os
+import requests
+from loguru import logger
+
 def obter_bairro_por_coord(lat, lon):
     """
-    Faz reverse geocoding via Nominatim (local ou público)
-    para retornar o bairro aproximado das coordenadas.
-    Retorna None em caso de erro.
+    Obtém o bairro aproximado via Nominatim público com fallback no Google Maps.
+    Retorna string com nome do bairro ou 'Não identificado'.
     """
+
+    # ========================
+    # 1️⃣ Nominatim público
+    # ========================
     try:
-        NOMINATIM_URL = os.getenv("NOMINATIM_URL", "http://nominatim:8080/reverse")
-        params = {
-            "lat": lat,
-            "lon": lon,
-            "format": "json",
-            "addressdetails": 1,
-            "zoom": 16
+        NOMINATIM_URL = os.getenv("NOMINATIM_URL", "https://nominatim.openstreetmap.org")
+        params = {"lat": lat, "lon": lon, "format": "json", "addressdetails": 1, "zoom": 16}
+        headers = {
+            "User-Agent": "SalesRouter/1.0 (suporte@salesrouter.ai)",
+            "Accept-Language": "pt-BR",
         }
-        resp = requests.get(NOMINATIM_URL, params=params, timeout=5)
+
+        resp = requests.get(f"{NOMINATIM_URL}/reverse", params=params, headers=headers, timeout=10)
+
         if resp.status_code == 200:
             data = resp.json()
             addr = data.get("address", {})
-            return (
+            bairro = (
                 addr.get("suburb")
                 or addr.get("neighbourhood")
                 or addr.get("city_district")
@@ -38,16 +46,54 @@ def obter_bairro_por_coord(lat, lon):
                 or addr.get("town")
                 or addr.get("city")
             )
-        return None
+            if bairro:
+                logger.debug(f"🏙️ Bairro via Nominatim ({lat},{lon}) → {bairro}")
+                return bairro.strip()
+            else:
+                logger.warning(f"⚠️ Nominatim retornou sem bairro para ({lat},{lon})")
+        else:
+            logger.warning(f"⚠️ Nominatim {resp.status_code} para ({lat},{lon}) | body={resp.text[:120]}")
+
     except Exception as e:
-        logger.warning(f"⚠️ Falha ao buscar bairro para ({lat}, {lon}): {e}")
-        return None
+        logger.warning(f"⚠️ Erro Nominatim ({lat},{lon}): {e}")
+
+    # ========================
+    # 2️⃣ Fallback: Google
+    # ========================
+    try:
+        GOOGLE_KEY = os.getenv("GMAPS_API_KEY")
+        if not GOOGLE_KEY:
+            logger.error("❌ GMAPS_API_KEY não configurada. Configure no .env")
+            return "Não identificado"
+
+        google_url = (
+            f"https://maps.googleapis.com/maps/api/geocode/json?"
+            f"latlng={lat},{lon}&key={GOOGLE_KEY}&language=pt-BR"
+        )
+        g_resp = requests.get(google_url, timeout=10)
+
+        if g_resp.status_code == 200:
+            g_data = g_resp.json()
+            if g_data.get("results"):
+                for comp in g_data["results"][0].get("address_components", []):
+                    if "sublocality" in comp["types"] or "neighborhood" in comp["types"]:
+                        bairro = comp["long_name"].strip()
+                        logger.debug(f"🌐 Bairro via Google ({lat},{lon}) → {bairro}")
+                        return bairro
+            logger.warning(f"⚠️ Google não encontrou bairro para ({lat},{lon})")
+        else:
+            logger.warning(f"⚠️ Google {g_resp.status_code} para ({lat},{lon})")
+
+    except Exception as e:
+        logger.warning(f"⚠️ Erro Google Geocoding ({lat},{lon}): {e}")
+
+    return "Não identificado"
+
 
 
 def exportar_resumo_clusters(tenant_id: int, clusterization_id: str):
     """
     Exporta resumo por cluster (clientes, CEPs, distâncias, tempos e bairro central)
-    para CSV em output/reports/{tenant_id}/mkp_resumo_clusters_{clusterization_id}.csv
     """
     sql = """
         SELECT 
@@ -78,33 +124,32 @@ def exportar_resumo_clusters(tenant_id: int, clusterization_id: str):
         logger.warning(f"⚠️ Nenhum resumo encontrado para clusterization_id={clusterization_id}")
         return None
 
-    # ============================================================
-    # 🧮 Reverse geocoding apenas para cluster_bairro ausente
-    # ============================================================
     logger.info("🌍 Obtendo bairros de cada centro de cluster via reverse geocoding...")
     bairros_cache = {}
 
     for i, row in df.iterrows():
-        lat, lon = float(row["cluster_lat"]), float(row["cluster_lon"])
-        chave = f"{lat:.6f},{lon:.6f}"
+        try:
+            lat, lon = float(row["cluster_lat"]), float(row["cluster_lon"])
+            chave = f"{lat:.6f},{lon:.6f}"
 
-        if pd.isna(row["cluster_bairro"]) or not str(row["cluster_bairro"]).strip():
-            if chave in bairros_cache:
-                bairro = bairros_cache[chave]
-            else:
-                bairro = obter_bairro_por_coord(lat, lon)
-                bairros_cache[chave] = bairro
-                time.sleep(0.3)  # evita flood no Nominatim
+            if pd.isna(row["cluster_bairro"]) or not str(row["cluster_bairro"]).strip():
+                if chave in bairros_cache:
+                    bairro = bairros_cache[chave]
+                else:
+                    bairro = obter_bairro_por_coord(lat, lon)
+                    bairros_cache[chave] = bairro
 
-            df.at[i, "cluster_bairro"] = bairro or "Não identificado"
+                df.at[i, "cluster_bairro"] = bairro or "Não identificado"
 
-    # ============================================================
-    # 📏 Formata apenas latitude/longitude com vírgula
-    # ============================================================
+        except Exception as e:
+            logger.warning(f"⚠️ Falha ao processar linha {i}: {e}")
+            df.at[i, "cluster_bairro"] = "Não identificado"
+
+    # formata latitude e longitude para CSV (com vírgula)
     df["cluster_lat"] = df["cluster_lat"].map(lambda x: f"{x:.6f}".replace(".", ","))
     df["cluster_lon"] = df["cluster_lon"].map(lambda x: f"{x:.6f}".replace(".", ","))
 
-    # Todas as demais colunas numéricas mantêm ponto decimal padrão
+    # conversão segura de numéricos
     numeric_cols = [
         "qtd_ceps", "clientes_total", "clientes_target",
         "distancia_media_km", "tempo_medio_min",
@@ -113,27 +158,14 @@ def exportar_resumo_clusters(tenant_id: int, clusterization_id: str):
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # ============================================================
-    # 📊 Preview no log
-    # ============================================================
     logger.info("📋 Prévia dos clusters exportados:")
     logger.info(df[["cluster_id", "cluster_bairro", "cluster_lat", "cluster_lon"]].head(10).to_string(index=False))
 
-    # ============================================================
-    # 💾 Exporta CSV formatado
-    # ============================================================
     output_dir = os.path.join("output", "reports", str(tenant_id))
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, f"mkp_resumo_clusters_{clusterization_id}.csv")
 
-    df.to_csv(
-        output_path,
-        index=False,
-        sep=";",
-        encoding="utf-8-sig",
-        float_format="%.2f"
-    )
-
+    df.to_csv(output_path, index=False, sep=";", encoding="utf-8-sig", float_format="%.2f")
     logger.success(f"✅ Resumo de clusters exportado para {output_path}")
     return output_path
 
