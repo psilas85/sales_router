@@ -58,3 +58,5 @@ psutil
 polyline==2.0.0
 
 openpyxl
+
+scikit-learn-extra-0.2.0

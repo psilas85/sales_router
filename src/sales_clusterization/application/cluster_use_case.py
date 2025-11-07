@@ -9,6 +9,9 @@ from loguru import logger
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
 import math
+import numpy as np
+
+
 
 
 from src.sales_clusterization.domain.sector_generator import kmeans_balanceado
@@ -27,6 +30,8 @@ from src.sales_clusterization.domain.sector_generator_hybrid import dbscan_kmean
 from src.sales_clusterization.domain.validators import checar_raio
 from src.sales_clusterization.domain.entities import PDV
 from src.sales_clusterization.domain.operational_cluster_refiner import OperationalClusterRefiner
+from src.sales_clusterization.domain.balanced_geokmeans import balanced_geokmeans
+
 
 
 # ============================================================
@@ -210,55 +215,118 @@ def executar_clusterizacao(
             tenant_id=tenant_id,  # 👈 adicionado
         )
 
-         # ============================================================
-        # 4️⃣-B NOVO MODO: KMEANS_SIMPLES (DEFAULT)
         # ============================================================
-        if algo in ("kmeans_simples", "simples", None):
-            logger.info("🧠 Modo simples: clusterização apenas por número máximo de PDVs (sem refino operacional).")
+        # 🧠 MODO KMEANS_SIMPLES — Balanced KMeans nativo (sem sklearn_extra)
+        # ============================================================
+        if algo == "kmeans_simples":
+            from sklearn.cluster import KMeans
+            import numpy as np
+            from src.sales_clusterization.domain.k_estimator import _haversine_km
+            from src.sales_clusterization.domain.entities import Setor
 
-            total_pdvs = len(pdvs)
-            k_inicial = max(1, math.ceil(total_pdvs / max_pdv_cluster))
-            logger.info(f"📊 Total {total_pdvs} PDVs | Máx {max_pdv_cluster}/cluster → K inicial = {k_inicial}")
+            logger.info("🧠 Modo simples balanceado: usando KMeans com redistribuição automática de clusters.")
 
-            # 🧮 Executa KMeans padrão (centros seguem densidade natural)
-            setores_finais, labels = kmeans_setores(pdvs, k_inicial)
+            # --------------------------
+            # 1️⃣ Preparação dos dados
+            # --------------------------
+            coords = np.array([[p.lat, p.lon] for p in pdvs])
+            n_pdvs = len(coords)
+            k_inicial = max(1, round(n_pdvs / max_pdv_cluster))
+            logger.info(f"📊 Total {n_pdvs} PDVs | alvo ≈ {max_pdv_cluster}/cluster → K inicial ≈ {k_inicial}")
 
-            # 🧩 Atualiza labels de cada PDV
-            for i, p in enumerate(pdvs):
-                p.cluster_label = int(labels[i]) if i < len(labels) else -1
+            # --------------------------
+            # 2️⃣ Execução inicial do KMeans
+            # --------------------------
+            clf = KMeans(n_clusters=k_inicial, n_init=20, random_state=42)
+            labels = clf.fit_predict(coords)
+            centers = clf.cluster_centers_
 
-            # 🗺️ Loga resumo por cluster
-            for s in setores_finais:
-                logger.debug(
-                    f"📍 Cluster {s.cluster_label}: {s.n_pdvs} PDVs | "
-                    f"Centro=({s.centro_lat:.5f}, {s.centro_lon:.5f}) | "
-                    f"Raio med={s.raio_med_km:.2f} km | P95={s.raio_p95_km:.2f} km"
+            # ============================================================
+            # 3️⃣ Redistribuição balanceada iterativa
+            # ============================================================
+            def balancear_clusters(coords, labels, centers, max_pdv_cluster, tolerancia=2, max_iter=10):
+                labels = np.array(labels, dtype=int)
+                for it in range(max_iter):
+                    unique, counts = np.unique(labels, return_counts=True)
+                    excesso = {u: c - max_pdv_cluster for u, c in zip(unique, counts) if c > max_pdv_cluster + tolerancia}
+                    faltando = {u: max_pdv_cluster - c for u, c in zip(unique, counts) if c < max_pdv_cluster - tolerancia}
+
+                    logger.debug(f"🔁 Iteração {it+1}: excesso={excesso} | faltando={faltando}")
+
+                    if not excesso and not faltando:
+                        break
+
+                    for cid_excesso, qtd_excesso in excesso.items():
+                        idx_excesso = np.where(labels == cid_excesso)[0]
+                        if not len(idx_excesso):
+                            continue
+
+                        dist_to_centers = np.linalg.norm(coords[idx_excesso][:, None, :] - centers, axis=2)
+                        ordenados = np.argsort(-dist_to_centers[:, cid_excesso])
+
+                        for i in ordenados[:qtd_excesso]:
+                            destinos_validos = [d for d, f in faltando.items() if f > 0]
+                            if not destinos_validos:
+                                break
+                            dist_ao_destino = {d: dist_to_centers[i, d] for d in destinos_validos}
+                            destino = min(dist_ao_destino, key=dist_ao_destino.get)
+                            labels[idx_excesso[i]] = destino
+                            faltando[destino] -= 1
+
+                    for cid in np.unique(labels):
+                        cluster_pts = coords[labels == cid]
+                        if len(cluster_pts):
+                            centers[cid] = cluster_pts.mean(axis=0)
+
+                logger.success(f"⚖️ Rebalanceamento concluído após {it+1} iterações.")
+                return labels, centers
+
+            labels, centers = balancear_clusters(coords, labels, centers, max_pdv_cluster)
+
+            # ============================================================
+            # 4️⃣ Criação dos objetos Setor e persistência
+            # ============================================================
+            setores_finais = []
+            for cid in np.unique(labels):
+                cluster_pdvs = [p for p, lbl in zip(pdvs, labels) if lbl == cid]
+                centro_lat = float(np.mean([p.lat for p in cluster_pdvs]))
+                centro_lon = float(np.mean([p.lon for p in cluster_pdvs]))
+
+                setor = Setor(
+                    cluster_label=int(cid),
+                    centro_lat=centro_lat,
+                    centro_lon=centro_lon,
+                    n_pdvs=len(cluster_pdvs),
+                    raio_med_km=0,
+                    raio_p95_km=0,
                 )
+                setores_finais.append(setor)
+                logger.debug(f"📍 Cluster {cid}: {len(cluster_pdvs)} PDVs | Centro=({centro_lat:.5f}, {centro_lon:.5f})")
 
-            # 💾 Salva setores e mapeamento PDVs
+            for p, lbl in zip(pdvs, labels):
+                p.cluster_label = int(lbl)
+
             mapping_cluster_id = salvar_setores(tenant_id, run_id, setores_finais)
             label_to_id = {s.cluster_label: mapping_cluster_id.get(s.cluster_label) for s in setores_finais}
+
             for p in pdvs:
-                if p.cluster_label in label_to_id:
+                if hasattr(p, "cluster_label") and p.cluster_label in label_to_id:
                     p.cluster_id = label_to_id[p.cluster_label]
 
             salvar_mapeamento_pdvs(tenant_id, run_id, pdvs)
 
-            # ✅ Finaliza execução
-            finalizar_run(run_id, status="done", k_final=k_inicial)
-            logger.success(f"✅ Clusterização simples concluída | K={k_inicial} | run_id={run_id}")
+            unique, counts = np.unique(labels, return_counts=True)
+            media_cluster = np.mean(counts)
+            desvio_cluster = np.std(counts)
+            indice_equilibrio = round(max(counts) / max(1, min(counts)), 2)
 
-            return {
-                "tenant_id": tenant_id,
-                "clusterization_id": clusterization_id,  # ✅ adicionada
-                "run_id": run_id,
-                "algo": algo,
-                "k_final": k_inicial,
-                "n_pdvs": len(pdvs),
-                "outliers": total_outliers,
-                "diagnostico": f"Clusterização simples concluída com K={k_inicial} e {len(pdvs)} PDVs."
-            }
+            logger.info(
+                f"📈 Diagnóstico: média={media_cluster:.1f} | desvio={desvio_cluster:.1f} "
+                f"| índice={indice_equilibrio} | tamanhos={dict(zip(unique, counts))}"
+            )
 
+            finalizar_run(run_id, status="done", k_final=len(setores_finais))
+            logger.success(f"✅ Clusterização simples balanceada concluída | K={len(setores_finais)} | run_id={run_id}")
 
 
 
@@ -322,10 +390,14 @@ def executar_clusterizacao(
                 if sc.get("status") == "EXCEDIDO"
             ]
 
+            # ✅ Garante escopo local de np
+            import numpy as np
+
             tempo_medio_min = np.mean(tempos) if tempos else 0
             tempo_max_min = np.max(tempos) if tempos else 0
             distancia_media_km = np.mean(distancias) if distancias else 0
             dist_max_km = np.max(distancias) if distancias else 0
+
 
             diag["refinamento_operacional"] = {
                 "clusters_excedidos": len(excedidos),
@@ -423,6 +495,330 @@ def executar_clusterizacao(
                 f"Distância média: {distancia_media_km:.1f} km (máx {dist_max_km:.1f})"
             )
 
+        # ============================================================
+        # 🧭 Novo modo: KMeans Geo Balanceado
+        # ============================================================
+        elif algo == "kmeans_geo":
+            from src.sales_clusterization.domain.entities import Setor
+
+            logger.info("🗺️  Modo Geo Balanceado: criando clusters espaciais coerentes com tamanho equilibrado.")
+            k_inicial = max(1, round(len(pdvs) / max_pdv_cluster))
+            logger.info(f"📊 Total {len(pdvs)} PDVs | alvo ≈ {max_pdv_cluster}/cluster → K inicial ≈ {k_inicial}")
+
+
+            labels, centers = balanced_geokmeans(pdvs, k=k_inicial)
+            setores_finais = []
+
+            # Cria objetos Setor e calcula centroides
+            for i in range(k_inicial):
+                cluster_points = [p for p, lbl in zip(pdvs, labels) if lbl == i]
+                centro_lat, centro_lon = centers[i]
+                setor = Setor(
+                    cluster_label=i,
+                    centro_lat=centro_lat,
+                    centro_lon=centro_lon,
+                    n_pdvs=len(cluster_points),
+                    raio_med_km=0,
+                    raio_p95_km=0,
+                )
+                setores_finais.append(setor)
+                logger.debug(f"📍 Cluster {i}: {len(cluster_points)} PDVs | Centro=({centro_lat:.5f}, {centro_lon:.5f})")
+
+            # Atribui cluster_label e cluster_id a cada PDV
+            for p, lbl in zip(pdvs, labels):
+                p.cluster_label = int(lbl)
+
+            mapping_cluster_id = salvar_setores(tenant_id, run_id, setores_finais)
+            label_to_id = {s.cluster_label: mapping_cluster_id.get(s.cluster_label) for s in setores_finais}
+
+            for p in pdvs:
+                if hasattr(p, "cluster_label") and p.cluster_label in label_to_id:
+                    p.cluster_id = label_to_id[p.cluster_label]
+
+            salvar_mapeamento_pdvs(tenant_id, run_id, pdvs)
+            logger.success(f"✅ Clusterização Geo Balanceada concluída | K={k_inicial} | run_id={run_id}")
+
+            return {
+                "clusterization_id": clusterization_id,
+                "run_id": run_id,
+                "k_final": k_inicial,
+                "n_pdvs": len(pdvs),
+                "diagnostico": (
+                    f"GeoKMeans balanceado concluído com K={k_inicial} clusters "
+                    f"e {len(pdvs)} PDVs (diferença máxima ±1 PDV por cluster)."
+                ),
+            }
+
+        # ============================================================
+        # 🧭 Novo modo: Radial Geo Balanceado
+        # ============================================================
+        elif algo == "radial_geo":
+            from src.sales_clusterization.domain.radial_balanced_clustering import radial_balanced_clustering
+            from src.sales_clusterization.domain.entities import Setor
+
+            logger.info("🌐 Modo Radial Geo: atribuição radial equilibrada em torno de centros geométricos.")
+            k_inicial = max(1, round(len(pdvs) / max_pdv_cluster))
+            logger.info(f"📊 Total {len(pdvs)} PDVs | alvo ≈ {max_pdv_cluster}/cluster → K inicial ≈ {k_inicial}")
+
+            # ⚙️ Executa o algoritmo radial
+            labels, centers = radial_balanced_clustering(pdvs, k=k_inicial, max_pdv_cluster=max_pdv_cluster)
+
+            # ✅ Corrige: atribui o cluster_label antes de salvar
+            for p, lbl in zip(pdvs, labels):
+                p.cluster_label = int(lbl)
+
+            # 🧩 Cria lista de setores
+            setores_finais = []
+            for i in range(k_inicial):
+                cluster_points = [p for p in pdvs if p.cluster_label == i]
+                if not cluster_points:
+                    continue
+
+                centro_lat, centro_lon = centers[i]
+                setor = Setor(
+                    cluster_label=i,
+                    centro_lat=centro_lat,
+                    centro_lon=centro_lon,
+                    n_pdvs=len(cluster_points),
+                    raio_med_km=0,
+                    raio_p95_km=0,
+                )
+                setores_finais.append(setor)
+                logger.debug(f"📍 Cluster {i}: {len(cluster_points)} PDVs | Centro=({centro_lat:.5f}, {centro_lon:.5f})")
+
+            # 💾 Persistência
+            mapping_cluster_id = salvar_setores(tenant_id, run_id, setores_finais)
+            label_to_id = {s.cluster_label: mapping_cluster_id.get(s.cluster_label) for s in setores_finais}
+
+            for p in pdvs:
+                if hasattr(p, "cluster_label") and p.cluster_label in label_to_id:
+                    p.cluster_id = label_to_id[p.cluster_label]
+
+            salvar_mapeamento_pdvs(tenant_id, run_id, pdvs)
+            logger.success(f"✅ Clusterização Radial Geo concluída | K={k_inicial} | run_id={run_id}")
+
+            return {
+                "clusterization_id": clusterization_id,
+                "run_id": run_id,
+                "k_final": k_inicial,
+                "n_pdvs": len(pdvs),
+                "diagnostico": (
+                    f"Radial Geo balanceado concluído com {k_inicial} clusters "
+                    f"(diferença máxima ±1 PDV por cluster)."
+                ),
+            }
+
+        # ============================================================
+        # 🧭 Novo modo: Radial Geo Contínuo (com conectividade espacial)
+        # ============================================================
+        elif algo == "radial_geo_continuous":
+            from src.sales_clusterization.domain.radial_geo_continuous import radial_geo_continuous
+            from src.sales_clusterization.domain.entities import Setor
+
+            logger.info("🌐 Modo Radial Geo Contínuo: priorizando continuidade espacial e equilíbrio.")
+            k_inicial = max(1, round(len(pdvs) / max_pdv_cluster))
+            logger.info(f"📊 Total {len(pdvs)} PDVs | alvo ≈ {max_pdv_cluster}/cluster → K inicial ≈ {k_inicial}")
+
+            labels, centers = radial_geo_continuous(
+                pdvs=pdvs,
+                k=k_inicial,
+                max_pdv_cluster=max_pdv_cluster,
+                tolerancia=2,
+                max_iter=10,
+            )
+
+            setores_finais = []
+            for i in range(k_inicial):
+                cluster_points = [p for p, lbl in zip(pdvs, labels) if lbl == i]
+                if not cluster_points:
+                    continue
+                centro_lat, centro_lon = centers[i]
+                setor = Setor(
+                    cluster_label=i,
+                    centro_lat=float(centro_lat),
+                    centro_lon=float(centro_lon),
+                    n_pdvs=len(cluster_points),
+                    raio_med_km=0,
+                    raio_p95_km=0,
+                )
+                setores_finais.append(setor)
+                logger.debug(f"📍 Cluster {i}: {len(cluster_points)} PDVs | Centro=({centro_lat:.5f}, {centro_lon:.5f})")
+
+            # Persistência
+            mapping_cluster_id = salvar_setores(tenant_id, run_id, setores_finais)
+            label_to_id = {s.cluster_label: mapping_cluster_id.get(s.cluster_label) for s in setores_finais}
+            for p, lbl in zip(pdvs, labels):
+                if hasattr(p, "cluster_label"):
+                    p.cluster_id = label_to_id.get(lbl)
+                    p.cluster_label = int(lbl)
+            salvar_mapeamento_pdvs(tenant_id, run_id, pdvs)
+
+            logger.success(f"✅ Clusterização Radial Geo Contínua concluída | K={k_inicial} | run_id={run_id}")
+
+            return {
+                "clusterization_id": clusterization_id,
+                "run_id": run_id,
+                "k_final": k_inicial,
+                "n_pdvs": len(pdvs),
+                "diagnostico": (
+                    f"Radial Geo Contínuo concluído com {k_inicial} clusters "
+                    f"({len(pdvs)} PDVs, diferença máxima ±2 PDVs)."
+                ),
+            }
+        
+        # ============================================================
+        # 🧭 Novo modo: Capacitated K-Means
+        # ============================================================
+        elif algo == "capacitated_kmeans":
+            from src.sales_clusterization.domain.capacitated_kmeans import capacitated_kmeans
+            from src.sales_clusterization.domain.entities import Setor
+            import numpy as np  # ✅ necessário para diagnóstico estatístico
+
+
+            logger.info("🚀 Modo Capacitated K-Means: balanceamento rápido com limite de PDVs por cluster.")
+            diag = {"refinamento_operacional": {}}  # ✅ evita erro se diag não existir
+
+            # ⚙️ Executa o algoritmo de clusterização
+            labels, centers = capacitated_kmeans(pdvs, max_capacity=max_pdv_cluster)
+
+            # 🧩 Criação dos objetos Setor
+            setores_finais = []
+            for i in range(len(centers)):
+                cluster_points = [p for p, lbl in zip(pdvs, labels) if lbl == i]
+                if not cluster_points:
+                    continue
+                centro_lat, centro_lon = centers[i]
+                setor = Setor(
+                    cluster_label=i,
+                    centro_lat=float(centro_lat),
+                    centro_lon=float(centro_lon),
+                    n_pdvs=len(cluster_points),
+                    raio_med_km=0,
+                    raio_p95_km=0,
+                )
+                setores_finais.append(setor)
+                logger.debug(f"📍 Cluster {i}: {len(cluster_points)} PDVs | Centro=({centro_lat:.5f}, {centro_lon:.5f})")
+
+            # 💾 Persistência dos resultados
+            mapping_cluster_id = salvar_setores(tenant_id, run_id, setores_finais)
+            label_to_id = {s.cluster_label: mapping_cluster_id.get(s.cluster_label) for s in setores_finais}
+
+            for p, lbl in zip(pdvs, labels):
+                if hasattr(p, "cluster_label"):
+                    p.cluster_label = int(lbl)
+                    p.cluster_id = label_to_id.get(lbl)
+
+            salvar_mapeamento_pdvs(tenant_id, run_id, pdvs)
+            logger.success(f"✅ Capacitated K-Means concluído | K={len(setores_finais)} | run_id={run_id}")
+
+            # 🧠 Diagnóstico simples
+            diag["refinamento_operacional"]["k_final"] = len(setores_finais)
+            diag["refinamento_operacional"]["media_pdv_cluster"] = round(
+                np.mean([s.n_pdvs for s in setores_finais]), 2
+            )
+            diag["refinamento_operacional"]["max_pdv_cluster"] = max([s.n_pdvs for s in setores_finais])
+            diag["refinamento_operacional"]["min_pdv_cluster"] = min([s.n_pdvs for s in setores_finais])
+
+        # ============================================================
+        # 🧭 Novo modo: Capacitated Sweep Clustering
+        # ============================================================
+        elif algo == "capacitated_sweep":
+            from src.sales_clusterization.domain.capacitated_sweep import capacitated_sweep
+            from src.sales_clusterization.domain.entities import Setor
+            import numpy as np
+
+            logger.info("🚀 Modo Capacitated Sweep: setorização contínua e linear com limite de PDVs por cluster.")
+            diag = {"refinamento_operacional": {}}
+
+            # ⚙️ Executa o algoritmo
+            labels, centers = capacitated_sweep(pdvs, max_capacity=max_pdv_cluster)
+
+            # 🧩 Criação dos objetos Setor
+            setores_finais = []
+            for i in range(len(centers)):
+                cluster_points = [p for p, lbl in zip(pdvs, labels) if lbl == i]
+                if not cluster_points:
+                    continue
+
+                centro_lat, centro_lon = centers[i]
+                setor = Setor(
+                    cluster_label=i,
+                    centro_lat=float(centro_lat),
+                    centro_lon=float(centro_lon),
+                    n_pdvs=len(cluster_points),
+                    raio_med_km=0,
+                    raio_p95_km=0,
+                )
+                setores_finais.append(setor)
+                logger.debug(
+                    f"📍 Cluster {i}: {len(cluster_points)} PDVs | Centro=({centro_lat:.5f}, {centro_lon:.5f})"
+                )
+
+            # 💾 Persistência dos resultados
+            mapping_cluster_id = salvar_setores(tenant_id, run_id, setores_finais)
+            label_to_id = {s.cluster_label: mapping_cluster_id.get(s.cluster_label) for s in setores_finais}
+
+            for p, lbl in zip(pdvs, labels):
+                if hasattr(p, "cluster_label"):
+                    p.cluster_label = int(lbl)
+                    p.cluster_id = label_to_id.get(lbl)
+
+            salvar_mapeamento_pdvs(tenant_id, run_id, pdvs)
+            logger.success(f"✅ Capacitated Sweep concluído | K={len(setores_finais)} | run_id={run_id}")
+
+            # 🧠 Diagnóstico simples
+            diag["refinamento_operacional"]["k_final"] = len(setores_finais)
+            diag["refinamento_operacional"]["media_pdv_cluster"] = round(
+                np.mean([s.n_pdvs for s in setores_finais]), 2
+            )
+            diag["refinamento_operacional"]["max_pdv_cluster"] = max([s.n_pdvs for s in setores_finais])
+            diag["refinamento_operacional"]["min_pdv_cluster"] = min([s.n_pdvs for s in setores_finais])
+
+
+        # 7️⃣ Persistência final (evita duplicação)
+        # Evita regravar clusters já persistidos em modos que fazem isso internamente
+        if algo not in ("capacitated_kmeans", "capacitated_sweep"):
+            mapping_cluster_id = salvar_setores(tenant_id, run_id, setores_finais)
+            label_to_id = {s.cluster_label: mapping_cluster_id.get(s.cluster_label) for s in setores_finais}
+            for p in pdvs:
+                if p.cluster_label in label_to_id:
+                    p.cluster_id = label_to_id[p.cluster_label]
+            salvar_mapeamento_pdvs(tenant_id, run_id, pdvs)
+
+        # ============================================================
+        # 🏁 Finalização do run
+        # ============================================================
+        k_final_exec = diag.get("refinamento_operacional", {}).get("k_final", len(setores_finais))
+        finalizar_run(run_id, k_final=k_final_exec, status="done")
+        logger.success(f"🏁 Clusterização concluída | run_id={run_id} | K={k_final_exec}")
+
+        return {
+            "tenant_id": tenant_id,
+            "clusterization_id": clusterization_id,
+            "run_id": run_id,
+            "algo": algo,
+            "k_final": k_final_exec,
+            "n_pdvs": len(pdvs),
+            "diagnostico": diag,
+            "outliers": total_outliers,
+            "setores": [
+                {
+                    "cluster_label": s.cluster_label,
+                    "centro_lat": s.centro_lat,
+                    "centro_lon": s.centro_lon,
+                    "n_pdvs": s.n_pdvs,
+                    "raio_med_km": s.raio_med_km,
+                    "raio_p95_km": s.raio_p95_km,
+                }
+                for s in setores_finais
+            ],
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Erro durante clusterização (run_id={run_id}): {e}")
+        finalizar_run(run_id, k_final=0, status="error", error=str(e))
+        raise
+
 
 
         # ============================================================
@@ -465,3 +861,5 @@ def executar_clusterizacao(
         logger.error(f"❌ Erro durante clusterização (run_id={run_id}): {e}")
         finalizar_run(run_id, k_final=0, status="error", error=str(e))
         raise
+    
+    
