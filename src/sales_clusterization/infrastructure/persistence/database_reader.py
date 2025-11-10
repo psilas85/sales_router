@@ -253,4 +253,33 @@ class DatabaseReader:
         cur.close()
         return rows
 
-    
+    # ============================================================
+    # 🔍 Busca coordenadas no cache de endereços
+    # ============================================================
+    def buscar_localizacao(self, endereco: str):
+        """
+        Busca coordenadas no cache (enderecos_cache) pelo campo 'endereco'.
+        Retorna (lat, lon) se encontrado, senão None.
+        """
+        if not endereco:
+            return None
+
+        try:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT lat, lon
+                FROM enderecos_cache
+                WHERE endereco = %s
+                LIMIT 1;
+            """, (endereco,))
+            row = cur.fetchone()
+            cur.close()
+
+            if row and row[0] is not None and row[1] is not None:
+                return row  # (lat, lon)
+            return None
+
+        except Exception as e:
+            import logging
+            logging.warning(f"⚠️ Erro ao consultar cache de endereços: {e}")
+            return None
