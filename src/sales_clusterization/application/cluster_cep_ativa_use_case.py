@@ -63,12 +63,43 @@ class ClusterCEPAtivaUseCase:
         df_centros = pd.read_csv(self.caminho_centros, sep=None, engine="python", encoding="utf-8")
         df_centros.columns = df_centros.columns.str.lower().str.strip()
 
+        # ============================================================
+        # 🔧 Normaliza e formata CNPJ para evitar notação científica
+        # ============================================================
+        if "CNPJ" in df_centros.columns or "cnpj" in df_centros.columns:
+            cnpj_col = "CNPJ" if "CNPJ" in df_centros.columns else "cnpj"
+
+            def normalizar_cnpj(valor):
+                """Converte e formata CNPJ em notação científica, float ou texto solto."""
+                try:
+                    s = str(valor).strip().replace(",", ".")
+                    # Trata notação científica (ex: 5.75E+13)
+                    if "E" in s.upper():
+                        s = "{:.0f}".format(float(s))
+                    # Extrai apenas dígitos
+                    s = "".join(filter(str.isdigit, s))
+                    # Garante 14 dígitos
+                    s = s.zfill(14)
+                    # Formata no padrão oficial
+                    if len(s) == 14:
+                        return f"{s[:2]}.{s[2:5]}.{s[5:8]}/{s[8:12]}-{s[12:]}"
+                    return s
+                except Exception:
+                    return str(valor).strip()
+
+            df_centros[cnpj_col] = df_centros[cnpj_col].apply(normalizar_cnpj)
+
+        # ============================================================
+        # 📋 Validação de colunas obrigatórias
+        # ============================================================
         colunas_requeridas = {"rua_numero", "bairro", "cidade", "uf"}
 
         if not colunas_requeridas.issubset(df_centros.columns):
             raise ValueError(f"❌ O CSV deve conter as colunas: {', '.join(colunas_requeridas)}")
 
-        # Monta endereço completo
+        # ============================================================
+        # 🏗️ Monta endereço completo para geocodificação
+        # ============================================================
         df_centros["endereco"] = (
             df_centros["rua_numero"].astype(str).str.strip() + ", "
             + df_centros["bairro"].astype(str).str.strip() + ", "
@@ -76,10 +107,10 @@ class ClusterCEPAtivaUseCase:
             + df_centros["uf"].astype(str).str.strip() + ", Brasil"
         )
 
-
         df_centros.dropna(subset=["endereco"], inplace=True)
         df_centros["cluster_id"] = range(len(df_centros))
         logger.info(f"🏗️ {len(df_centros)} endereços de centros carregados e formatados.")
+
 
         # ============================================================
         # 🧩 1.1 Inclui informações adicionais (nome e CNPJ se existirem)

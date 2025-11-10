@@ -70,12 +70,24 @@ def obter_bairro_por_coord(lat, lon):
 
 
 def formatar_cnpj(cnpj_raw: str) -> str:
-    """Formata CNPJ para 00.000.000/0000-00."""
+    """Formata CNPJ corretamente, mesmo se vier em float, notação científica ou com vírgula."""
     try:
-        cnpj = f"{int(cnpj_raw):014d}"
-        return f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
+        cnpj_str = str(cnpj_raw).strip().replace(",", ".")
+        # Se vier em notação científica (ex: 2.17E+13)
+        if "E" in cnpj_str.upper():
+            cnpj_str = "{:.0f}".format(float(cnpj_str))
+        # Extrai apenas dígitos
+        cnpj_digits = "".join(filter(str.isdigit, cnpj_str))
+        # Preenche com zeros à esquerda, se vier menor
+        if len(cnpj_digits) < 14:
+            cnpj_digits = cnpj_digits.zfill(14)
+        if len(cnpj_digits) == 14:
+            return f"{cnpj_digits[:2]}.{cnpj_digits[2:5]}.{cnpj_digits[5:8]}/{cnpj_digits[8:12]}-{cnpj_digits[12:]}"
+        return cnpj_digits
+
     except Exception:
         return str(cnpj_raw).strip()
+
 
 
 def exportar_resumo_clusters(tenant_id: int, clusterization_id: str):
@@ -132,7 +144,11 @@ def exportar_resumo_clusters(tenant_id: int, clusterization_id: str):
             df.at[i, "cluster_bairro"] = "Não identificado"
 
     # 🧾 formatações
-    df["centro_cnpj"] = df["centro_cnpj"].apply(formatar_cnpj)
+    df["centro_cnpj"] = (
+        df["centro_cnpj"]
+        .astype(str)
+        .apply(lambda x: formatar_cnpj(x))
+    )
     df["cluster_lat"] = df["cluster_lat"].map(lambda x: f"{x:.6f}".replace(".", ","))
     df["cluster_lon"] = df["cluster_lon"].map(lambda x: f"{x:.6f}".replace(".", ","))
 
