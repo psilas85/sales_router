@@ -435,6 +435,7 @@ class DatabaseWriter:
         """
         Insere resultado da clusterização de CEPs na tabela mkp_cluster_cep.
         Cada execução tem clusterization_id único (sem sobrescrever execuções anteriores).
+        Agora suporta o campo 'modo_clusterizacao' ('ativa' ou 'passiva').
         """
         if not lista_clusters:
             return 0
@@ -444,13 +445,15 @@ class DatabaseWriter:
 
         cur = self.conn.cursor()
 
+        # Adiciona campos opcionais no insert
         valores = [
             (
                 c["tenant_id"], c["input_id"], c["clusterization_id"], c["uf"], c["cep"],
-                c["cluster_id"], c["clientes_total"], c["clientes_target"],
-                c["lat"], c["lon"],               # 🆕 incluído
-                c["cluster_lat"], c["cluster_lon"],
-                c["distancia_km"], c["tempo_min"], c["is_outlier"]
+                c["cluster_id"], c.get("clientes_total", 0), c.get("clientes_target", 0),
+                c["lat"], c["lon"], c["cluster_lat"], c["cluster_lon"],
+                c["distancia_km"], c["tempo_min"], c["is_outlier"],
+                c.get("modo_clusterizacao", "passiva"),
+                c.get("centro_nome", ""), c.get("centro_cnpj", "")
             )
             for c in lista_clusters
         ]
@@ -459,22 +462,26 @@ class DatabaseWriter:
             INSERT INTO mkp_cluster_cep (
                 tenant_id, input_id, clusterization_id, uf, cep, cluster_id,
                 clientes_total, clientes_target,
-                lat, lon,                     -- 🆕 novas colunas
-                cluster_lat, cluster_lon,
-                distancia_km, tempo_min, is_outlier
+                lat, lon, cluster_lat, cluster_lon,
+                distancia_km, tempo_min, is_outlier,
+                modo_clusterizacao, centro_nome, centro_cnpj
             )
             VALUES %s
             ON CONFLICT (tenant_id, input_id, clusterization_id, cep) DO UPDATE SET
-                lat = EXCLUDED.lat,           
-                lon = EXCLUDED.lon,           
+                lat = EXCLUDED.lat,
+                lon = EXCLUDED.lon,
                 cluster_id = EXCLUDED.cluster_id,
                 cluster_lat = EXCLUDED.cluster_lat,
                 cluster_lon = EXCLUDED.cluster_lon,
                 distancia_km = EXCLUDED.distancia_km,
                 tempo_min = EXCLUDED.tempo_min,
                 is_outlier = EXCLUDED.is_outlier,
+                modo_clusterizacao = EXCLUDED.modo_clusterizacao,
+                centro_nome = EXCLUDED.centro_nome,
+                centro_cnpj = EXCLUDED.centro_cnpj,
                 atualizado_em = NOW();
         """
+
 
         try:
             logger.info(
@@ -504,5 +511,31 @@ class DatabaseWriter:
             cur.close()
             return 0
 
-    
+    # ============================================================
+    # 💾 Salva endereço no cache de geocodificação
+    # ============================================================
+    def salvar_cache(self, endereco: str, lat: float, lon: float, tipo: str = "geral"):
+        """
+        Insere ou atualiza endereço no cache (enderecos_cache).
+        Campo 'origem' armazena a fonte dos dados (ex: nominatim, google, etc.).
+        """
+        if not endereco or lat is None or lon is None:
+            return
 
+        try:
+            cur = self.conn.cursor()
+            cur.execute("""
+                INSERT INTO enderecos_cache (endereco, lat, lon, origem, criado_em, atualizado_em)
+                VALUES (%s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (endereco)
+                DO UPDATE SET
+                    lat = EXCLUDED.lat,
+                    lon = EXCLUDED.lon,
+                    origem = EXCLUDED.origem,
+                    atualizado_em = NOW();
+            """, (endereco, lat, lon, tipo))
+            self.conn.commit()
+            cur.close()
+        except Exception as e:
+            import logging
+            logging.warning(f"⚠️ Erro ao salvar cache de endereço: {e}")

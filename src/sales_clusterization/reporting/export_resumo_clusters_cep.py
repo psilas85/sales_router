@@ -12,19 +12,11 @@ from loguru import logger
 from database.db_connection import get_connection
 
 
-import os
-import requests
-from loguru import logger
-
 def obter_bairro_por_coord(lat, lon):
     """
     Obtém o bairro aproximado via Nominatim público com fallback no Google Maps.
     Retorna string com nome do bairro ou 'Não identificado'.
     """
-
-    # ========================
-    # 1️⃣ Nominatim público
-    # ========================
     try:
         NOMINATIM_URL = os.getenv("NOMINATIM_URL", "https://nominatim.openstreetmap.org")
         params = {"lat": lat, "lon": lon, "format": "json", "addressdetails": 1, "zoom": 16}
@@ -49,21 +41,15 @@ def obter_bairro_por_coord(lat, lon):
             if bairro:
                 logger.debug(f"🏙️ Bairro via Nominatim ({lat},{lon}) → {bairro}")
                 return bairro.strip()
-            else:
-                logger.warning(f"⚠️ Nominatim retornou sem bairro para ({lat},{lon})")
         else:
-            logger.warning(f"⚠️ Nominatim {resp.status_code} para ({lat},{lon}) | body={resp.text[:120]}")
-
+            logger.warning(f"⚠️ Nominatim {resp.status_code} para ({lat},{lon})")
     except Exception as e:
         logger.warning(f"⚠️ Erro Nominatim ({lat},{lon}): {e}")
 
-    # ========================
-    # 2️⃣ Fallback: Google
-    # ========================
+    # fallback Google
     try:
         GOOGLE_KEY = os.getenv("GMAPS_API_KEY")
         if not GOOGLE_KEY:
-            logger.error("❌ GMAPS_API_KEY não configurada. Configure no .env")
             return "Não identificado"
 
         google_url = (
@@ -71,24 +57,25 @@ def obter_bairro_por_coord(lat, lon):
             f"latlng={lat},{lon}&key={GOOGLE_KEY}&language=pt-BR"
         )
         g_resp = requests.get(google_url, timeout=10)
-
         if g_resp.status_code == 200:
             g_data = g_resp.json()
             if g_data.get("results"):
                 for comp in g_data["results"][0].get("address_components", []):
                     if "sublocality" in comp["types"] or "neighborhood" in comp["types"]:
-                        bairro = comp["long_name"].strip()
-                        logger.debug(f"🌐 Bairro via Google ({lat},{lon}) → {bairro}")
-                        return bairro
-            logger.warning(f"⚠️ Google não encontrou bairro para ({lat},{lon})")
-        else:
-            logger.warning(f"⚠️ Google {g_resp.status_code} para ({lat},{lon})")
-
+                        return comp["long_name"].strip()
+        return "Não identificado"
     except Exception as e:
         logger.warning(f"⚠️ Erro Google Geocoding ({lat},{lon}): {e}")
+        return "Não identificado"
 
-    return "Não identificado"
 
+def formatar_cnpj(cnpj_raw: str) -> str:
+    """Formata CNPJ para 00.000.000/0000-00."""
+    try:
+        cnpj = f"{int(cnpj_raw):014d}"
+        return f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
+    except Exception:
+        return str(cnpj_raw).strip()
 
 
 def exportar_resumo_clusters(tenant_id: int, clusterization_id: str):
@@ -100,6 +87,8 @@ def exportar_resumo_clusters(tenant_id: int, clusterization_id: str):
             tenant_id,
             clusterization_id,
             cluster_id,
+            MIN(centro_nome) AS centro_nome,
+            MIN(centro_cnpj) AS centro_cnpj,
             MIN(cluster_bairro) AS cluster_bairro,
             ROUND(AVG(cluster_lat)::numeric, 6) AS cluster_lat,
             ROUND(AVG(cluster_lon)::numeric, 6) AS cluster_lon,
@@ -131,25 +120,22 @@ def exportar_resumo_clusters(tenant_id: int, clusterization_id: str):
         try:
             lat, lon = float(row["cluster_lat"]), float(row["cluster_lon"])
             chave = f"{lat:.6f},{lon:.6f}"
-
             if pd.isna(row["cluster_bairro"]) or not str(row["cluster_bairro"]).strip():
                 if chave in bairros_cache:
                     bairro = bairros_cache[chave]
                 else:
                     bairro = obter_bairro_por_coord(lat, lon)
                     bairros_cache[chave] = bairro
-
                 df.at[i, "cluster_bairro"] = bairro or "Não identificado"
-
         except Exception as e:
             logger.warning(f"⚠️ Falha ao processar linha {i}: {e}")
             df.at[i, "cluster_bairro"] = "Não identificado"
 
-    # formata latitude e longitude para CSV (com vírgula)
+    # 🧾 formatações
+    df["centro_cnpj"] = df["centro_cnpj"].apply(formatar_cnpj)
     df["cluster_lat"] = df["cluster_lat"].map(lambda x: f"{x:.6f}".replace(".", ","))
     df["cluster_lon"] = df["cluster_lon"].map(lambda x: f"{x:.6f}".replace(".", ","))
 
-    # conversão segura de numéricos
     numeric_cols = [
         "qtd_ceps", "clientes_total", "clientes_target",
         "distancia_media_km", "tempo_medio_min",
@@ -159,7 +145,11 @@ def exportar_resumo_clusters(tenant_id: int, clusterization_id: str):
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     logger.info("📋 Prévia dos clusters exportados:")
-    logger.info(df[["cluster_id", "cluster_bairro", "cluster_lat", "cluster_lon"]].head(10).to_string(index=False))
+    logger.info(
+        df[["cluster_id", "centro_nome", "centro_cnpj", "cluster_bairro", "cluster_lat", "cluster_lon"]]
+        .head(10)
+        .to_string(index=False)
+    )
 
     output_dir = os.path.join("output", "reports", str(tenant_id))
     os.makedirs(output_dir, exist_ok=True)
