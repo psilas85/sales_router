@@ -92,8 +92,24 @@ def formatar_cnpj(cnpj_raw: str) -> str:
 
 def exportar_resumo_clusters(tenant_id: int, clusterization_id: str):
     """
-    Exporta resumo por cluster (clientes, CEPs, distâncias, tempos e bairro central)
+    Exporta resumo por cluster (clientes, CEPs, distâncias, tempos e bairro central).
+    Detecta automaticamente o modo de clusterização (ativa/passiva)
+    e atualiza o banco quando novos bairros são obtidos via API.
     """
+    # Detecta modo
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT DISTINCT modo_clusterizacao
+        FROM mkp_cluster_cep
+        WHERE tenant_id=%s AND clusterization_id=%s;
+    """, (tenant_id, clusterization_id))
+    modo_clusterizacao = cur.fetchone()
+    modo_clusterizacao = (modo_clusterizacao[0] if modo_clusterizacao else "passiva").lower()
+    conn.close()
+    logger.info(f"⚙️ Modo detectado: {modo_clusterizacao}")
+
+    # Carrega resumo base
     sql = """
         SELECT 
             tenant_id,
@@ -125,30 +141,40 @@ def exportar_resumo_clusters(tenant_id: int, clusterization_id: str):
         logger.warning(f"⚠️ Nenhum resumo encontrado para clusterization_id={clusterization_id}")
         return None
 
-    logger.info("🌍 Obtendo bairros de cada centro de cluster via reverse geocoding...")
     bairros_cache = {}
+    conn_update = get_connection()
 
-    for i, row in df.iterrows():
-        try:
+    # Só faz reverse geocoding se for clusterização passiva
+    if modo_clusterizacao == "passiva":
+        logger.info("🌍 Obtendo bairros via reverse geocoding (modo passivo)...")
+        for i, row in df.iterrows():
             lat, lon = float(row["cluster_lat"]), float(row["cluster_lon"])
             chave = f"{lat:.6f},{lon:.6f}"
-            if pd.isna(row["cluster_bairro"]) or not str(row["cluster_bairro"]).strip():
-                if chave in bairros_cache:
-                    bairro = bairros_cache[chave]
-                else:
-                    bairro = obter_bairro_por_coord(lat, lon)
-                    bairros_cache[chave] = bairro
-                df.at[i, "cluster_bairro"] = bairro or "Não identificado"
-        except Exception as e:
-            logger.warning(f"⚠️ Falha ao processar linha {i}: {e}")
-            df.at[i, "cluster_bairro"] = "Não identificado"
+            bairro_atual = str(row.get("cluster_bairro") or "").strip()
 
-    # 🧾 formatações
-    df["centro_cnpj"] = (
-        df["centro_cnpj"]
-        .astype(str)
-        .apply(lambda x: formatar_cnpj(x))
-    )
+            if not bairro_atual:
+                bairro = bairros_cache.get(chave) or obter_bairro_por_coord(lat, lon)
+                bairros_cache[chave] = bairro
+                df.at[i, "cluster_bairro"] = bairro or "Não identificado"
+
+                try:
+                    with conn_update.cursor() as cur:
+                        cur.execute("""
+                            UPDATE mkp_cluster_cep
+                            SET cluster_bairro = %s
+                            WHERE tenant_id = %s AND clusterization_id = %s
+                              AND cluster_id = %s
+                              AND (cluster_bairro IS NULL OR cluster_bairro = '');
+                        """, (bairro, tenant_id, clusterization_id, row["cluster_id"]))
+                    conn_update.commit()
+                    logger.debug(f"💾 Bairro '{bairro}' salvo no cluster {row['cluster_id']}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Falha ao atualizar banco: {e}")
+
+    conn_update.close()
+
+    # Formatações
+    df["centro_cnpj"] = df["centro_cnpj"].astype(str).apply(lambda x: formatar_cnpj(x))
     df["cluster_lat"] = df["cluster_lat"].map(lambda x: f"{x:.6f}".replace(".", ","))
     df["cluster_lon"] = df["cluster_lon"].map(lambda x: f"{x:.6f}".replace(".", ","))
 
@@ -160,13 +186,6 @@ def exportar_resumo_clusters(tenant_id: int, clusterization_id: str):
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    logger.info("📋 Prévia dos clusters exportados:")
-    logger.info(
-        df[["cluster_id", "centro_nome", "centro_cnpj", "cluster_bairro", "cluster_lat", "cluster_lon"]]
-        .head(10)
-        .to_string(index=False)
-    )
-
     output_dir = os.path.join("output", "reports", str(tenant_id))
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, f"mkp_resumo_clusters_{clusterization_id}.csv")
@@ -174,6 +193,7 @@ def exportar_resumo_clusters(tenant_id: int, clusterization_id: str):
     df.to_csv(output_path, index=False, sep=";", encoding="utf-8-sig", float_format="%.2f")
     logger.success(f"✅ Resumo de clusters exportado para {output_path}")
     return output_path
+
 
 
 if __name__ == "__main__":

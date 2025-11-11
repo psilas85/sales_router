@@ -453,7 +453,8 @@ class DatabaseWriter:
                 c["lat"], c["lon"], c["cluster_lat"], c["cluster_lon"],
                 c["distancia_km"], c["tempo_min"], c["is_outlier"],
                 c.get("modo_clusterizacao", "passiva"),
-                c.get("centro_nome", ""), c.get("centro_cnpj", "")
+                c.get("centro_nome", ""), c.get("centro_cnpj", ""),
+                c.get("cluster_bairro", "") 
             )
             for c in lista_clusters
         ]
@@ -464,7 +465,7 @@ class DatabaseWriter:
                 clientes_total, clientes_target,
                 lat, lon, cluster_lat, cluster_lon,
                 distancia_km, tempo_min, is_outlier,
-                modo_clusterizacao, centro_nome, centro_cnpj
+                modo_clusterizacao, centro_nome, centro_cnpj, cluster_bairro
             )
             VALUES %s
             ON CONFLICT (tenant_id, input_id, clusterization_id, cep) DO UPDATE SET
@@ -479,8 +480,10 @@ class DatabaseWriter:
                 modo_clusterizacao = EXCLUDED.modo_clusterizacao,
                 centro_nome = EXCLUDED.centro_nome,
                 centro_cnpj = EXCLUDED.centro_cnpj,
+                cluster_bairro = EXCLUDED.cluster_bairro,
                 atualizado_em = NOW();
         """
+
 
 
         try:
