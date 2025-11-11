@@ -54,3 +54,16 @@ docker exec -it sales_clusterization python3 -m src.sales_clusterization.reporti
 docker exec -it sales_clusterization python3 -m src.sales_clusterization.reporting.export_cluster_pdv_detalhado_xlsx \
     --tenant_id 1 \
     --clusterization_id 9ef6a8c1-32d4-465e-a123-ca71f092cd1a
+
+docker exec -it sales_clusterization python3 -m src.sales_clusterization.cli.run_cluster_cep_ativa   --tenant 1   --uf SP   --input_id ca582dad-3782-4a89-bb49-0dda00449d8f   --descricao "Clusterização ativa SP - teste inicial"   --velocidade_media 40   --tempo_max_min 15   --centros_csv data/centros_enderecos.csv
+
+docker exec -it sales_clusterization bash -c "python3 -m src.sales_clusterization.visualization.mkp_cluster_plotting \
+    --tenant_id 1 \
+    --clusterization_id 7f3fea67-baed-4663-b6d2-08918c1564fb \
+    --modo_interativo
+"
+
+docker exec -it sales_clusterization bash -c "python3 -m src.sales_clusterization.reporting.export_resumo_clusters_cep \
+    --tenant_id 1 \
+    --clusterization_id 1d4ddf90-4a58-4725-8a4a-3b020c7090b8
+"

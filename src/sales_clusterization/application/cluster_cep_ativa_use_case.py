@@ -123,9 +123,6 @@ class ClusterCEPAtivaUseCase:
         )
 
 
-
-
-
         # ============================================================
         # 🌍 2. Geocodifica centros (com logs detalhados)
         # ============================================================
@@ -174,6 +171,21 @@ class ClusterCEPAtivaUseCase:
         df_centros = df_centros.dropna(subset=["lat", "lon"]).reset_index(drop=True)
 
         logger.success(f"✅ Geocodificação de centros concluída: {len(df_centros)} válidos / {total_centros} totais.")
+
+        # ============================================================
+        # 🏙️ 2.1 Obtém bairro para cada centro (preferencialmente do CSV)
+        # ============================================================
+        bairros = []
+        for i, row in df_centros.iterrows():
+            bairro = str(row.get("bairro") or "").strip()
+            if not bairro and pd.notna(row.get("lat")) and pd.notna(row.get("lon")):
+                try:
+                    info_rev = self.geo_service.reverse_geocode(row["lat"], row["lon"])
+                    bairro = info_rev.get("bairro", "")
+                except Exception:
+                    bairro = ""
+            bairros.append(bairro)
+        df_centros["cluster_bairro"] = bairros
 
 
         # ============================================================
@@ -252,6 +264,19 @@ class ClusterCEPAtivaUseCase:
         )
 
         # ============================================================
+        # 🏙️ 5.1 Inclui bairro do centro no DataFrame de CEPs
+        # ============================================================
+        if "cluster_bairro" in df_centros.columns:
+            df_ceps = df_ceps.merge(
+                df_centros[["cluster_id", "cluster_bairro"]],
+                on="cluster_id",
+                how="left"
+            )
+        else:
+            df_ceps["cluster_bairro"] = ""
+
+
+        # ============================================================
         # 💾 6. Persiste resultados
         # ============================================================
         lista_clusters = []
@@ -266,6 +291,7 @@ class ClusterCEPAtivaUseCase:
                     "cluster_id": int(row["cluster_id"]),
                     "centro_nome": str(row.get("centro_nome", "")),
                     "centro_cnpj": str(row.get("centro_cnpj", "")),
+                    "cluster_bairro": str(row.get("cluster_bairro", "")),  # 🆕 adiciona bairro do centro
                     "clientes_total": int(row["clientes_total"] or 0),
                     "clientes_target": int(row["clientes_target"] or 0),
                     "lat": float(row["lat"]),
@@ -276,6 +302,7 @@ class ClusterCEPAtivaUseCase:
                     "tempo_min": float(row["tempo_min"]),
                     "is_outlier": bool(row["is_outlier"]),
                     "modo_clusterizacao": "ativa",
+                    "cluster_bairro": str(row.get("cluster_bairro", "")),
                 }
             )
 
