@@ -5,9 +5,10 @@
 import os
 import time
 import requests
-import logging
+from loguru import logger
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from random import uniform
+from typing import Optional, Tuple, Dict, List
 from pdv_preprocessing.infrastructure.database_reader import DatabaseReader
 from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
 
@@ -29,7 +30,8 @@ class GeolocationService:
         self.timeout = 5
         self.max_workers = max_workers
 
-        self.cache_mem = {}
+        # Cache e estatísticas de execução
+        self.cache_mem: Dict[str, Tuple[float, float]] = {}
         self.stats = {
             "cache_mem": 0,
             "cache_db": 0,
@@ -42,7 +44,8 @@ class GeolocationService:
     # ============================================================
     # 🧭 Coordenadas genéricas conhecidas (para descartar)
     # ============================================================
-    def _is_generic_location(self, lat: float, lon: float) -> bool:
+    @staticmethod
+    def _is_generic_location(lat: float, lon: float) -> bool:
         if lat is None or lon is None:
             return True
         pontos_genericos = [
@@ -57,40 +60,44 @@ class GeolocationService:
         return False
 
     # ============================================================
-    # 🌍 Busca coordenadas com fallback inteligente (auto-switch)
+    # 🌍 Busca coordenadas com fallback inteligente
     # ============================================================
-    def buscar_coordenadas(self, endereco: str | None, cep: str | None = None) -> tuple[float, float, str]:
+    def buscar_coordenadas(self, endereco: Optional[str], cep: Optional[str] = None) -> Tuple[Optional[float], Optional[float], str]:
         if not endereco and not cep:
-            logging.warning("⚠️ Chamada de geocodificação com parâmetros vazios.")
+            logger.warning("⚠️ Chamada de geocodificação com parâmetros vazios.")
             return None, None, "parametro_vazio"
 
         query = (cep or endereco).strip().lower()
         self.stats["total"] += 1
 
+        # ============================================================
         # 1️⃣ Cache em memória
+        # ============================================================
         if query in self.cache_mem:
-            self.stats["cache_mem"] += 1
             lat, lon = self.cache_mem[query]
-            logging.debug(f"📦 [CACHE_MEM] {query} → ({lat}, {lon})")
+            self.stats["cache_mem"] += 1
+            logger.debug(f"📦 [CACHE_MEM] {query} → ({lat}, {lon})")
             return lat, lon, "cache_mem"
 
+        # ============================================================
         # 2️⃣ Cache no banco
-        cache_db = self.reader.buscar_localizacao(endereco) if endereco else self.reader.buscar_localizacao_mkp(cep)
-        if cache_db:
-            lat, lon = cache_db
-            self.stats["cache_db"] += 1
-            self.cache_mem[query] = (lat, lon)
-            logging.debug(f"🗄️ [CACHE_DB] {query} → ({lat}, {lon})")
-            return lat, lon, "cache_db"
+        # ============================================================
+        try:
+            cache_db = self.reader.buscar_localizacao(endereco) if endereco else self.reader.buscar_localizacao_mkp(cep)
+            if cache_db:
+                lat, lon = cache_db
+                self.stats["cache_db"] += 1
+                self.cache_mem[query] = (lat, lon)
+                logger.debug(f"🗄️ [CACHE_DB] {query} → ({lat}, {lon})")
+                return lat, lon, "cache_db"
+        except Exception as e:
+            logger.warning(f"⚠️ Erro ao consultar cache DB: {e}")
 
         # ============================================================
-        # 🚦 Controle adaptativo (modo degradado temporário)
+        # 🚦 Modo Google temporário (se limite Nominatim excedido)
         # ============================================================
         now = time.time()
-        if getattr(self, "_modo_google_ativo_ate", 0) > now:
-            modo_google_ativo = True
-        else:
-            modo_google_ativo = False
+        modo_google_ativo = getattr(self, "_modo_google_ativo_ate", 0) > now
 
         # ============================================================
         # 3️⃣ Nominatim público (modo normal)
@@ -98,6 +105,7 @@ class GeolocationService:
         if not modo_google_ativo:
             headers = {"User-Agent": "SalesRouter-Geocoder/1.0"}
             url_pub = f"{self.NOMINATIM_PUBLIC}?q={query}+Brasil&countrycodes=br&format=json"
+
             for tent in range(3):
                 try:
                     r = requests.get(url_pub, headers=headers, timeout=self.timeout)
@@ -109,27 +117,26 @@ class GeolocationService:
                                 self.stats["nominatim_public"] += 1
                                 self.cache_mem[query] = (lat, lon)
                                 self.writer.salvar_cache(endereco or cep, lat, lon, tipo="mkp" if cep else "pdv")
-                                logging.info(f"🌍 [NOMINATIM] {query} → ({lat}, {lon})")
+                                logger.debug(f"🌍 [NOMINATIM] {query} → ({lat}, {lon})")
                                 return lat, lon, "nominatim_public"
                             else:
-                                logging.warning(f"⚠️ Coordenada genérica descartada para '{query}' → ({lat}, {lon})")
+                                logger.warning(f"⚠️ Coordenada genérica descartada: {query} → ({lat}, {lon})")
+
                     elif r.status_code == 429:
-                        # Too Many Requests → ativa fallback Google temporário
-                        logging.warning("🚦 Nominatim atingiu limite → mudando para modo Google por 2 minutos.")
+                        logger.warning("🚦 Nominatim atingiu limite → mudando para modo Google (2 min).")
                         self._modo_google_ativo_ate = now + 120
                         modo_google_ativo = True
                         break
                 except Exception as e:
-                    logging.warning(f"⚠️ Tentativa {tent+1}/3 falhou no Nominatim → {e}")
+                    logger.warning(f"⚠️ Tentativa {tent+1}/3 falhou no Nominatim → {e}")
                     if "Network is unreachable" in str(e) or "Max retries" in str(e):
-                        # Ativa modo Google temporário por 2 minutos
                         self._modo_google_ativo_ate = now + 120
                         modo_google_ativo = True
                         break
                 time.sleep(0.8 * (2 ** tent) + uniform(0, 0.3))
 
         # ============================================================
-        # 4️⃣ Google Maps fallback (ou modo degradado ativo)
+        # 4️⃣ Google Maps fallback
         # ============================================================
         if modo_google_ativo and self.GOOGLE_KEY:
             from urllib.parse import quote
@@ -148,37 +155,35 @@ class GeolocationService:
                             self.stats["google"] += 1
                             self.cache_mem[query] = (lat, lon)
                             self.writer.salvar_cache(endereco or cep, lat, lon, tipo="mkp" if cep else "pdv")
-                            logging.info(f"🗺️ [GOOGLE] {query} → ({lat}, {lon})")
+                            logger.debug(f"🗺️ [GOOGLE] {query} → ({lat}, {lon})")
                             return lat, lon, "google"
             except Exception as e:
-                logging.warning(f"⚠️ Falha no Google Maps → {e}")
+                logger.warning(f"⚠️ Falha no Google Maps → {e}")
 
+        # ============================================================
         # ❌ Nenhum resultado
+        # ============================================================
         self.stats["falha"] += 1
-        logging.warning(f"💀 Nenhuma coordenada encontrada para '{query}' após 3 tentativas.")
+        logger.warning(f"💀 Nenhuma coordenada encontrada para '{query}' após 3 tentativas.")
         return None, None, "falha"
 
-
     # ============================================================
-    # ⚡ Geocodificação em lote (threads com controle adaptativo)
+    # ⚡ Geocodificação em lote (multithread + adaptativa)
     # ============================================================
-    def geocodificar_em_lote(self, entradas: list[str], tipo: str = "PDV") -> dict[str, tuple[float, float, str]]:
+    def geocodificar_em_lote(self, entradas: List[str], tipo: str = "PDV") -> Dict[str, Tuple[float, float, str]]:
         if not entradas:
             return {}
 
         total = len(entradas)
-        # número de threads cresce até o limite máximo, com base no volume
         max_workers = min(self.max_workers, 10 if total < 1000 else 25 if total < 3000 else 40)
         inicio_total = time.time()
         resultados = {}
 
-        logging.info(f"🚀 Geocodificação em lote ({tipo}) iniciada: {total} registros | {max_workers} threads")
+        logger.info(f"🚀 Geocodificação em lote ({tipo}) iniciada: {total} registros | {max_workers} threads")
 
-        # Pequena espera entre disparos para evitar banimento do Nominatim público
         def _worker(e):
-            # delay aleatório de 0.05–0.2s para distribuir carga entre threads
-            time.sleep(uniform(0.05, 0.2))
-            return self.buscar_coordenadas(e if tipo == 'PDV' else None, e if tipo == 'MKP' else None)
+            time.sleep(uniform(0.05, 0.2))  # Distribui carga
+            return self.buscar_coordenadas(e if tipo == "PDV" else None, e if tipo == "MKP" else None)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futuros = {executor.submit(_worker, e): e for e in entradas}
@@ -190,44 +195,39 @@ class GeolocationService:
                     if coords:
                         resultados[chave] = coords
                 except Exception as e:
-                    logging.warning(f"⚠️ Erro geocodificando {chave}: {e}")
+                    logger.warning(f"⚠️ Erro geocodificando {chave}: {e}")
 
-                # logs intermediários
                 if i % 200 == 0 or i == total:
                     resolvidos = len(resultados)
                     falhas = self.stats["falha"]
-                    logging.info(
+                    logger.info(
                         f"🧩 Progresso: {i}/{total} ({100 * i / total:.1f}%) "
                         f"→ {resolvidos} resolvidos | {falhas} falhas"
                     )
-
-                    # throttling adaptativo — se falhas >=10%, reduz velocidade
                     if falhas / max(1, i) > 0.1:
-                        logging.warning("⚠️ Muitas falhas recentes — aplicando pausa preventiva (3s)...")
+                        logger.warning("⚠️ Muitas falhas recentes — aplicando pausa preventiva (3s)...")
                         time.sleep(3)
 
         dur = time.time() - inicio_total
         taxa_ok = (len(resultados) / total * 100) if total else 0
-        logging.info(
+        logger.info(
             f"✅ Concluído: {len(resultados)}/{total} resolvidos ({taxa_ok:.1f}%) em {dur:.1f}s "
-            f"→ média {dur/total:.2f}s/reg"
+            f"→ média {dur / total:.2f}s/reg"
         )
         return resultados
-
 
     # ============================================================
     # 📊 Resumo de logs
     # ============================================================
     def exibir_resumo_logs(self):
         total = self.stats["total"]
-        logging.info("📊 Resumo de Geolocalização:")
+        logger.info("📊 Resumo de Geolocalização:")
         for origem, count in self.stats.items():
             if origem != "total":
                 pct = (count / total * 100) if total else 0
-                logging.info(f"   {origem:<18}: {count:>6} ({pct:5.1f}%)")
-        logging.info(f"   total               : {total:>6}")
+                logger.info(f"   {origem:<18}: {count:>6} ({pct:5.1f}%)")
+        logger.info(f"   total               : {total:>6}")
 
         sucesso = total - self.stats["falha"]
         taxa = (sucesso / total * 100) if total else 0
-        logging.info(f"✅ Taxa de sucesso: {sucesso}/{total} ({taxa:.1f}%)")
-
+        logger.info(f"✅ Taxa de sucesso: {sucesso}/{total} ({taxa:.1f}%)")

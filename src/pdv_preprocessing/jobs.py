@@ -1,17 +1,18 @@
-#sales_router/src/pdv_preprocessing/jobs.py
+# ============================================================
+# 📦 src/pdv_preprocessing/jobs.py (versão aprimorada)
+# ============================================================
 
 import logging
 import subprocess
 import json
 from datetime import datetime
 from rq import get_current_job
-from database.db_connection import get_connection  # ✅ usa o core global
+from database.db_connection import get_connection_context
 
 logger = logging.getLogger(__name__)
 
-
 # ============================================================
-# 🧾 Função auxiliar: salvar histórico no banco
+# 🧾 Função auxiliar: salvar histórico com segurança
 # ============================================================
 def salvar_historico(
     tenant_id,
@@ -27,32 +28,29 @@ def salvar_historico(
 ):
     """Grava o histórico do processamento vinculado ao input_id."""
     try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO historico_pdv_jobs
-            (tenant_id, input_id, descricao, arquivo, status, total_processados, validos,
-             invalidos, arquivo_invalidos, mensagem, criado_em)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                tenant_id,
-                input_id,
-                descricao,
-                arquivo,
-                status,
-                total,
-                validos,
-                invalidos,
-                arquivo_invalidos,
-                mensagem,
-                datetime.utcnow(),
-            ),
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+        with get_connection_context() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO historico_pdv_jobs
+                    (tenant_id, input_id, descricao, arquivo, status, total_processados, validos,
+                     invalidos, arquivo_invalidos, mensagem, criado_em)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        tenant_id,
+                        input_id,
+                        descricao,
+                        arquivo,
+                        status,
+                        total,
+                        validos,
+                        invalidos,
+                        arquivo_invalidos,
+                        mensagem,
+                        datetime.utcnow(),
+                    ),
+                )
         logger.info(f"💾 Histórico gravado (input_id={input_id})")
     except Exception as e:
         logger.error(f"❌ Erro ao salvar histórico no banco: {e}", exc_info=True)
@@ -62,10 +60,7 @@ def salvar_historico(
 # 🚀 Função principal: processar CSV via subprocesso
 # ============================================================
 def processar_csv(tenant_id, file_path, descricao):
-    """
-    Executa o pré-processamento de PDVs chamando o script principal em subprocesso.
-    Gera automaticamente um input_id (UUID) e grava o histórico no banco.
-    """
+    """Executa o pré-processamento de PDVs chamando o script principal em subprocesso."""
     job = get_current_job()
     job_id = job.id if job else "local"
     logger.info(f"🚀 Iniciando job {job_id} para tenant {tenant_id}")
@@ -83,14 +78,11 @@ def processar_csv(tenant_id, file_path, descricao):
             descricao,
         ]
 
-        job.meta["step"] = "Iniciando processamento"
-        job.meta["progress"] = 0
-        job.save_meta()
+        if job:
+            job.meta.update({"step": "Iniciando processamento", "progress": 0})
+            job.save_meta()
 
         logger.info(f"▶️ Executando comando: {' '.join(comando)}")
-        job.meta["step"] = "Executando pipeline"
-        job.meta["progress"] = 25
-        job.save_meta()
 
         process = subprocess.Popen(
             comando,
@@ -101,54 +93,38 @@ def processar_csv(tenant_id, file_path, descricao):
             errors="ignore",
         )
 
-        stdout_lines = []
-        for line in iter(process.stdout.readline, ""):
-            line = line.strip()
-            if line:
-                logger.info(f"[{job_id}] {line}")
-                stdout_lines.append(line)
+        try:
+            stdout, _ = process.communicate(timeout=3600)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            raise TimeoutError("⏱️ Tempo limite excedido (1h) no pré-processamento de PDVs")
 
-        process.wait()
         if process.returncode != 0:
-            raise Exception("\n".join(stdout_lines))
+            raise RuntimeError(f"❌ Processo retornou código {process.returncode}:\n{stdout}")
 
         resumo = {}
-        for line in stdout_lines:
-            if line.startswith("{") and line.endswith("}"):
-                try:
-                    resumo = json.loads(line)
+        for line in stdout.splitlines():
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict) and "status" in obj:
+                    resumo = obj
                     break
-                except Exception:
-                    continue
+            except json.JSONDecodeError:
+                continue
 
         input_id = resumo.get("input_id")
+        status = resumo.get("status", "done")
         validos = resumo.get("validos", 0)
         invalidos = resumo.get("invalidos", 0)
-        total_processados = resumo.get("total_processados", validos + invalidos)
+        total = resumo.get("total_processados", validos + invalidos)
         arquivo_invalidos = resumo.get("arquivo_invalidos")
         arquivo_nome = resumo.get("arquivo")
-        status = resumo.get("status", "done")
 
-        logger.info(
-            f"✅ Job {job_id} concluído (input_id={input_id}) → {validos} válidos / {invalidos} inválidos"
-        )
+        logger.info(f"✅ Job {job_id} concluído: {validos} válidos / {invalidos} inválidos")
 
-        job.meta["step"] = "Finalizado"
-        job.meta["progress"] = 100
-        job.save_meta()
-
-        salvar_historico(
-            tenant_id,
-            input_id,
-            descricao,
-            status,
-            arquivo_nome,
-            total_processados,
-            validos,
-            invalidos,
-            arquivo_invalidos,
-            "✅ Pré-processamento concluído com sucesso",
-        )
+        if job:
+            job.meta.update({"step": "Finalizado", "progress": 100})
+            job.save_meta()
 
         return {
             "status": status,
@@ -157,27 +133,22 @@ def processar_csv(tenant_id, file_path, descricao):
             "input_id": input_id,
             "descricao": descricao,
             "arquivo": arquivo_nome,
-            "total_processados": total_processados,
+            "total_processados": total,
             "validos": validos,
             "invalidos": invalidos,
             "arquivo_invalidos": arquivo_invalidos,
         }
 
     except Exception as e:
-        logger.error(f"❌ Erro no job {job_id}: {e}", exc_info=True)
-        job.meta["step"] = "Erro"
-        job.meta["progress"] = 100
-        job.save_meta()
+        logger.error(f"💥 Erro no job {job_id}: {e}", exc_info=True)
+        if job:
+            job.meta.update({"step": "Erro", "progress": 100})
+            job.save_meta()
 
-        # tenta capturar input_id se já tiver sido gerado
-        try:
-            input_id = resumo.get("input_id", None)
-        except Exception:
-            input_id = None
-
+        # fallback de histórico
         salvar_historico(
             tenant_id,
-            input_id,
+            resumo.get("input_id") if "resumo" in locals() else None,
             descricao,
             "error",
             file_path.split("/")[-1],
@@ -192,7 +163,6 @@ def processar_csv(tenant_id, file_path, descricao):
             "status": "error",
             "job_id": job_id,
             "tenant_id": tenant_id,
-            "input_id": input_id,
             "descricao": descricao,
             "error": str(e),
         }

@@ -1,26 +1,22 @@
-# sales_router/src/authentication/Dockerfile.authentication
+# ============================
+# 🚀 Dockerfile.authentication (SalesRouter Auth Service)
+# ============================
 
-# =========================
-# 1. Imagem base (leve e estável)
-# =========================
+# 1️⃣ Imagem base leve e estável
 FROM python:3.11-slim-bullseye
 
-# =========================
-# 2. Diretório de trabalho
-# =========================
+# 2️⃣ Diretório de trabalho
 WORKDIR /app/authentication
 
-# =========================
-# 3. Variáveis de ambiente
-# =========================
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
-ENV TZ=America/Sao_Paulo
+# 3️⃣ Variáveis de ambiente principais
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    TZ=America/Sao_Paulo \
+    ENV=production \
+    LOGURU_LEVEL=INFO
 
-# =========================
-# 4. Dependências do sistema
-# =========================
+# 4️⃣ Dependências do sistema
 RUN apt-get update && apt-get install -y \
     build-essential \
     libpq-dev \
@@ -28,23 +24,24 @@ RUN apt-get update && apt-get install -y \
     tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-# =========================
-# 5. Copiar e instalar dependências Python
-# =========================
-COPY ./requirements.txt /app/
+# 5️⃣ Copia e instala dependências Python
+COPY ./requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Garante libs críticas para autenticação
-RUN pip install --no-cache-dir bcrypt PyJWT fastapi uvicorn psycopg2-binary
+# 6️⃣ Instala libs críticas específicas de autenticação
+RUN pip install --no-cache-dir fastapi uvicorn bcrypt PyJWT psycopg2-binary loguru==0.7.2
 
-# =========================
-# 6. Copiar módulos da aplicação
-# =========================
+# 7️⃣ Copia módulos da aplicação
 COPY ./src/authentication /app/authentication
 COPY ./src/database /app/database
 
-# =========================
-# 7. Expor porta e comando inicial
-# =========================
+# 8️⃣ Porta padrão e startup
 EXPOSE 8000
+
+# 9️⃣ Log básico e inicialização
+RUN python --version && \
+    echo "🔐 Auth Service pronto. Dependências principais:" && \
+    pip list | grep -E "fastapi|bcrypt|PyJWT|psycopg2|loguru"
+
+# 🔟 Comando principal
 CMD ["uvicorn", "authentication.api.authentication_api:app", "--host", "0.0.0.0", "--port", "8000"]
