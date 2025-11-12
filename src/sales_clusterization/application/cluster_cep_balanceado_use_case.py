@@ -26,7 +26,7 @@ class ClusterCEPBalanceadoUseCase(ClusterCEPAtivaUseCase):
         *args,
         min_ceps: int = None,
         max_ceps: int = None,
-        max_merge_km: float = 20.0,
+        max_merge_km: float = 3.0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
