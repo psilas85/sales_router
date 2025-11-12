@@ -29,8 +29,8 @@ def main():
     # ======================================================
     # ⚙️ Parâmetros opcionais
     # ======================================================
-    parser.add_argument("--velocidade_media", type=float, default=30.0, help="Velocidade média (km/h)")
-    parser.add_argument("--tempo_max_min", type=float, default=60.0, help="Tempo máximo de rota (min)")
+    parser.add_argument("--velocidade_media", type=float, default=40.0, help="Velocidade média (km/h)")
+    parser.add_argument("--tempo_max_min", type=float, default=15.0, help="Tempo máximo de rota (min)")
     parser.add_argument("--cidade", type=str, default=None, help="Filtrar marketplace por cidade específica")
     parser.add_argument("--clientes_total", action="store_true", help="Usar clientes_total como filtro (padrão: clientes_target)")
     parser.add_argument("--modo", type=str, default="ativa", choices=["ativa", "balanceada"], help="Modo de clusterização")
@@ -38,7 +38,7 @@ def main():
     # 🧩 Parâmetros específicos do modo balanceado
     parser.add_argument("--min_ceps", type=int, required=False, help="Número mínimo de CEPs por cluster")
     parser.add_argument("--max_ceps", type=int, required=False, help="Número máximo de CEPs por cluster")
-    parser.add_argument("--max_merge_km", type=float, default=20.0, help="Distância máxima (km) para fusão de clusters vizinhos")
+    parser.add_argument("--max_merge_km", type=float, default=1.0, help="Distância máxima (km) para fusão de clusters vizinhos")
 
     args = parser.parse_args()
 
