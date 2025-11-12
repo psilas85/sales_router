@@ -1,10 +1,10 @@
-# src/pdv_preprocessing/application/pdv_preprocessing_use_case.py
-
 import os
 import pandas as pd
-import logging
 import unicodedata
 import re
+import time
+import uuid
+from loguru import logger
 from pdv_preprocessing.entities.pdv_entity import PDV
 from pdv_preprocessing.domain.pdv_validation_service import PDVValidationService
 from pdv_preprocessing.domain.geolocation_service import GeolocationService
@@ -26,15 +26,15 @@ class PDVPreprocessingUseCase:
         self.reader = reader
         self.writer = writer
         self.tenant_id = tenant_id
-        self.input_id = input_id
-        self.descricao = descricao
+        self.input_id = input_id or str(uuid.uuid4())
+        self.descricao = descricao or "PDV Importado"
         self.validator = PDVValidationService(db_reader=reader)
         self.geo_service = GeolocationService(reader, writer)
 
     # ============================================================
     # 🔹 Normalização de colunas
     # ============================================================
-    def normalizar_colunas(self, df):
+    def normalizar_colunas(self, df: pd.DataFrame) -> pd.DataFrame:
         df.columns = (
             df.columns
             .str.strip()
@@ -48,7 +48,7 @@ class PDVPreprocessingUseCase:
     # ============================================================
     # 🔹 Limpeza de valores e formatos
     # ============================================================
-    def limpar_valores(self, df):
+    def limpar_valores(self, df: pd.DataFrame) -> pd.DataFrame:
         def normalizar_cnpj(valor):
             if pd.isna(valor) or str(valor).strip() == "":
                 return None
@@ -62,33 +62,25 @@ class PDVPreprocessingUseCase:
                 pass
             return re.sub(r"[^0-9]", "", v)
 
-        # ============================================================
-        # 🔹 Normalização de CNPJ e CEP
-        # ============================================================
+        # Normaliza CNPJ e CEP
         df["cnpj"] = df["cnpj"].apply(normalizar_cnpj)
         if "cep" in df.columns:
             df["cep"] = df["cep"].astype(str).str.replace(r"[^0-9]", "", regex=True)
 
-        # ============================================================
-        # 🔹 Normalização de campos de texto
-        # ============================================================
+        # Normaliza campos de texto
         for c in ["logradouro", "bairro", "cidade", "uf", "numero"]:
             if c in df.columns:
                 df[c] = df[c].astype(str).str.strip().replace({"nan": "", "None": ""})
 
-        # ============================================================
-        # 🔹 Normalização de UF
-        # ============================================================
+        # Normaliza UF
         estados_validos = set(UF_BOUNDS.keys())
         if "uf" in df.columns:
             df["uf"] = df["uf"].str.upper().str.strip()
             uf_invalidas = df.loc[~df["uf"].isin(estados_validos) & df["uf"].ne(""), "uf"].unique()
             if len(uf_invalidas) > 0:
-                logging.warning(f"⚠️ UFs inválidas detectadas: {', '.join(uf_invalidas)}")
+                logger.warning(f"⚠️ UFs inválidas detectadas: {', '.join(uf_invalidas)}")
 
-        # ============================================================
-        # 🔹 Normalização de cidade
-        # ============================================================
+        # Normaliza cidade
         if "cidade" in df.columns:
             df["cidade"] = df["cidade"].apply(
                 lambda x: unicodedata.normalize("NFKD", str(x))
@@ -98,30 +90,18 @@ class PDVPreprocessingUseCase:
                 .strip()
             )
 
-        ## ============================================================
-        # 🔹 Conversão segura da coluna pdv_vendas (se existir)
-        # ============================================================
+        # Converte pdv_vendas se existir
         if "pdv_vendas" in df.columns:
             import math
 
             def normalizar_vendas(valor):
                 if pd.isna(valor):
                     return None
-                v = str(valor).strip()
-
-                # Remove símbolo de moeda e espaços
-                v = v.replace("R$", "").replace("r$", "").strip()
-
-                # Remove separador de milhar e ajusta vírgula decimal
-                # Ex: "R$ 39.893,23" -> "39893.23"
+                v = str(valor).strip().replace("R$", "").replace("r$", "").strip()
                 v = v.replace(".", "").replace(",", ".")
-
-                # Remove quaisquer caracteres que não sejam dígitos ou ponto
                 v = re.sub(r"[^0-9.]", "", v)
-
                 if v == "":
                     return None
-
                 try:
                     num = float(v)
                     if math.isnan(num) or math.isinf(num):
@@ -132,27 +112,24 @@ class PDVPreprocessingUseCase:
 
             df["pdv_vendas"] = df["pdv_vendas"].apply(normalizar_vendas)
             vendas_validas = df["pdv_vendas"].notna().sum()
-            logging.info(f"ℹ️ {vendas_validas} registros com valor de vendas numérico válido.")
-
+            logger.info(f"ℹ️ {vendas_validas} registros com valor de vendas numérico válido.")
 
         return df
 
-
     # ============================================================
-    # 🔹 Filtra apenas as colunas relevantes
+    # 🔹 Filtra apenas colunas relevantes
     # ============================================================
-    def filtrar_colunas(self, df):
+    def filtrar_colunas(self, df: pd.DataFrame) -> pd.DataFrame:
         colunas_base = ["cnpj", "logradouro", "numero", "bairro", "cidade", "uf", "cep"]
         colunas_opcionais = ["pdv_vendas"]
         colunas_presentes = [c for c in (colunas_base + colunas_opcionais) if c in df.columns]
         return df[colunas_presentes].copy()
 
-
     # ============================================================
     # 🔹 Execução principal
     # ============================================================
-    def execute(self, input_path: str, sep=";", input_id=None, descricao=None):
-        logging.info(f"📄 Lendo arquivo de entrada: {input_path}")
+    def execute(self, input_path: str, sep=";") -> tuple:
+        logger.info(f"📄 Lendo arquivo de entrada: {input_path}")
         df = pd.read_csv(input_path, sep=sep, dtype=str).fillna("")
         df = self.normalizar_colunas(df)
         df = self.limpar_valores(df)
@@ -163,9 +140,7 @@ class PDVPreprocessingUseCase:
         if faltantes:
             raise ValueError(f"❌ Colunas obrigatórias ausentes: {', '.join(faltantes)}")
 
-        # ============================================================
-        # 🏠 Montagem do endereço completo
-        # ============================================================
+        # Monta endereço completo
         df["pdv_endereco_completo"] = df.apply(
             lambda r: ", ".join(
                 filter(None, [
@@ -178,17 +153,13 @@ class PDVPreprocessingUseCase:
             axis=1,
         )
 
-        # ============================================================
-        # 🧩 Validação cadastral inicial
-        # ============================================================
+        # Validação inicial
         df_validos, df_invalidos = self.validator.validar_dados(df, tenant_id=self.tenant_id)
         if df_validos.empty:
-            logging.warning(f"⚠️ [{self.tenant_id}] Nenhum PDV válido para geolocalização.")
+            logger.warning(f"⚠️ [{self.tenant_id}] Nenhum PDV válido para geolocalização.")
             return df_validos, df_invalidos, 0
 
-        # ============================================================
-        # ⚡ Busca prévia de endereços no cache
-        # ============================================================
+        # Busca cache
         enderecos_norm = df_validos["pdv_endereco_completo"].str.strip().str.lower().tolist()
         cache_db = self.reader.buscar_enderecos_cache(enderecos_norm)
 
@@ -207,45 +178,40 @@ class PDVPreprocessingUseCase:
             else:
                 enderecos_novos.append(i)
 
-        logging.info(f"⚡ {len(cache_db)} endereços encontrados no cache.")
-        logging.info(f"🌍 {len(enderecos_novos)} endereços novos para geocodificação.")
+        logger.info(f"⚡ {len(cache_db)} endereços encontrados no cache.")
+        logger.info(f"🌍 {len(enderecos_novos)} endereços novos para geocodificação.")
 
-        # ============================================================
-        # ⚡ Geocodificação paralela (até 20 threads)
-        # ============================================================
+        # Geocodificação paralela
         if enderecos_novos:
             enderecos_para_geo = [
                 df_validos.iloc[i]["pdv_endereco_completo"] for i in enderecos_novos
             ]
 
-            # 🚀 Executa busca paralela em lote (Nominatim + Google fallback)
             resultados_geo = self.geo_service.geocodificar_em_lote(enderecos_para_geo, tipo="PDV")
 
-            # Atualiza dataframe com resultados
             for i in enderecos_novos:
                 endereco = df_validos.iloc[i]["pdv_endereco_completo"]
                 if endereco in resultados_geo:
                     lat, lon, origem = resultados_geo[endereco]
-                    df_validos.at[i, "pdv_lat"] = lat
-                    df_validos.at[i, "pdv_lon"] = lon
-                    df_validos.at[i, "status_geolocalizacao"] = origem
-                    try:
-                        self.writer.inserir_localizacao(endereco, lat, lon)
-                    except Exception as e:
-                        logging.warning(f"⚠️ Falha ao salvar no cache: {e}")
+                    if lat is not None and lon is not None:
+                        df_validos.at[i, "pdv_lat"] = lat
+                        df_validos.at[i, "pdv_lon"] = lon
+                        df_validos.at[i, "status_geolocalizacao"] = origem
+                        try:
+                            self.writer.inserir_localizacao(endereco, lat, lon)
+                            time.sleep(0.05)
+                        except Exception as e:
+                            logger.warning(f"⚠️ Falha ao salvar no cache: {e}")
+                    else:
+                        df_validos.at[i, "status_geolocalizacao"] = "falha"
                 else:
                     df_validos.at[i, "status_geolocalizacao"] = "falha"
-                    df_validos.at[i, "motivo_invalidade"] = "falha_geolocalizacao"
 
-            logging.info(f"✅ Geocodificação paralela concluída: {len(resultados_geo)} endereços resolvidos.")
+            logger.info(f"✅ Geocodificação concluída: {len(resultados_geo)} endereços resolvidos.")
         else:
-            logging.info("⚡ Nenhum endereço novo para geocodificação.")
+            logger.info("⚡ Nenhum endereço novo para geocodificação.")
 
-
-
-        # ============================================================
-        # 🧭 Validação geográfica (UF × Coordenadas)
-        # ============================================================
+        # Validação geográfica (UF × coordenadas)
         def validar_limites_uf(row):
             if pd.isna(row["pdv_lat"]) or pd.isna(row["pdv_lon"]):
                 return "falha_geolocalizacao"
@@ -260,37 +226,31 @@ class PDVPreprocessingUseCase:
         df_validos["motivo_invalidade"] = df_validos.apply(validar_limites_uf, axis=1)
         df_invalidos_geo = df_validos[df_validos["motivo_invalidade"] != "ok"]
         df_validos = df_validos[df_validos["motivo_invalidade"] == "ok"]
-
         df_invalidos_total = pd.concat([df_invalidos, df_invalidos_geo], ignore_index=True)
 
-        # ============================================================
-        # 💾 Inserção no banco (sem sobrescrita)
-        # ============================================================
+        # Inserção no banco
         df_validos["tenant_id"] = self.tenant_id
         df_validos["input_id"] = self.input_id
         df_validos["descricao"] = self.descricao
 
-        # Mantém apenas colunas que correspondem a atributos do dataclass PDV
         campos_validos = PDV.__init__.__code__.co_varnames[1:]
-        colunas_validas = [c for c in df_validos.columns if c in campos_validos]
-        df_para_inserir = df_validos[colunas_validas]
+        df_para_inserir = df_validos[[c for c in df_validos.columns if c in campos_validos]]
 
-        # Cria instâncias PDV sem repassar argumentos duplicados
         pdvs = [PDV(**row) for row in df_para_inserir.to_dict(orient="records")]
 
-        # Inserção no banco
-        inseridos = self.writer.inserir_pdvs(pdvs)
+        try:
+            inseridos = self.writer.inserir_pdvs(pdvs)
+        except Exception as e:
+            if hasattr(self.writer, "conn"):
+                self.writer.conn.rollback()
+            logger.error(f"❌ Falha ao inserir PDVs no banco: {e}", exc_info=True)
+            inseridos = 0
 
-        logging.info(f"✅ [{self.tenant_id}] {len(df_validos)} válidos / {len(df_invalidos_total)} inválidos.")
-        logging.info(f"💾 [{self.tenant_id}] {inseridos} PDVs inseridos (input_id={self.input_id}).")
+        total_falhas = df_validos["status_geolocalizacao"].eq("falha").sum()
+        logger.info(f"✅ [{self.tenant_id}] {len(df_validos)} válidos / {len(df_invalidos_total)} inválidos.")
+        logger.info(f"💾 [{self.tenant_id}] {inseridos} PDVs inseridos (input_id={self.input_id}).")
+        logger.info(f"⚠️ {total_falhas} PDVs não geocodificados com sucesso.")
 
-        # ============================================================
-        # 📊 Resumo final de geocodificação
-        # ============================================================
         self.geo_service.exibir_resumo_logs()
 
-
-        # ============================================================
-        # 📦 Retorno final
-        # ============================================================
         return df_validos, df_invalidos_total, inseridos

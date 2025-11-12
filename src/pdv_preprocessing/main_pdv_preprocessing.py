@@ -1,3 +1,7 @@
+# ============================================================
+# 📦 src/pdv_preprocessing/main_pdv_preprocessing.py
+# ============================================================
+
 import os
 import argparse
 import logging
@@ -9,42 +13,36 @@ from dotenv import load_dotenv
 from pdv_preprocessing.application.pdv_preprocessing_use_case import PDVPreprocessingUseCase
 from pdv_preprocessing.infrastructure.database_reader import DatabaseReader
 from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
-from database.db_connection import get_connection
+from pdv_preprocessing.utils.file_utils import detectar_separador, salvar_invalidos
 from pdv_preprocessing.logs.logging_config import setup_logging
+from database.db_connection import get_connection
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# ============================================================
+# 🌍 Inicialização de ambiente
+# ============================================================
 load_dotenv()
-
-
-def detectar_separador(path: str) -> str:
-    """Detecta automaticamente o separador do CSV."""
-    with open(path, "r", encoding="utf-8-sig") as f:
-        linha = f.readline()
-        return ";" if ";" in linha else ","
-
-
-def salvar_invalidos(df_invalidos, pasta_base: str, input_id: str):
-    """Salva PDVs inválidos em CSV e retorna o caminho."""
-    try:
-        if df_invalidos is None or df_invalidos.empty:
-            return None
-        pasta_invalidos = os.path.join(pasta_base, "invalidos")
-        os.makedirs(pasta_invalidos, exist_ok=True)
-        nome_arquivo = f"pdvs_invalidos_{input_id}.csv"
-        caminho_saida = os.path.join(pasta_invalidos, nome_arquivo)
-        df_invalidos.to_csv(caminho_saida, index=False, sep=";", encoding="utf-8-sig")
-        logging.warning(f"⚠️ {len(df_invalidos)} inválidos salvos em: {caminho_saida}")
-        return caminho_saida
-    except Exception as e:
-        logging.error(f"❌ Erro ao salvar inválidos: {e}")
-        return None
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pré-processamento de PDVs (SalesRouter multi-tenant)")
-    parser.add_argument("--tenant", required=True, help="Tenant ID (inteiro ou variável TENANT_ID do .env)")
-    parser.add_argument("--arquivo", required=True, help="Caminho do CSV de entrada (ex: /app/data/pdvs_enderecos.csv)")
-    parser.add_argument("--descricao", required=True, help="Descrição do processamento (máx. 60 caracteres)")
+    # ------------------------------------------------------------
+    # 🎯 Argumentos CLI
+    # ------------------------------------------------------------
+    parser = argparse.ArgumentParser(
+        description="Pré-processamento de PDVs (SalesRouter multi-tenant)"
+    )
+    parser.add_argument(
+        "--tenant", required=True,
+        help="Tenant ID (inteiro ou variável TENANT_ID do .env)"
+    )
+    parser.add_argument(
+        "--arquivo", required=True,
+        help="Caminho do CSV de entrada (ex: /app/data/pdvs_enderecos.csv)"
+    )
+    parser.add_argument(
+        "--descricao", required=True,
+        help="Descrição do processamento (máx. 60 caracteres)"
+    )
     args = parser.parse_args()
 
     # ------------------------------------------------------------
@@ -63,7 +61,7 @@ def main():
     # 🧾 Logging e informações iniciais
     # ------------------------------------------------------------
     setup_logging(tenant_id)
-    logging.info(f"🚀 Iniciando pré-processamento de PDVs (tenant={tenant_id})")
+    logging.info(f"🚀 Iniciando pré-processamento de PDVs | tenant={tenant_id}")
     logging.info(f"🆔 input_id={input_id}")
     logging.info(f"📝 Descrição: {descricao}")
 
@@ -100,10 +98,9 @@ def main():
 
         df_validos, df_invalidos, inseridos = use_case.execute(
             input_path=input_path,
-            sep=sep,
-            input_id=input_id,
-            descricao=descricao,
+            sep=sep
         )
+
 
         total_validos = len(df_validos) if df_validos is not None else 0
         total_invalidos = len(df_invalidos) if df_invalidos is not None else 0
@@ -134,9 +131,9 @@ def main():
         )
 
         # --------------------------------------------------------
-        # 📤 Saída JSON
+        # 📤 Saída JSON estruturada
         # --------------------------------------------------------
-        print(json.dumps({
+        resultado = {
             "status": "done",
             "tenant_id": tenant_id,
             "input_id": input_id,
@@ -147,8 +144,9 @@ def main():
             "invalidos": total_invalidos,
             "inseridos": inseridos,
             "arquivo_invalidos": arquivo_invalidos,
-            "duracao_segundos": round(duracao, 2)
-        }))
+            "duracao_segundos": round(duracao, 2),
+        }
+        print(json.dumps(resultado, ensure_ascii=False))
 
     except Exception as e:
         logging.error(f"❌ Erro inesperado: {e}", exc_info=True)
@@ -172,7 +170,7 @@ def main():
             "tenant_id": tenant_id,
             "input_id": input_id,
             "descricao": descricao
-        }))
+        }, ensure_ascii=False))
 
 
 if __name__ == "__main__":

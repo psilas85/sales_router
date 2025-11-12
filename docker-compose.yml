@@ -20,22 +20,32 @@ services:
       context: .
       dockerfile: ./src/authentication/Dockerfile.authentication
     container_name: authentication_service
+    env_file:
+      - .env
+    environment:
+      - ENV=production
+      - TZ=America/Sao_Paulo
+      - PYTHONPATH=/app
+      - LOGURU_LEVEL=INFO
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-salesrouter-secret-key}
+      - JWT_ALGORITHM=HS256
+      - JWT_EXP_HOURS=8
     expose:
       - "8000"
     ports:
       - "8001:8000"
-    env_file:
-      - .env
     depends_on:
       - sales_router_db
     volumes:
       - ./src/authentication:/app/authentication
+      - ./src/database:/app/database
     networks:
       - sales_router_net
     restart: always
 
+
   # ======================
-  # Pré-processamento de PDVs
+  # Pré-processamento de PDVs (FastAPI)
   # ======================
   pdv_preprocessing:
     build:
@@ -44,12 +54,23 @@ services:
     container_name: pdv_preprocessing
     env_file:
       - .env
+    environment:
+      - ENV=production
+      - TZ=America/Sao_Paulo
+      - PYTHONPATH=/app/src
+      - AUTH_SERVICE_URL=http://authentication_service:8000
+    expose:
+      - "8000"
+    ports:
+      - "8010:8000"  # (opcional: só se quiser acessar diretamente)
     depends_on:
       - sales_router_db
       - redis
+      - authentication_service
     volumes:
-      - ./src/pdv_preprocessing:/app/src/pdv_preprocessing
+      - ./src:/app/src
       - ./data:/app/data
+      - ./output:/app/output
     networks:
       - sales_router_net
     restart: always
@@ -65,11 +86,16 @@ services:
     env_file:
       - .env
     environment:
+      - ENV=production
+      - TZ=America/Sao_Paulo
+      - PYTHONPATH=/app/src
+      - REDIS_URL=redis://redis:6379/0
       - DB_HOST=sales_router_db
       - DB_PORT=5432
     depends_on:
       - redis
       - sales_router_db
+      - pdv_preprocessing
     volumes:
       - ./src/pdv_preprocessing:/app/src/pdv_preprocessing
       - ./src/database:/app/src/database
@@ -77,6 +103,7 @@ services:
     networks:
       - sales_router_net
     restart: always
+
 
   # ======================
   # Clusterização de PDVs (Sales Clusterization)
@@ -176,11 +203,14 @@ services:
       - "443:443"
     depends_on:
       - authentication_service
+      - pdv_preprocessing
     volumes:
       - ./src/api_gateway/nginx.conf:/etc/nginx/conf.d/sales_router.conf:ro
+      - ./output:/home/ubuntu/sales_router/output   # 🗺️ Compartilha os mapas
     networks:
       - sales_router_net
     restart: always
+
 
   # ======================
   # OSRM - Servidor de rotas Sudeste (RJ, SP, MG, ES)

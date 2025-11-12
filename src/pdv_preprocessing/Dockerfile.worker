@@ -1,29 +1,38 @@
 # ============================
-# Dockerfile.worker (PDV Jobs)
+# 🚀 Dockerfile.worker (PDV Jobs)
 # ============================
 
+# Imagem base compartilhada
 FROM psilas85/sales_router-base:latest
 
+# Diretório de trabalho
 WORKDIR /app
 
-# Copia módulos necessários
+# Copia os módulos necessários (isolados)
 COPY ./src/pdv_preprocessing /app/src/pdv_preprocessing
 COPY ./src/database /app/src/database
 
-# Copia dependências globais e instala
+# Copia e instala dependências globais
 COPY ./requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# ✅ Adiciona dependências do worker (não estão na base)
-RUN pip install --no-cache-dir rq==1.16.2 redis==5.0.7
+# 🔧 Instala dependências específicas do worker
+RUN pip install --no-cache-dir rq==1.16.2 redis==5.0.7 loguru==0.7.2
 
-# Define variáveis padrão
+# Variáveis de ambiente padrão
 ENV PYTHONPATH=/app/src \
     TZ=America/Sao_Paulo \
-    ENV=production
+    ENV=production \
+    REDIS_URL=redis://redis:6379/0 \
+    LOGURU_LEVEL=INFO
 
-# Exibe dependências críticas para debug
-RUN python --version && pip list | grep -E "rq|redis|psycopg2|pandas"
+# Debug informativo
+RUN python --version && \
+    echo "🧩 Dependências críticas do worker:" && \
+    pip list | grep -E "rq|redis|psycopg2|pandas|loguru"
 
-# Comando principal: worker escutando fila "pdv_jobs"
-CMD ["rq", "worker", "--url", "redis://redis:6379", "pdv_jobs"]
+# Expõe a pasta data (compartilhada com a API)
+VOLUME ["/app/data"]
+
+# Comando padrão: worker escutando a fila "pdv_jobs"
+CMD ["rq", "worker", "--url", "redis://redis:6379/0", "pdv_jobs"]
