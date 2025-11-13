@@ -254,7 +254,35 @@ class OperationalClusterRefiner:
                 setores_finais = setores_refinados
                 break
 
+        # ============================================================
+        # 🔒 SEGURANÇA — garantir retorno válido
+        # ============================================================
+        if not setores_finais:
+            if setores_refinados:
+                setores_finais = setores_refinados
+            else:
+                setores_finais = setores_macro
+
+        # ============================================================
+        # 🔑 NORMALIZAÇÃO DOS LABELS — evita KeyError no cluster_use_case
+        # ============================================================
+        labels_originais = sorted(s.cluster_label for s in setores_finais)
+        mapa_labels = {old: new for new, old in enumerate(labels_originais)}
+
+        for s in setores_finais:
+            old = s.cluster_label
+            new = mapa_labels[old]
+            s.cluster_label = new
+
+            # atualiza PDVs vinculados ao setor
+            if hasattr(s, "pdvs") and s.pdvs:
+                for p in s.pdvs:
+                    p.cluster_label = new
+
+        logger.info(f"🔒 Labels normalizados: {mapa_labels}")
+
         return setores_finais
+
 
     # ============================================================
     # 🧭 Geração e refinamento de subrotas teóricas (sequência otimizada)

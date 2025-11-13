@@ -17,12 +17,6 @@ def carregar_pdvs(
     uf: Optional[str] = None,
     cidade: Optional[str] = None,
 ) -> List[PDV]:
-    """
-    Lê os PDVs válidos da base vinculada ao tenant e ao input_id informado.
-    - Filtra PDVs pela base específica (input_id)
-    - Mantém duplicatas legítimas (não descarta coordenadas iguais)
-    - Apenas registra duplicatas no log
-    """
 
     base_query = """
         SELECT id, cnpj, bairro, cidade, uf, pdv_lat, pdv_lon
@@ -48,53 +42,59 @@ def carregar_pdvs(
 
     if not rows:
         logger.warning(
-            f"⚠️ Nenhum PDV encontrado para tenant={tenant_id}, input_id={input_id}, "
+            f"⚠️ Nenhum PDV encontrado | tenant={tenant_id}, input_id={input_id}, "
             f"UF={uf or 'todas'}, cidade={cidade or 'todas'}"
         )
         return []
 
     pdvs_limp = []
     invalidos = 0
-    coords_vistos = set()
     duplicadas = 0
+    coords_vistos = set()
 
     for row in rows:
         try:
             _id, cnpj, bairro, cidade_, uf_, lat, lon = row
 
-            # Ignora coordenadas inválidas
-            if lat in (None, 0) or lon in (None, 0):
-                invalidos += 1
-                continue
-            if np.isnan(lat) or np.isnan(lon) or np.isinf(lat) or np.isinf(lon):
+            # --- VALIDAÇÃO CRÍTICA ---
+            if lat is None or lon is None:
                 invalidos += 1
                 continue
 
-            # Detecta duplicatas sem excluir
+            if np.isnan(lat) or np.isnan(lon):
+                invalidos += 1
+                continue
+
+            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                invalidos += 1
+                continue
+
+            # Duplicatas (apenas log)
             chave = (round(lat, 6), round(lon, 6))
             if chave in coords_vistos:
                 duplicadas += 1
-                logger.debug(
-                    f"⚠️ Coordenadas duplicadas detectadas "
-                    f"(tenant={tenant_id}, cidade={cidade_}, uf={uf_}): lat={lat:.6f}, lon={lon:.6f}"
-                )
             coords_vistos.add(chave)
 
-            pdvs_limp.append(
-                PDV(
-                    id=_id,
-                    cnpj=cnpj,
-                    nome=None,
-                    cidade=cidade_,
-                    uf=uf_,
-                    lat=float(lat),
-                    lon=float(lon),
-                )
+            # --- CRIA OBJETO PDV ---
+            pdv = PDV(
+                id=_id,
+                cnpj=cnpj,
+                nome=None,
+                cidade=cidade_,
+                uf=uf_,
+                lat=float(lat),
+                lon=float(lon),
             )
+            pdvs_limp.append(pdv)
+
         except Exception as e:
             invalidos += 1
-            logger.warning(f"⚠️ Erro ao processar linha de PDV (id={row[0] if row else 'N/A'}): {e}")
+            logger.warning(f"⚠️ Erro ao processar PDV id={row[0] if row else 'N/A'}: {e}")
             continue
+
+    # --- INDEXAÇÃO CRUCIAL PARA SWEEP E BALANCEADO ---
+    for idx, p in enumerate(pdvs_limp):
+        p.original_index = idx
 
     logger.info(
         f"📦 {len(pdvs_limp)} PDVs carregados | tenant={tenant_id} | input_id={input_id} | "
@@ -102,6 +102,7 @@ def carregar_pdvs(
     )
 
     return pdvs_limp
+
 
 
 def get_cidades_por_uf(tenant_id: int, uf: str, input_id: str) -> list[str]:

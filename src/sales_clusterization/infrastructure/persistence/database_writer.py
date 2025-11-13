@@ -119,14 +119,6 @@ def finalizar_run(run_id: int, k_final: int, status: str = "done", error: str | 
 # 💾 Salvamento de setores (clusters principais)
 # ============================================================
 def salvar_setores(tenant_id: int, run_id: int, setores: List[Setor]) -> Dict[int, int]:
-    """
-    Insere setores (macroclusters) e retorna o mapping cluster_label -> cluster_setor.id.
-
-    ✅ Armazena métricas operacionais em colunas dedicadas e também no JSON metrics:
-      - raio_med_km / raio_p95_km
-      - tempo_medio_min / tempo_max_min
-      - distancia_media_km / dist_max_km
-    """
 
     mapping = {}
     sql = """
@@ -151,21 +143,18 @@ def salvar_setores(tenant_id: int, run_id: int, setores: List[Setor]) -> Dict[in
 
     with get_connection() as conn:
         with conn.cursor() as cur:
+
             for s in setores:
                 cluster_label = int(s.cluster_label)
                 centro_lat = float(s.centro_lat)
                 centro_lon = float(s.centro_lon)
                 n_pdvs = int(s.n_pdvs)
 
-                # ============================================================
-                # 🧩 Extração de métricas operacionais com fallback seguro
-                # ============================================================
                 raio_med_km = float(getattr(s, "raio_med_km", 0.0))
                 raio_p95_km = float(getattr(s, "raio_p95_km", 0.0))
 
-                # Caso os tempos/distâncias não estejam setados no objeto Setor,
-                # calcula dinamicamente com base nos subclusters.
                 subclusters = getattr(s, "subclusters", [])
+
                 if subclusters and isinstance(subclusters, list):
                     tempos = [sc.get("tempo_min", 0.0) for sc in subclusters]
                     distancias = [sc.get("dist_km", 0.0) for sc in subclusters]
@@ -179,9 +168,13 @@ def salvar_setores(tenant_id: int, run_id: int, setores: List[Setor]) -> Dict[in
                     distancia_media_km = float(getattr(s, "distancia_media_km", 0.0))
                     dist_max_km = float(getattr(s, "dist_max_km", 0.0))
 
-                # ============================================================
-                # 🧮 JSON consolidado
-                # ============================================================
+                # 🚀 FIX: JSON sempre serializável
+                subclusters_json = json.dumps(
+                    subclusters,
+                    ensure_ascii=False,
+                    default=lambda o: float(o)
+                )
+
                 metrics_json = json.dumps(
                     {
                         "raio_med_km": raio_med_km,
@@ -193,11 +186,9 @@ def salvar_setores(tenant_id: int, run_id: int, setores: List[Setor]) -> Dict[in
                         "subclusters": subclusters,
                     },
                     ensure_ascii=False,
+                    default=lambda o: float(o)
                 )
 
-                # ============================================================
-                # 💾 Inserção no banco
-                # ============================================================
                 cur.execute(
                     sql,
                     (
@@ -213,19 +204,15 @@ def salvar_setores(tenant_id: int, run_id: int, setores: List[Setor]) -> Dict[in
                         tempo_max_min,
                         distancia_media_km,
                         dist_max_km,
-                        json.dumps(subclusters),
+                        subclusters_json,
                     ),
                 )
 
-                cid = cur.fetchone()[0]
-                mapping[cluster_label] = cid
+                mapping[cluster_label] = cur.fetchone()[0]
 
             conn.commit()
 
-    logger.info(
-        f"💾 {len(mapping)} setores salvos no banco com métricas operacionais "
-        f"(run_id={run_id}, tenant={tenant_id})"
-    )
+    logger.info(f"💾 {len(mapping)} setores salvos (run_id={run_id}, tenant={tenant_id})")
     return mapping
 
 
@@ -252,7 +239,8 @@ def salvar_mapeamento_pdvs(
         with conn.cursor() as cur:
             count = 0
             for p in pdvs:
-                if getattr(p, "cluster_id", None):
+                # 🚀 FIX: cluster_id=0 deve ser aceito
+                if getattr(p, "cluster_id", None) is not None:
                     cur.execute(
                         sql,
                         (
@@ -270,6 +258,7 @@ def salvar_mapeamento_pdvs(
             conn.commit()
 
     logger.info(f"🧩 {count} PDVs mapeados em clusters (run_id={run_id})")
+
 
 
 # ============================================================
@@ -329,7 +318,14 @@ def salvar_outliers(tenant_id: int, clusterization_id: str, pdv_flags: list):
     # 📏 Cálculo eficiente das distâncias médias (em km)
     # ============================================================
     try:
-        coords = np.radians(np.array([(r["lat"], r["lon"]) for r in rows_dict if r["lat"] and r["lon"]]))
+        coords = np.radians(
+            np.array([
+                (r["lat"], r["lon"])
+                for r in rows_dict
+                if r["lat"] is not None and r["lon"] is not None
+            ])
+        )
+
         n_neighbors = min(6, len(coords))
         nn = NearestNeighbors(n_neighbors=n_neighbors, metric="haversine")
         nn.fit(coords)
