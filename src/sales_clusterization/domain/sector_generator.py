@@ -56,7 +56,8 @@ def kmeans_setores(pdvs: List[PDV], k: int, random_state: int = RANDOM_STATE):
 
     logger.info(f"🧮 Executando KMeans (K={k}) com {cpu_cores} núcleos (loky backend)...")
 
-    km = KMeans(n_clusters=k, random_state=random_state, n_init="auto", algorithm="lloyd")
+    km = KMeans(n_clusters=k, random_state=random_state, n_init=10, algorithm="lloyd")
+
 
     with parallel_backend("loky", n_jobs=-1):
         labels = km.fit_predict(X)
@@ -250,16 +251,28 @@ def kmeans_balanceado(
     import math
     from src.sales_clusterization.domain.k_estimator import _haversine_km
 
-    def subdividir_por_tamanho(coords, max_pdv_cluster):
-        """Divide um cluster grande em subclusters menores até respeitar o limite."""
+    def subdividir_por_tamanho(coords, indices_originais, max_pdv_cluster):
         if len(coords) <= max_pdv_cluster:
-            return [coords]
+            return [(coords, indices_originais)]
+
         k_sub = math.ceil(len(coords) / max_pdv_cluster)
-        km = KMeans(n_clusters=k_sub, random_state=42, n_init=10)
-        labels_sub = km.fit_predict(coords)
-        subclusters = [coords[labels_sub == i] for i in range(k_sub) if np.sum(labels_sub == i) > 0]
-        logger.warning(f"⚠️ Cluster excedido ({len(coords)} PDVs) → subdividido em {len(subclusters)} partes.")
-        return subclusters
+        km = KMeans(n_clusters=k_sub, random_state=42, n_init=10).fit(coords)
+        labels_sub = km.labels_
+
+        resultados = []
+        for sub_id in range(k_sub):
+            mask = labels_sub == sub_id
+            if not np.any(mask):
+                continue
+
+            sub_coords = coords[mask].astype(np.float64)
+            sub_idx = indices_originais[mask]
+            resultados.append((sub_coords, sub_idx))
+
+
+        logger.warning(f"⚠️ Cluster excedido ({len(coords)} PDVs) → subdividido em {len(resultados)} partes.")
+        return resultados
+
 
     def avaliar_cluster(coords, centro):
         """Calcula distância total e tempo de rota simulada (vizinho mais próximo simples)."""
@@ -302,19 +315,25 @@ def kmeans_balanceado(
     labels = kmeans.fit_predict(coords)
 
     # ==========================================================
-    # 🔹 Etapa 2: Rebalanceamento por tamanho
+    # 🔹 Etapa 2: Rebalanceamento por tamanho (AGORA COM ÍNDICES REAIS)
     # ==========================================================
     clusters_validos = []
+    clusters_indices = []  # <<<<< ADICIONE ISSO
+
     for i in range(k_inicial):
         subset = coords[labels == i]
+        subset_idx = np.where(labels == i)[0]  # <<< ÍNDICES ORIGINAIS DOS PDVs
+
         if len(subset) == 0:
             continue
 
-        # se cluster excede o limite de PDVs, subdivide antes de qualquer cálculo
-        subclusters = subdividir_por_tamanho(subset, max_pdv_cluster)
-        clusters_validos.extend(subclusters)
+        subclusters = subdividir_por_tamanho(subset, subset_idx, max_pdv_cluster)
 
-    logger.info(f"✅ Todos os clusters ajustados por tamanho. Total final: {len(clusters_validos)}")
+        for sub_coords, sub_idx in subclusters:
+            clusters_validos.append(sub_coords)
+            clusters_indices.append(sub_idx)
+
+
 
     # ==========================================================
     # 🔹 Etapa 3: Avaliação de rota (Haversine + tempo)
@@ -326,12 +345,13 @@ def kmeans_balanceado(
         pts = [(float(x[0]), float(x[1])) for x in subset]
         med, p95 = _raios_cluster(centro, pts)
 
-        # associa PDVs originais
-        pdvs_sub = []
-        for p in pdvs:
-            if any(abs(p.lat - c[0]) < 1e-6 and abs(p.lon - c[1]) < 1e-6 for c in pts):
-                p.cluster_label = idx
-                pdvs_sub.append(p)
+        # associação correta usando clusters_indices
+        real_idx = clusters_indices[idx]
+        pdvs_sub = [pdvs[j] for j in real_idx]
+
+        for p in pdvs_sub:
+            p.cluster_label = idx
+
 
         setores.append(
             Setor(
