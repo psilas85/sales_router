@@ -1,3 +1,5 @@
+#sales_router/src/pdv_preprocessing/api/pdv_preprocessing_api.py
+
 # ==========================================================
 # 📦 src/pdv_preprocessing/api/pdv_preprocessing_api.py
 # ==========================================================
@@ -66,7 +68,9 @@ async def sanitize_json_response(request: Request, call_next):
 # ==========================================================
 # 🔀 Rotas principais
 # ==========================================================
+
 app.include_router(pdv_router, prefix="/pdv")
+
 
 # ==========================================================
 # 🩺 Health check

@@ -1,3 +1,5 @@
+#sales_router/src/pdv_preprocessing/config/uf_bounds.py
+
 # ============================================================
 # 📍 Limites geográficos aproximados por UF (lat/lon)
 # ============================================================

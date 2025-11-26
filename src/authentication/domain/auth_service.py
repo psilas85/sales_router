@@ -22,14 +22,16 @@ class AuthService:
     def verify_password(self, senha, senha_hash):
         return bcrypt.checkpw(senha.encode("utf-8"), senha_hash.encode("utf-8"))
 
-    def generate_token(self, user_id, tenant_id, role):
+    def generate_token(self, user_id, tenant_id, role, email):
         payload = {
             "user_id": user_id,
             "tenant_id": tenant_id,
             "role": role,
+            "email": email,          # ← necessário para clusterization
             "exp": datetime.utcnow() + timedelta(hours=JWT_EXP_HOURS),
         }
         return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
 
     def decode_token(self, token: str):
         try:
@@ -67,7 +69,9 @@ def role_required(roles: list[str]):
                 "user_id": payload.get("user_id"),
                 "tenant_id": payload.get("tenant_id"),
                 "role": payload.get("role"),
+                "email": payload.get("email"),  # ← necessário
             }
+
 
             import inspect
             if inspect.iscoroutinefunction(func):

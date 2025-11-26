@@ -1,10 +1,11 @@
 #sales_router/src/sales_clusterization/domain/k_estimator.py
 
 # ============================================================
-# 📦 src/sales_clusterization/domain/k_estimator.py
+# 📦 src/sales_clusterization/domain/k_estimator.py  (CORRIGIDO)
 # ============================================================
 
 import numpy as np
+import math
 from loguru import logger
 from typing import List, Tuple, Dict
 
@@ -38,28 +39,23 @@ def estimar_k_inicial(
     alpha_path: float,
 ) -> Tuple[int, Dict]:
     """
-    Define o número inicial de macroclusters (setores) com base em:
-      - número total de PDVs
-      - capacidade máxima de PDVs por cluster
-      - frequência mensal de visitação (freq)
-
-    Fórmula:
-        K_macro = N_PDVs / (max_pdv_cluster / freq)
-
-    Exemplo:
-        900 PDVs, max_pdv_cluster=300, freq=2 → K=6
+    Cálculo correto do K inicial com base em:
+    - número total de PDVs
+    - capacidade por cluster ajustada pela frequência
     """
+
     n_pdvs = len(pdvs)
     if n_pdvs == 0:
         raise ValueError("Nenhum PDV informado para cálculo do K inicial.")
 
     # ============================================================
-    # 🧮 Cálculo principal (determinístico) — NOVA REGRA
+    # 🚀 CORREÇÃO CRÍTICA:
+    # Capacidade real por cluster = max_pdv_cluster * freq
+    # K inicial = ceil(n_pdvs / capacidade)
     # ============================================================
-    # Regra: K = floor(n_pdvs / (max_pdv_cluster * freq)), com mínimo 1
-    divisor = max(1, int(max_pdv_cluster * max(freq, 1)))
-    k_estimado = max(1, int(len(pdvs) // divisor))
+    capacidade_real = max_pdv_cluster * max(freq, 1)
 
+    k_estimado = max(1, math.ceil(n_pdvs / capacidade_real))
 
     # ============================================================
     # 📊 Diagnóstico detalhado
@@ -68,27 +64,20 @@ def estimar_k_inicial(
         "pdvs_totais": n_pdvs,
         "max_pdv_cluster": max_pdv_cluster,
         "freq": freq,
+        "capacidade_real_por_cluster": capacidade_real,
         "dias_uteis": dias_uteis,
         "workday_min": workday_min,
         "route_km_max": route_km_max,
         "service_min": service_min,
         "v_kmh": v_kmh,
         "alpha_path": alpha_path,
-        "max_pdv_cluster_ajustado": round(max_pdv_cluster / max(freq, 1), 2),
         "k_inicial": k_estimado,
-        "criterio": "pdvs_e_frequencia",
+        "criterio": "ceil(n_pdvs / capacidade_real)",
     }
 
     logger.info(
         f"🧮 K inicial estimado = {k_estimado} "
-        f"(n_pdvs={n_pdvs}, max_pdv_cluster={max_pdv_cluster}, freq={freq}x/mês → "
-        f"{round(max_pdv_cluster / max(freq, 1), 1)} PDVs/cluster)"
-    )
-
-    logger.debug(
-        f"📘 Parâmetros recebidos → freq={freq}, dias_uteis={dias_uteis}, "
-        f"workday_min={workday_min}, route_km_max={route_km_max}, "
-        f"service_min={service_min}, v_kmh={v_kmh}, α={alpha_path}"
+        f"(n_pdvs={n_pdvs}, capacidade={capacidade_real} PDVs/cluster)"
     )
 
     return k_estimado, diag
@@ -99,8 +88,8 @@ def estimar_k_inicial(
 # ============================================================
 def estimar_k_por_raio(pdvs: List, raio_km: float = 5.0) -> int:
     """
-    Estima um K aproximado com base em densidade geográfica.
-    Pode ser usada como fallback apenas para diagnósticos visuais.
+    Estima K baseado em densidade para propósitos diagnósticos.
+    Não interfere no cálculo principal.
     """
     if len(pdvs) < 2:
         return 1
@@ -112,15 +101,15 @@ def estimar_k_por_raio(pdvs: List, raio_km: float = 5.0) -> int:
     dists = np.array(
         [_haversine_km((lat_med, lon_med), (lat, lon)) for lat, lon in zip(lats, lons)]
     )
-    area_estimada = np.pi * (raio_km**2)
-    raio_medio = np.mean(dists)
     raio_global = np.percentile(dists, 95)
+    area_coberta = np.pi * (raio_km**2)
     densidade = len(pdvs) / (np.pi * raio_global**2)
 
-    k_estimado = max(1, int(np.ceil(len(pdvs) / (densidade * area_estimada))))
+    k_estimado = max(1, int(math.ceil(len(pdvs) / (densidade * area_coberta))))
 
     logger.debug(
         f"🌐 Estimativa geográfica → densidade={densidade:.2f} pts/km² | "
         f"raio_p95={raio_global:.1f} km | K≈{k_estimado}"
     )
+
     return k_estimado

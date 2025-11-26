@@ -1,27 +1,33 @@
+#sales_router/src/pdv_preprocessing/main_mkp_preprocessing.py
+
 # ============================================================
-# 📦 src/pdv_preprocessing/main_mkp_preprocessing.py
+# 📦 src/pdv_preprocessing/main_mkp_preprocessing.py (ASSÍNCRONO FINAL)
 # ============================================================
 
 import os
 import argparse
 import logging
 import uuid
-import time
 import json
+import time
+import pandas as pd
 from dotenv import load_dotenv
+from redis import Redis
+from rq import Queue
 
 from pdv_preprocessing.application.mkp_preprocessing_use_case import MKPPreprocessingUseCase
 from pdv_preprocessing.infrastructure.database_reader import DatabaseReader
 from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
-from database.db_connection import get_connection
 from pdv_preprocessing.logs.logging_config import setup_logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# novo master que orquestra job_geocode
+from pdv_preprocessing.jobs.job_master_mkp import job_master_mkp
+
+
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-# ------------------------------------------------------------
-# Detecta separador CSV
 # ------------------------------------------------------------
 def detectar_separador(path: str) -> str:
     with open(path, "r", encoding="utf-8-sig") as f:
@@ -30,159 +36,171 @@ def detectar_separador(path: str) -> str:
 
 
 # ------------------------------------------------------------
-# Salva inválidos em CSV
-# ------------------------------------------------------------
-def salvar_invalidos(df_invalidos, pasta_base: str, input_id: str):
-    try:
-        if df_invalidos is None or df_invalidos.empty:
-            return None
-        pasta_invalidos = os.path.join(pasta_base, "invalidos")
-        os.makedirs(pasta_invalidos, exist_ok=True)
-        nome_arquivo = f"mkp_invalidos_{input_id}.csv"
-        caminho_saida = os.path.join(pasta_invalidos, nome_arquivo)
-        df_invalidos.to_csv(caminho_saida, index=False, sep=";", encoding="utf-8-sig")
-        logging.warning(f"⚠️ {len(df_invalidos)} inválidos salvos em: {caminho_saida}")
-        return caminho_saida
-    except Exception as e:
-        logging.error(f"❌ Erro ao salvar inválidos: {e}")
-        return None
+def carregar_dataframe_inteligente(path: str, sep: str = ";"):
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext in [".xlsx", ".xls"]:
+        logging.info("📄 Lendo XLSX — zeros à esquerda preservados")
+        df = pd.read_excel(path, dtype=str, keep_default_na=False)
+        return df.fillna("")
+
+    logging.info("📄 Lendo CSV")
+    df = pd.read_csv(path, sep=sep, dtype=str, encoding="utf-8", keep_default_na=False)
+    return df.fillna("")
 
 
-# ------------------------------------------------------------
-# Execução principal
 # ------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Pré-processamento de dados agregados por CEP (Marketplace)."
+        description="Pré-processamento assíncrono de CEPs (Marketplace MKP)."
     )
     parser.add_argument("--tenant", required=True, help="Tenant ID (inteiro)")
-    parser.add_argument("--arquivo", required=True, help="Caminho do CSV de entrada")
+    parser.add_argument("--arquivo", required=True, help="Caminho do arquivo (CSV/XLSX)")
     parser.add_argument("--descricao", required=True, help="Descrição do processamento")
     args = parser.parse_args()
 
     try:
         tenant_id = int(args.tenant)
     except ValueError:
-        logging.error("❌ Tenant ID inválido. Deve ser um número inteiro.")
+        logging.error("❌ Tenant ID inválido. Deve ser inteiro.")
         return
 
     descricao = args.descricao.strip()[:60]
     input_id = str(uuid.uuid4())
 
     setup_logging(tenant_id)
-    logging.info(f"🚀 Iniciando pré-processamento MKP (tenant={tenant_id})")
+    logging.info(f"🚀 Iniciando pré-processamento MKP (ASSÍNCRONO) | tenant={tenant_id}")
     logging.info(f"🆔 input_id={input_id}")
     logging.info(f"📝 Descrição: {descricao}")
-    logging.info("⚙️ Modo de execução: paralelizado (Nominatim + cache global + fallback Google)")
 
     input_path = args.arquivo
+    arquivo_nome = os.path.basename(input_path)
+
     if not os.path.exists(input_path):
         logging.error(f"❌ Arquivo não encontrado: {input_path}")
         return
 
-    sep = detectar_separador(input_path)
-    inicio_execucao = time.time()
+    ext = os.path.splitext(input_path)[1].lower()
+    sep = detectar_separador(input_path) if ext == ".csv" else None
 
+    # ------------------------------------------------------------
+    #  Conexão com banco
+    # ------------------------------------------------------------
     try:
-        conn = get_connection()
-        db_reader = DatabaseReader(conn)
-        db_writer = DatabaseWriter(conn)
+        db_reader = DatabaseReader()
+        db_writer = DatabaseWriter()
     except Exception as e:
-        logging.error(f"❌ Falha ao conectar ao banco: {e}", exc_info=True)
+        logging.error(f"❌ Falha ao inicializar banco: {e}", exc_info=True)
         return
 
     try:
         # ============================================================
-        # 🚀 Executa pipeline principal
+        # 1) Carregar e validar dados (SEM geocodificação)
         # ============================================================
+        df = carregar_dataframe_inteligente(input_path, sep=sep)
+
         use_case = MKPPreprocessingUseCase(
-            db_reader,
-            db_writer,
-            tenant_id,
+            reader=None,
+            writer=None,
+            tenant_id=tenant_id,
             input_id=input_id,
             descricao=descricao
         )
 
-        df_validos, df_invalidos, inseridos = use_case.execute(
-            input_path=input_path,
-            sep=sep,
-            input_id=input_id,
-            descricao=descricao,
+        df_validos, df_invalidos, _ = use_case.execute_df(df)
+
+        total_validos = len(df_validos)
+        total_invalidos = len(df_invalidos)
+        total_processados = total_validos + total_invalidos
+
+        logging.info(f"📌 {total_validos} válidos | {total_invalidos} inválidos")
+
+        # ============================================================
+        # 2) Exportar inválidos se existirem
+        # ============================================================
+        arquivo_invalidos = None
+        if total_invalidos > 0:
+            os.makedirs("output/invalidos", exist_ok=True)
+            arquivo_invalidos = f"output/invalidos/invalidos_mkp_{tenant_id}_{input_id}.csv"
+            df_invalidos.to_csv(arquivo_invalidos, sep=";", index=False, encoding="utf-8-sig")
+
+        # ============================================================
+        # 3) Inserir apenas VÁLIDOS no marketplace_cep (lat/lon NULL)
+        # ============================================================
+        inseridos = db_writer.inserir_mkp_sem_geo(
+            df_validos,
+            tenant_id,
+            input_id,
+            descricao
         )
-
-        total_validos = len(df_validos) if df_validos is not None else 0
-        total_invalidos = len(df_invalidos) if df_invalidos is not None else 0
-        total = total_validos + total_invalidos
-
-        arquivo_invalidos = salvar_invalidos(df_invalidos, os.path.dirname(input_path), input_id)
-        duracao = time.time() - inicio_execucao
+        logging.info(f"💾 {inseridos} registros inseridos no marketplace_cep (lat/lon NULL)")
 
         # ============================================================
-        # 💾 Registro de histórico no banco
+        # 4) Registrar histórico inicial
         # ============================================================
-        db_writer.salvar_historico_pdv_job(
+        db_writer.salvar_historico_mkp_job(
             tenant_id=tenant_id,
-            input_id=input_id,
-            descricao=descricao,
-            arquivo=os.path.basename(input_path),
-            status="done",
-            total_processados=total,
+            job_id=input_id,
+            arquivo=arquivo_nome,
+            status="processing",
+            total_processados=total_processados,
             validos=total_validos,
             invalidos=total_invalidos,
             arquivo_invalidos=arquivo_invalidos,
-            mensagem="✅ Pré-processamento MKP concluído com sucesso",
+            arquivo_validos=None,
+            mensagem="Processamento iniciado. Novo job master acionado.",
             inseridos=inseridos,
+            sobrescritos=0,
+            descricao=descricao,
+            input_id=input_id,
         )
 
         # ============================================================
-        # 📊 Resumo final da execução
+        # 5) Disparar job_master_mkp
         # ============================================================
-        logging.info("📊 Resumo da execução:")
-        logging.info(f"   • Tenant: {tenant_id}")
-        logging.info(f"   • Input ID: {input_id}")
-        logging.info(f"   • Descrição: {descricao}")
-        logging.info(f"   • CEPs válidos: {total_validos}")
-        logging.info(f"   • CEPs inválidos: {total_invalidos}")
-        logging.info(f"   • Registros inseridos: {inseridos}")
-        logging.info(f"   • Threads ativas: {use_case.geo_service.max_workers}")
-        logging.info(f"   • Tempo total: {duracao:.2f}s")
-        logging.info("✅ Processo MKP finalizado com sucesso.")
+        queue_master = Queue("mkp_master", connection=Redis(host="redis", port=6379))
+        queue_master.enqueue(job_master_mkp, tenant_id, input_id, descricao)
+
+        logging.info("🧠 Novo job_master_mkp enfileirado com sucesso!")
 
         # ============================================================
-        # 🧾 Saída JSON para integração com orquestrador
+        # 6) Retorno JSON para CLI
         # ============================================================
         print(json.dumps({
-            "status": "done",
+            "status": "processing",
             "tenant_id": tenant_id,
             "input_id": input_id,
             "descricao": descricao,
-            "arquivo": os.path.basename(input_path),
-            "total_processados": total,
+            "arquivo": arquivo_nome,
+            "total_processados": total_processados,
             "validos": total_validos,
             "invalidos": total_invalidos,
-            "inseridos": inseridos,
             "arquivo_invalidos": arquivo_invalidos,
-            "duracao_segundos": round(duracao, 2)
+            "msg": "Novo job master MKP enfileirado"
         }))
 
     except Exception as e:
-        logging.error(f"❌ Erro inesperado durante o processamento MKP: {e}", exc_info=True)
+        logging.error(f"❌ Erro inesperado no main MKP: {e}", exc_info=True)
+
         try:
-            db_writer.salvar_historico_pdv_job(
+            db_writer.salvar_historico_mkp_job(
                 tenant_id=tenant_id,
-                input_id=input_id,
-                descricao=descricao,
-                arquivo=os.path.basename(input_path),
+                job_id=input_id,
+                arquivo=arquivo_nome,
                 status="error",
                 total_processados=0,
                 validos=0,
                 invalidos=0,
                 arquivo_invalidos=None,
+                arquivo_validos=None,
                 mensagem=str(e),
                 inseridos=0,
+                sobrescritos=0,
+                descricao=descricao,
+                input_id=input_id
             )
-        except Exception as err:
-            logging.error(f"⚠️ Falha ao registrar histórico de erro: {err}")
+        except:
+            pass
 
         print(json.dumps({
             "status": "error",
@@ -191,13 +209,6 @@ def main():
             "input_id": input_id,
             "descricao": descricao
         }))
-
-    finally:
-        try:
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":

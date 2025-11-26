@@ -37,8 +37,9 @@ services:
     depends_on:
       - sales_router_db
     volumes:
-      - ./src/authentication:/app/authentication
-      - ./src/database:/app/database
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./output:/app/output
     networks:
       - sales_router_net
     restart: always
@@ -59,6 +60,8 @@ services:
       - TZ=America/Sao_Paulo
       - PYTHONPATH=/app/src
       - AUTH_SERVICE_URL=http://authentication_service:8000
+      - GMAPS_API_KEY=${GMAPS_API_KEY}
+
     expose:
       - "8000"
     ports:
@@ -68,42 +71,38 @@ services:
       - redis
       - authentication_service
     volumes:
-      - ./src:/app/src
+      - ./src/pdv_preprocessing:/app/src/pdv_preprocessing
+      - ./src/database:/app/src/database
       - ./data:/app/data
       - ./output:/app/output
     networks:
       - sales_router_net
     restart: always
 
-  # ======================
-  # PDV Jobs Worker (RQ)
-  # ======================
   pdv_jobs_worker:
     build:
       context: .
-      dockerfile: ./src/pdv_preprocessing/Dockerfile.worker
+      dockerfile: ./src/pdv_preprocessing/Dockerfile.pdv_preprocessing
     container_name: pdv_jobs_worker
     env_file:
       - .env
     environment:
-      - ENV=production
-      - TZ=America/Sao_Paulo
       - PYTHONPATH=/app/src
       - REDIS_URL=redis://redis:6379/0
-      - DB_HOST=sales_router_db
-      - DB_PORT=5432
     depends_on:
       - redis
       - sales_router_db
       - pdv_preprocessing
     volumes:
-      - ./src/pdv_preprocessing:/app/src/pdv_preprocessing
-      - ./src/database:/app/src/database
+      - ./src:/app/src
       - ./data:/app/data
+      - ./output:/app/output
     networks:
       - sales_router_net
-    restart: always
+    command: >
+      rq worker -v -u redis://redis:6379/0 pdv_jobs
 
+    restart: always
 
   # ======================
   # Clusterização de PDVs (Sales Clusterization)
@@ -118,10 +117,18 @@ services:
     environment:
       - DB_HOST=sales_router_db
       - DB_PORT=5432
+      - DB_NAME=sales_routing_db
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - REDIS_HOST=redis
+      - PYTHONPATH=/app/src
+    expose:
+      - "8004"
+    ports:
+      - "8011:8004"   # opcional, só para debug
     depends_on:
       - sales_router_db
       - redis
-    user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - ./src/sales_clusterization:/app/src/sales_clusterization
       - ./src/database:/app/src/database
@@ -206,7 +213,8 @@ services:
       - pdv_preprocessing
     volumes:
       - ./src/api_gateway/nginx.conf:/etc/nginx/conf.d/sales_router.conf:ro
-      - ./output:/home/ubuntu/sales_router/output   # 🗺️ Compartilha os mapas
+      - ./output:/app/output
+
     networks:
       - sales_router_net
     restart: always
@@ -226,31 +234,7 @@ services:
     networks:
       - sales_router_net
     restart: always
-
-  # ======================
-  # Worker de Pipeline Completo (Assíncrono)
-  # ======================
-  pipeline_worker:
-    build:
-      context: .
-      dockerfile: ./src/jobs/Dockerfile.pipeline_worker
-    container_name: pipeline_worker
-    env_file:
-      - .env
-    environment:
-      - DB_HOST=sales_router_db
-      - DB_PORT=5432
-    depends_on:
-      - redis
-      - sales_router_db
-    volumes:
-      - ./src:/app/src
-      - ./data:/app/data
-      - ./output:/app/output
-    networks:
-      - sales_router_net
-    restart: always
-
+  
   # ======================
   # Clusterization Jobs Worker (RQ)
   # ======================
@@ -325,6 +309,51 @@ services:
     command: >
       sh -c "rq worker -u redis://redis:6379/0 routing_subjobs"
     restart: always
+
+  worker_mkp_base: &worker_mkp_base
+    build:
+      context: .
+      dockerfile: ./src/pdv_preprocessing/Dockerfile.mkp_worker
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      GMAPS_API_KEY: ${GMAPS_API_KEY}
+    depends_on:
+      - redis
+      - sales_router_db
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./output:/app/output
+    networks:
+      - sales_router_net
+    restart: always
+
+  worker_mkp_1:
+    <<: *worker_mkp_base
+   
+    command: ["mkp_geocode"]
+
+  worker_mkp_2:
+    <<: *worker_mkp_base
+    
+    command: ["mkp_geocode"]
+
+  worker_mkp_3:
+    <<: *worker_mkp_base
+    
+    command: ["mkp_geocode"]
+
+  worker_mkp_master_finalize:
+    <<: *worker_mkp_base
+    container_name: worker_mkp_master_finalize
+    command: ["mkp_master_finalize"]
+
+  worker_mkp_master:
+    <<: *worker_mkp_base
+    container_name: worker_mkp_master
+    command: ["mkp_master"]
 
 # ======================
 # Volumes persistentes

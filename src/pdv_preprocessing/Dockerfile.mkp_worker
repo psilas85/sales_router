@@ -1,0 +1,16 @@
+#sales_router/src/pdv_preprocessing/Dockerfile.mkp_worker
+# ============================================================
+# 🐳 Worker MKP - Genérico (todos os workers MKP usam este container)
+# ============================================================
+
+FROM psilas85/sales_router-base:latest
+
+WORKDIR /app
+
+COPY src/pdv_preprocessing /app/src/pdv_preprocessing
+COPY src/database /app/src/database
+
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+ENTRYPOINT ["rq", "worker", "-u", "redis://redis:6379/0"]
+CMD ["mkp_geocode"]

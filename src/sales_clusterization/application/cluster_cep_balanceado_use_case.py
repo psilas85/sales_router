@@ -1,3 +1,5 @@
+#sales_router/src/sales_clusterization/application/cluster_cep_balanceado_use_case.py
+
 # ============================================================
 # 📦 src/sales_clusterization/application/cluster_cep_balanceado_use_case.py
 # ============================================================
@@ -13,13 +15,6 @@ from sales_clusterization.domain.haversine_utils import haversine
 
 
 class ClusterCEPBalanceadoUseCase(ClusterCEPAtivaUseCase):
-    """
-    Clusterização balanceada de CEPs com base em limites mínimos e máximos de CEPs.
-    Trabalha apenas com centros logísticos reais — não cria novos centros.
-    - Clusters grandes redistribuem excedentes entre centros próximos (até max_merge_km).
-    - Clusters pequenos fundem-se ao centro real mais próximo, ignorando o raio.
-    - Mantém consistência total dos dados de centro (nome, CNPJ, bairro, coordenadas).
-    """
 
     def __init__(
         self,
@@ -41,44 +36,60 @@ class ClusterCEPBalanceadoUseCase(ClusterCEPAtivaUseCase):
     def execute(self):
         inicio_execucao = time.time()
         logger.info("🚀 Iniciando clusterização balanceada de CEPs...")
-        clusterization_id = str(uuid.uuid4())
 
+        clusterization_id = str(uuid.uuid4())
         resultado_inicial = super().execute()
+
         if not resultado_inicial:
             logger.error("❌ Falha na clusterização base.")
             return None
 
         clusterization_id_base = resultado_inicial["clusterization_id"]
 
-        conn = get_connection()
-        df_ceps = pd.read_sql(
+        # ============================================================
+        # 1) LEITURA ROBUSTA DOS CEPS — FIX ABSOLUTO DO PROBLEMA
+        # ============================================================
+        df_ceps = self._read_df_sql(
             "SELECT * FROM mkp_cluster_cep WHERE clusterization_id = %s;",
-            conn,
-            params=[clusterization_id_base],
+            (clusterization_id_base,)
         )
-        conn.close()
 
         if df_ceps.empty:
             logger.error("❌ Nenhum CEP encontrado para balanceamento.")
             return None
 
-        # Centros reais de referência
-        df_centros = (
-            df_ceps.groupby("cluster_id")
-            .agg(
-                lat=("cluster_lat", "mean"),
-                lon=("cluster_lon", "mean"),
-                centro_nome=("centro_nome", "first"),
-                centro_cnpj=("centro_cnpj", "first"),
-                cluster_bairro=("cluster_bairro", "first"),
-            )
-            .reset_index()
+        # ============================================================
+        # 2) LEITURA DOS CENTROS REAIS
+        # ============================================================
+        df_centros = self._read_df_sql(
+            """
+            SELECT DISTINCT 
+                cluster_id,
+                cluster_lat AS lat,
+                cluster_lon AS lon,
+                centro_nome,
+                centro_cnpj,
+                cluster_bairro
+            FROM mkp_cluster_cep
+            WHERE clusterization_id = %s
+            """,
+            (clusterization_id_base,)
         )
+
+        # ============================================================
+        # 🧹 FIX — DEDUPE DE CEP (impede erro ON CONFLICT)
+        # ============================================================
+        df_ceps["cep"] = df_ceps["cep"].astype(str).str.replace(r"\D+", "", regex=True)
+        df_ceps = df_ceps[df_ceps["cep"].str.len() == 8]
+        df_ceps = df_ceps.drop_duplicates(subset=["cep"]).copy()
 
         df_bal = self.balancear_clusters(df_ceps.copy(), df_centros.copy())
         df_bal["modo_clusterizacao"] = "balanceada"
         df_bal["clusterization_id"] = clusterization_id
 
+        # ============================================================
+        # 💾 GRAVAÇÃO
+        # ============================================================
         logger.info("💾 Gravando clusters balanceados...")
         self.writer.inserir_mkp_cluster_cep(df_bal.to_dict(orient="records"))
 
@@ -104,73 +115,91 @@ class ClusterCEPBalanceadoUseCase(ClusterCEPAtivaUseCase):
         }
 
     # ============================================================
-    # ⚖️ Balanceamento principal
+    # 🔽 FUNÇÃO DE LEITURA SQL ROBUSTA (SUBSTITUI pd.read_sql)
+    # ============================================================
+    def _read_df_sql(self, sql: str, params: tuple):
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        cols = [desc[0] for desc in cur.description]
+        cur.close()
+        conn.close()
+        return pd.DataFrame(rows, columns=cols)
+
+    # ============================================================
+    # ⚖️ BALANCEAMENTO PRINCIPAL
     # ============================================================
     def balancear_clusters(self, df_ceps: pd.DataFrame, df_centros: pd.DataFrame) -> pd.DataFrame:
-        logger.info("⚖️ Iniciando balanceamento de clusters com base em CEPs (modo realista).")
+        logger.info("⚖️ Iniciando balanceamento realista de CEPs (min/max real).")
 
         filtro_coluna = "clientes_total" if getattr(self, "usar_clientes_total", False) else "clientes_target"
         df_ceps = df_ceps[df_ceps[filtro_coluna] > 0].copy()
-        logger.info(f"📊 Filtro aplicado: apenas CEPs com {filtro_coluna} > 0 ({len(df_ceps)} linhas válidas).")
 
-        # Cria dicionário fixo com dados dos centros
+        OUTLIER_MAX_KM = 30
+        df_ceps["distancia_km"] = df_ceps.apply(
+            lambda r: haversine((r["lat"], r["lon"]), (r["cluster_lat"], r["cluster_lon"])),
+            axis=1
+        )
+
+        antes = len(df_ceps)
+        df_ceps = df_ceps[df_ceps["distancia_km"] <= OUTLIER_MAX_KM].copy()
+        removidos = antes - len(df_ceps)
+
+        if removidos > 0:
+            logger.warning(f"🧹 Removidos {removidos} outliers (> {OUTLIER_MAX_KM} km).")
+
         centros_dict = df_centros.set_index("cluster_id").to_dict("index")
-
-        alteracoes_total = 0
+        total_mov = 0
         warnings_total = []
 
-        for iteracao in range(1, self.max_iter + 1):
-            resumo = df_ceps.groupby("cluster_id")["cep"].count().reset_index().rename(columns={"cep": "qtd_ceps"})
-            clusters_acima = resumo[resumo["qtd_ceps"] > self.max_ceps]
-            clusters_abaixo = resumo[resumo["qtd_ceps"] < self.min_ceps]
+        # ============================================================
+        # 🔁 Iterações de ajuste
+        # ============================================================
+        for i in range(1, self.max_iter + 1):
+            resumo = df_ceps.groupby("cluster_id")["cep"].count().reset_index()
+            resumo = resumo.rename(columns={"cep": "qtd_ceps"})
+            acima = resumo[resumo["qtd_ceps"] > self.max_ceps]
+            abaixo = resumo[resumo["qtd_ceps"] < self.min_ceps]
 
-            logger.info(f"🔁 Iteração {iteracao}/{self.max_iter} — acima={len(clusters_acima)} | abaixo={len(clusters_abaixo)}")
+            logger.info(f"🔁 Iteração {i} — acima={len(acima)}, abaixo={len(abaixo)}")
 
-            if clusters_acima.empty and clusters_abaixo.empty:
-                logger.success("✅ Todos os clusters dentro dos limites definidos.")
+            if acima.empty and abaixo.empty:
+                logger.success("✅ Tudo dentro de min/max.")
                 break
 
-            df_ceps, alter_excesso, warn_excesso = self.redistribuir_clusters_reais(
+            df_ceps, a1, w1 = self.redistribuir_clusters_reais(
                 df_ceps, df_centros, centros_dict, self.min_ceps, self.max_ceps, self.max_merge_km
             )
 
-            df_ceps, alter_deficit, warn_deficit = self.fundir_clusters_pequenos_reais(
+            df_ceps, a2, w2 = self.fundir_clusters_pequenos_reais(
                 df_ceps, df_centros, centros_dict, self.min_ceps, self.max_ceps
             )
 
-            alter_iter = alter_excesso + alter_deficit
-            alteracoes_total += alter_iter
-            warnings_total.extend(warn_excesso + warn_deficit)
+            mov = a1 + a2
+            total_mov += mov
+            warnings_total.extend(w1 + w2)
 
-            if alter_iter == 0:
-                logger.warning("⚠️ Nenhuma realocação adicional possível nesta iteração.")
+            if mov == 0:
+                logger.warning("⚠️ Nenhuma realocação possível nesta iteração.")
                 break
 
-            # Atualiza centros médios (sem alterar dados originais)
-            df_centros = (
-                df_ceps.groupby("cluster_id")[["lat", "lon"]]
-                .mean()
-                .reset_index()
-            )
+            df_centros = df_ceps.groupby("cluster_id")[["lat", "lon"]].mean().reset_index()
 
-        # Verificação final de consistência
         df_ceps = self._corrigir_inconsistencias(df_ceps, df_centros)
 
-        resumo_final = df_ceps.groupby("cluster_id")["cep"].count()
-        p90 = np.percentile(resumo_final, 90)
-        logger.info(
-            f"📈 Estatísticas finais — Clusters: {df_ceps['cluster_id'].nunique()} | "
-            f"min={resumo_final.min()} | média={resumo_final.mean():.1f} | "
-            f"máx={resumo_final.max()} | p90={p90:.1f}"
+        # ============================================================
+        # RECÁLCULO FINAL
+        # ============================================================
+        df_ceps["distancia_km"] = df_ceps.apply(
+            lambda r: haversine((r["lat"], r["lon"]), (r["cluster_lat"], r["cluster_lon"])),
+            axis=1
         )
+        df_ceps["tempo_min"] = df_ceps["distancia_km"] * (60 / 40)
 
-        if warnings_total:
-            logger.warning("⚠️ Clusters com avisos:")
-            for w in warnings_total:
-                logger.warning(f"   • {w}")
-
-        logger.success(f"🏁 Balanceamento concluído: {alteracoes_total} CEPs realocados.")
+        logger.success(f"🏁 Balanceamento concluído — {total_mov} realocações.")
         return df_ceps
+
 
     # ============================================================
     # ♻️ Redistribuição entre centros reais (grandes → médios)
@@ -247,40 +276,69 @@ class ClusterCEPBalanceadoUseCase(ClusterCEPAtivaUseCase):
     def fundir_clusters_pequenos_reais(self, df_ceps, df_centros, centros_dict, min_ceps, max_ceps):
         alteracoes = 0
         warnings = []
+
         cluster_stats = df_ceps.groupby("cluster_id")["cep"].count().to_dict()
 
         for cluster_id, total in cluster_stats.items():
+            # Não precisa fundir
             if total >= min_ceps:
                 continue
 
+            # Centro de referência
             centro_ref = df_centros[df_centros["cluster_id"] == cluster_id]
             if centro_ref.empty:
                 continue
 
             lat_c, lon_c = centro_ref.iloc[0]["lat"], centro_ref.iloc[0]["lon"]
 
+            # Calcula distância para todos os centros
             df_centros["dist_km"] = df_centros.apply(
-                lambda r: haversine((lat_c, lon_c), (r["lat"], r["lon"])), axis=1
+                lambda r: haversine((lat_c, lon_c), (r["lat"], r["lon"])),
+                axis=1
             )
-            vizinho = df_centros[df_centros["cluster_id"] != cluster_id].sort_values("dist_km").iloc[0]
+
+            # Centros candidatos (todos menos ele mesmo)
+            candidatos = df_centros[df_centros["cluster_id"] != cluster_id].copy()
+
+            # Nenhum vizinho disponível → não funde
+            if candidatos.empty:
+                warnings.append(
+                    f"⚠️ Cluster {cluster_id} ({total}) não pode ser fundido — nenhum vizinho disponível."
+                )
+                continue
+
+            # Vizinho mais próximo
+            candidatos = candidatos.sort_values("dist_km")
+            vizinho = candidatos.iloc[0]
+
             novo_id = vizinho["cluster_id"]
             novo_centro = centros_dict.get(novo_id, {})
 
             mask = df_ceps["cluster_id"] == cluster_id
+
+            # Atualiza dados de centro
             for col, val in novo_centro.items():
                 if col in df_ceps.columns:
                     df_ceps.loc[mask, col] = val
+
+            # Atualiza o cluster
             df_ceps.loc[mask, "cluster_id"] = novo_id
 
             alteracoes += total
             novo_total = df_ceps[df_ceps["cluster_id"] == novo_id].shape[0]
 
+            # Checagem de estouro
             if novo_total > max_ceps:
-                warnings.append(f"⚠️ Cluster {cluster_id} ({total}) fundido a {novo_id} → destino excedeu ({novo_total}>{max_ceps}).")
+                warnings.append(
+                    f"⚠️ Cluster {cluster_id} ({total}) fundido a {novo_id} → destino excedeu ({novo_total}>{max_ceps})."
+                )
             else:
-                logger.info(f"🤝 Cluster {cluster_id} ({total}) fundido com {novo_id} ({vizinho['dist_km']:.1f} km).")
+                logger.info(
+                    f"🤝 Cluster {cluster_id} ({total}) fundido com {novo_id} ({vizinho['dist_km']:.1f} km)."
+                )
 
         return df_ceps, alteracoes, warnings
+
 
     # ============================================================
     # 🧹 Correção de inconsistências antes de gravação

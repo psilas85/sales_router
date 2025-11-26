@@ -1,11 +1,16 @@
+#sales_router/src/pdv_preprocessing/infrastructure/database_writer.py
+
 import logging
 import time
-from contextlib import closing
 from functools import wraps
-from typing import Optional, List
-import psycopg2
+from typing import Optional, List, Tuple
 from psycopg2.extras import execute_values
+import psycopg2
 
+from pdv_preprocessing.infrastructure.database_reader import POOL
+from pdv_preprocessing.domain.utils_geo import coordenada_generica
+
+from database.db_connection import get_connection_context
 
 # ============================================================
 # 🔁 Decorator de retry com backoff exponencial
@@ -20,22 +25,25 @@ def retry_on_failure(max_retries=3, delay=1.0, backoff=2.0):
                     return func(*args, **kwargs)
                 except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
                     tentativa += 1
-                    logging.warning(f"⚠️ Erro de conexão na tentativa {tentativa}/{max_retries}: {e}")
+                    logging.warning(
+                        f"⚠️ Erro de conexão ({func.__name__}) tentativa {tentativa}/{max_retries}: {e}"
+                    )
                     time.sleep(delay * (backoff ** (tentativa - 1)))
                 except Exception as e:
                     logging.error(f"❌ Erro inesperado em {func.__name__}: {e}", exc_info=True)
                     break
+
             logging.error(f"🚨 Falha após {max_retries} tentativas em {func.__name__}")
-            return 0
+            return None
         return wrapper
     return decorator
 
 
-class DatabaseWriter:
-    """Gerencia inserções e atualizações no banco PostgreSQL (PDVs, MKP e cache)."""
 
-    def __init__(self, conn):
-        self.conn = conn
+class DatabaseWriter:
+    def __init__(self):
+        pass
+
 
     # ============================================================
     # 💾 Inserção de PDVs
@@ -43,10 +51,8 @@ class DatabaseWriter:
     @retry_on_failure()
     def inserir_pdvs(self, lista_pdvs) -> int:
         if not lista_pdvs:
-            logging.warning("⚠️ Nenhum PDV para inserir.")
             return 0
 
-        inicio = time.time()
         valores = [
             (
                 p.tenant_id, p.input_id, p.descricao, p.cnpj, p.logradouro, p.numero,
@@ -67,67 +73,200 @@ class DatabaseWriter:
             DO NOTHING;
         """
 
+        conn = POOL.getconn()
         try:
-            with closing(self.conn.cursor()) as cur:
+            with conn.cursor() as cur:
                 execute_values(cur, sql, valores)
-                self.conn.commit()
-                inseridos = cur.rowcount or len(valores)
-            dur = time.time() - inicio
-            logging.info(f"💾 [PDV_DB] Inseridos {inseridos} PDVs ({dur:.2f}s)")
-            return inseridos
+            conn.commit()
+            return len(valores)
         except Exception as e:
-            self.conn.rollback()
+            conn.rollback()
             logging.error(f"❌ Erro ao inserir PDVs: {e}", exc_info=True)
             return 0
+        finally:
+            POOL.putconn(conn)
+
 
     # ============================================================
     # 🗺️ Inserção no cache de endereços (PDV e MKP unificado)
     # ============================================================
     @retry_on_failure()
-    def salvar_cache(self, chave: str, lat: float, lon: float, tipo: str = "pdv") -> None:
-        if not chave or lat is None or lon is None:
+    def salvar_cache(self, chave: str, lat: float, lon: float, tipo: str, fonte: str = "desconhecido"):
+
+        def fix_encoding(x: str) -> str:
+            if not x:
+                return ""
+            try:
+                x = x.encode("latin1").decode("utf-8")
+            except Exception:
+                pass
+            return x
+
+        def normalize_endereco(x: str) -> str:
+            import unicodedata
+            if not x:
+                return ""
+            x = fix_encoding(x).strip().lower()
+            x = unicodedata.normalize("NFKD", x).encode("ascii", "ignore").decode("ascii")
+            x = " ".join(x.split())
+            return x
+
+        if lat is None or lon is None or coordenada_generica(lat, lon):
+            logging.warning(f"⚠️ Ignorando salvar_cache coordenada inválida ({tipo}) para {chave}")
             return
 
-        # Proteção contra coordenadas genéricas
-        if abs(lat + 23.5506507) < 0.002 and abs(lon + 46.6333824) < 0.002:
-            logging.debug(f"🧹 Coordenada genérica ignorada: {chave} ({lat}, {lon})")
-            return
-
+        conn = POOL.getconn()
         try:
-            with closing(self.conn.cursor()) as cur:
-                if tipo.lower() == "mkp":
-                    cur.execute(
-                        """
-                        INSERT INTO mkp_enderecos_cache (cep, lat, lon)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (cep) DO NOTHING;
-                        """,
-                        (str(chave).zfill(8), lat, lon),
-                    )
-                else:
+            with conn.cursor() as cur:
+
+                # PDV → tabela: enderecos_cache (sem campo 'fonte')
+                if tipo == "pdv":
+                    endereco_norm = normalize_endereco(chave)
                     cur.execute(
                         """
                         INSERT INTO enderecos_cache (endereco, lat, lon)
                         VALUES (%s, %s, %s)
-                        ON CONFLICT (endereco) DO NOTHING;
+                        ON CONFLICT (endereco)
+                        DO UPDATE SET
+                            lat = EXCLUDED.lat,
+                            lon = EXCLUDED.lon,
+                            atualizado_em = NOW();
                         """,
-                        (chave.strip().lower(), lat, lon),
+                        (endereco_norm, lat, lon),
                     )
-                self.conn.commit()
-            logging.debug(f"💾 [CACHE_DB] Inserido no cache ({tipo.upper()}): {chave} → ({lat}, {lon})")
+
+                # MKP → tabela: mkp_enderecos_cache (tem 'fonte')
+                else:
+                    cep = str(chave).replace("-", "").zfill(8)
+                    cur.execute(
+                        """
+                        INSERT INTO mkp_enderecos_cache (cep, lat, lon, fonte)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (cep)
+                        DO UPDATE SET
+                            lat = EXCLUDED.lat,
+                            lon = EXCLUDED.lon,
+                            fonte = EXCLUDED.fonte,
+                            atualizado_em = NOW();
+                        """,
+                        (cep, lat, lon, fonte),
+                    )
+
+            conn.commit()
+
         except Exception as e:
-            self.conn.rollback()
-            logging.error(f"❌ Erro ao salvar cache ({tipo}): {e}", exc_info=True)
+            conn.rollback()
+            logging.error(f"❌ Erro ao salvar no cache ({tipo}): {e}", exc_info=True)
+
+        finally:
+            POOL.putconn(conn)
+
+    # ============================================================
+    # 💾 ViaCEP Cache — Inserir ou atualizar 1 CEP
+    # ============================================================
+    @retry_on_failure()
+    def salvar_viacep_cache(
+        self,
+        cep: str,
+        logradouro: Optional[str],
+        bairro: Optional[str],
+        cidade: Optional[str],
+        uf: Optional[str]
+    ) -> None:
+
+        if not cep:
+            return
+
+        cep = str(cep).replace("-", "").strip().zfill(8)
+
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO viacep_cache (
+                        cep, logradouro, bairro, cidade, uf
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (cep)
+                    DO UPDATE SET
+                        logradouro = EXCLUDED.logradouro,
+                        bairro     = EXCLUDED.bairro,
+                        cidade     = EXCLUDED.cidade,
+                        uf         = EXCLUDED.uf,
+                        atualizado_em = NOW();
+                    """,
+                    (cep, logradouro, bairro, cidade, uf)
+                )
+            conn.commit()
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"❌ Erro ao salvar viacep_cache para {cep}: {e}", exc_info=True)
+
+        finally:
+            POOL.putconn(conn)
+
+    # ============================================================
+    # 💾 ViaCEP Cache — Inserção em lote
+    # ============================================================
+    @retry_on_failure()
+    def salvar_viacep_cache_em_lote(self, lista_dados: List[Tuple[str, str, str, str, str]]) -> int:
+        """
+        lista_dados = [(cep, logradouro, bairro, cidade, uf), ...]
+        """
+        if not lista_dados:
+            return 0
+
+        valores = [
+            (str(cep).replace("-", "").strip().zfill(8), logradouro, bairro, cidade, uf)
+            for (cep, logradouro, bairro, cidade, uf) in lista_dados
+        ]
+
+        sql = """
+            INSERT INTO viacep_cache (
+                cep, logradouro, bairro, cidade, uf
+            )
+            VALUES %s
+            ON CONFLICT (cep)
+            DO UPDATE SET
+                logradouro = EXCLUDED.logradouro,
+                bairro     = EXCLUDED.bairro,
+                cidade     = EXCLUDED.cidade,
+                uf         = EXCLUDED.uf,
+                atualizado_em = NOW();
+        """
+
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                execute_values(cur, sql, valores)
+            conn.commit()
+            return len(valores)
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"❌ Erro ao salvar lote ViaCEP cache: {e}", exc_info=True)
+            return 0
+
+        finally:
+            POOL.putconn(conn)
+
+
+
+
 
     # ============================================================
     # 🗺️ Inserção individual em cache PDV
     # ============================================================
     @retry_on_failure()
     def inserir_localizacao(self, endereco: str, lat: float, lon: float) -> None:
-        if not endereco or lat is None or lon is None:
+        if not endereco or lat is None or lon is None or coordenada_generica(lat, lon):
             return
+
+        conn = POOL.getconn()
         try:
-            with closing(self.conn.cursor()) as cur:
+            with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO enderecos_cache (endereco, lat, lon)
@@ -136,13 +275,16 @@ class DatabaseWriter:
                     """,
                     (endereco.strip().lower(), lat, lon),
                 )
-                self.conn.commit()
+            conn.commit()
         except Exception as e:
-            self.conn.rollback()
+            conn.rollback()
             logging.error(f"❌ Erro ao inserir localização no cache: {e}", exc_info=True)
+        finally:
+            POOL.putconn(conn)
+
 
     # ============================================================
-    # 🧾 Registro de histórico de execução
+    # 🧾 Registro de histórico de execução (VERSÃO FINAL CORRIGIDA)
     # ============================================================
     @retry_on_failure()
     def salvar_historico_pdv_job(
@@ -161,10 +303,18 @@ class DatabaseWriter:
         input_id: Optional[str] = None,
         job_id: Optional[str] = None,
     ) -> None:
-        """Salva histórico de execução do pré-processamento de PDVs."""
-        job_id = job_id or input_id
+
+        # 🔥 Garantir que job_id seja válido e obrigatório
+        if job_id is None:
+            raise ValueError("job_id não pode ser None (coluna NOT NULL no banco).")
+
+        # 🔥 Converter para string (psycopg2 exige)
+        job_id = str(job_id)
+        input_id = str(input_id) if input_id is not None else None
+
+        conn = POOL.getconn()
         try:
-            with closing(self.conn.cursor()) as cur:
+            with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO historico_pdv_jobs (
@@ -175,92 +325,161 @@ class DatabaseWriter:
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s);
                     """,
                     (
-                        tenant_id, job_id, arquivo, status, total_processados,
-                        validos, invalidos, arquivo_invalidos, mensagem,
-                        inseridos, sobrescritos, descricao, input_id,
+                        tenant_id,
+                        job_id,
+                        arquivo,
+                        status,
+                        total_processados,
+                        validos,
+                        invalidos,
+                        arquivo_invalidos,
+                        mensagem,
+                        inseridos,
+                        sobrescritos,
+                        descricao,
+                        input_id,
                     ),
                 )
-                self.conn.commit()
-            logging.info(
-                f"🧾 Histórico salvo (tenant={tenant_id}, input_id={input_id}, status={status})"
-            )
+            conn.commit()
         except Exception as e:
-            self.conn.rollback()
-            logging.error(f"❌ Erro ao salvar histórico (input_id={input_id}): {e}", exc_info=True)
+            conn.rollback()
+            logging.error(f"❌ Erro ao salvar histórico: {e}", exc_info=True)
+        finally:
+            POOL.putconn(conn)
+
+
 
     # ============================================================
-    # 💾 Inserção de dados MKP agregados
+    # 💾 Inserção de dados MKP agregados (versão final)
     # ============================================================
     @retry_on_failure()
     def inserir_mkp(self, lista_mkp) -> int:
         if not lista_mkp:
-            logging.warning("⚠️ Nenhum registro MKP para inserir.")
             return 0
 
-        inicio = time.time()
+        valores = []
         vistos = set()
-        valores_unicos = []
+
         for m in lista_mkp:
-            chave = (m.tenant_id, m.input_id, str(m.cep).zfill(8))
+            cep = str(m.cep).zfill(8)
+            chave = (m.tenant_id, m.input_id, cep)
+
+            # evita repetir inserções
             if chave in vistos:
                 continue
             vistos.add(chave)
-            valores_unicos.append((
-                m.tenant_id, m.input_id, m.descricao, m.cidade, m.uf, m.bairro,
-                str(m.cep).zfill(8) if m.cep else None,
-                m.clientes_total, m.clientes_target,
-                getattr(m, "lat", None), getattr(m, "lon", None),
+
+            lat = getattr(m, "lat", None)
+            lon = getattr(m, "lon", None)
+
+            # -----------------------------------------------------------------
+            # ❌ BLOQUEIO TOTAL
+            # NÃO INSERIR NO DB se lat/lon forem nulos ou suspeitos
+            #  (pipeline já faz isso, mas aqui reforça o bloqueio)
+            # -----------------------------------------------------------------
+            if (
+                lat is None or lon is None or
+                coordenada_generica(lat, lon)
+            ):
+                continue  # <-- NÃO SALVA NO DB
+
+            valores.append((
+                m.tenant_id,
+                m.input_id,
+                m.descricao,
+                m.cidade,
+                m.uf,
+                m.bairro,
+                cep,
+                m.clientes_total,
+                m.clientes_target,
+                lat,
+                lon,
+                m.status_geolocalizacao,   # <-- CORREÇÃO
             ))
+
+
+        if not valores:
+            logging.warning("⚠️ Nenhum MKP válido para inserir no marketplace_cep.")
+            return 0
 
         sql = """
             INSERT INTO marketplace_cep (
                 tenant_id, input_id, descricao, cidade, uf, bairro, cep,
-                clientes_total, clientes_target, lat, lon
+                clientes_total, clientes_target, lat, lon, status_geolocalizacao
             )
             VALUES %s
+
             ON CONFLICT (tenant_id, input_id, cep)
             DO UPDATE SET
                 clientes_total = EXCLUDED.clientes_total,
                 clientes_target = EXCLUDED.clientes_target,
+                -- só atualiza lat/lon se EXCLUDED tiver coordenadas boas
                 lat = COALESCE(EXCLUDED.lat, marketplace_cep.lat),
                 lon = COALESCE(EXCLUDED.lon, marketplace_cep.lon),
-                atualizado_em = NOW();
+                status_geolocalizacao = COALESCE(EXCLUDED.status_geolocalizacao, marketplace_cep.status_geolocalizacao),
+                atualizado_em = NOW()
+                ;
         """
 
+        conn = POOL.getconn()
         try:
-            with closing(self.conn.cursor()) as cur:
-                execute_values(cur, sql, valores_unicos)
-                self.conn.commit()
-                inseridos = cur.rowcount or len(valores_unicos)
-            dur = time.time() - inicio
-            logging.info(f"💾 [MKP_DB] Inseridos/atualizados {inseridos} registros ({dur:.2f}s)")
-            return inseridos
+            with conn.cursor() as cur:
+                execute_values(cur, sql, valores)
+            conn.commit()
+            return len(valores)
         except Exception as e:
-            self.conn.rollback()
-            logging.error(f"❌ Erro ao inserir/atualizar marketplace_cep: {e}", exc_info=True)
+            conn.rollback()
+            logging.error(f"❌ Erro ao inserir marketplace_cep: {e}", exc_info=True)
             return 0
+        finally:
+            POOL.putconn(conn)
 
+
+
+    # ============================================================
+    # 💾 Inserção individual no cache MKP
+    # ============================================================
     # ============================================================
     # 💾 Inserção individual no cache MKP
     # ============================================================
     @retry_on_failure()
     def inserir_localizacao_mkp(self, cep: str, lat: float, lon: float) -> None:
+
         if not cep or lat is None or lon is None:
             return
+
+        # CEP corrigido e padronizado
+        cep = str(cep).replace("-", "").zfill(8)
+
+        # Não salvar coordenadas suspeitas
+        if coordenada_generica(lat, lon):
+            logging.warning(f"⚠️ Coordenada suspeita ignorada para CEP {cep}: {lat}, {lon}")
+            return
+
+        conn = POOL.getconn()
         try:
-            with closing(self.conn.cursor()) as cur:
+            with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO mkp_enderecos_cache (cep, lat, lon)
                     VALUES (%s, %s, %s)
-                    ON CONFLICT (cep) DO NOTHING;
+                    ON CONFLICT (cep)
+                    DO UPDATE SET
+                        lat = EXCLUDED.lat,
+                        lon = EXCLUDED.lon,
+                        atualizado_em = NOW();
                     """,
-                    (str(cep).zfill(8), lat, lon),
+                    (cep, lat, lon),
                 )
-                self.conn.commit()
+            conn.commit()
         except Exception as e:
-            self.conn.rollback()
+            conn.rollback()
             logging.error(f"❌ Erro ao inserir CEP no cache MKP: {e}", exc_info=True)
+        finally:
+            POOL.putconn(conn)
+
+
 
     # ============================================================
     # 🔄 Atualização de lat/lon de MKP via cache
@@ -272,17 +491,19 @@ class DatabaseWriter:
         uf: Optional[str] = None,
         input_id: Optional[str] = None,
     ) -> int:
+
+        conn = POOL.getconn()
         try:
-            inicio = time.time()
             sql = """
                 UPDATE marketplace_cep AS m
                 SET lat = c.lat, lon = c.lon, atualizado_em = NOW()
                 FROM mkp_enderecos_cache AS c
                 WHERE m.cep = c.cep
-                  AND (m.lat IS NULL OR m.lon IS NULL)
-                  AND c.lat IS NOT NULL
-                  AND c.lon IS NOT NULL
+                AND (m.lat IS NULL OR m.lon IS NULL)
+                AND c.lat IS NOT NULL
+                AND c.lon IS NOT NULL
             """
+
             params = []
             if tenant_id:
                 sql += " AND m.tenant_id = %s"; params.append(tenant_id)
@@ -291,14 +512,257 @@ class DatabaseWriter:
             if input_id:
                 sql += " AND m.input_id = %s"; params.append(input_id)
 
-            with closing(self.conn.cursor()) as cur:
+            with conn.cursor() as cur:
                 cur.execute(sql, tuple(params))
                 afetados = cur.rowcount
-                self.conn.commit()
-            dur = time.time() - inicio
-            logging.info(f"🗺️ [MKP_DB] Atualizados {afetados} CEPs com coordenadas do cache ({dur:.2f}s)")
+
+            conn.commit()
             return afetados
+
         except Exception as e:
-            self.conn.rollback()
+            conn.rollback()
             logging.error(f"❌ Erro ao atualizar lat/lon a partir do cache: {e}", exc_info=True)
             return 0
+        finally:
+            POOL.putconn(conn)
+
+    @retry_on_failure()
+    def salvar_historico_mkp_job(
+        self,
+        tenant_id: int,
+        job_id: str,
+        arquivo: str,
+        status: str,
+        total_processados: int,
+        validos: int,
+        invalidos: int,
+        arquivo_invalidos: Optional[str],
+        arquivo_validos: Optional[str],
+        mensagem: str,
+        inseridos: int,
+        sobrescritos: int,
+        descricao: str,
+        input_id: str,
+    ):
+        query = """
+            INSERT INTO historico_mkp_jobs (
+                tenant_id, job_id, arquivo, status,
+                total_processados, validos, invalidos,
+                arquivo_invalidos, arquivo_validos,
+                mensagem, inseridos, sobrescritos,
+                descricao, input_id, criado_em
+            )
+            VALUES (%s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s,
+                    %s, %s, %s,
+                    %s, %s, NOW());
+        """
+
+        params = (
+            tenant_id, job_id, arquivo, status,
+            total_processados, validos, invalidos,
+            arquivo_invalidos, arquivo_validos,
+            mensagem, inseridos, sobrescritos,
+            descricao, input_id,
+        )
+
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"❌ Erro ao salvar histórico MKP: {e}", exc_info=True)
+        finally:
+            POOL.putconn(conn)
+
+
+    def aplicar_cache_mkp_para_marketplace(self, tenant_id: int, input_id: str):
+        with get_connection_context() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE marketplace_cep mc
+                    SET lat = c.lat,
+                        lon = c.lon,
+                        status_geolocalizacao = 'geo_ok',
+                        atualizado_em = NOW()
+                    FROM mkp_enderecos_cache c
+                    WHERE mc.tenant_id = %s
+                    AND mc.input_id = %s
+                    AND mc.cep = c.cep
+                    AND c.lat IS NOT NULL
+                    AND c.lon IS NOT NULL;
+                    """,
+                    (tenant_id, input_id)
+                )
+                return cur.rowcount
+
+
+    @retry_on_failure()
+    def marcar_falhas_mkp(self, tenant_id: int, input_id: str) -> int:
+        """
+        Marca CEPs como geo_fail em marketplace_cep onde lat/lon seguem NULL
+        mesmo após todas as tentativas assíncronas.
+        """
+        with get_connection_context() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE marketplace_cep
+                    SET status_geolocalizacao = 'geo_fail',
+                        atualizado_em = NOW()
+                    WHERE tenant_id = %s
+                    AND input_id = %s
+                    AND (lat IS NULL OR lon IS NULL);
+                    """,
+                    (tenant_id, input_id)
+                )
+
+                return cur.rowcount
+
+    # ============================================================
+    # 💾 Atualizar marketplace_cep após geocodificação (workers)
+    # ============================================================
+    def atualizar_marketplace_coord(self, cep, lat, lon, status, tenant_id=None, input_id=None):
+        cep = str(cep).replace("-", "").zfill(8)
+
+        # proteção → nunca sobrescrever lat/lon inválidos (exceto geo_fail)
+        if status != "geo_fail":
+            if (
+                lat is None or lon is None or
+                coordenada_generica(lat, lon)
+            ):
+                logging.warning(f"⚠️ Ignorando update inválido para CEP {cep} — lat/lon inválidos")
+                return
+
+        sql = """
+            UPDATE marketplace_cep
+            SET lat = %s,
+                lon = %s,
+                status_geolocalizacao = %s,
+                atualizado_em = NOW()
+            WHERE cep = %s
+            AND tenant_id = %s
+            AND input_id = %s
+        """
+
+        params = (lat, lon, status, cep, tenant_id, input_id)
+
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"❌ Erro ao atualizar marketplace_cep: {e}")
+        finally:
+            POOL.putconn(conn)
+
+
+
+    # ============================================================
+    # 💾 Inserção de MKP sem geocodificação (corrigida)
+    # ============================================================
+    @retry_on_failure()
+    def inserir_mkp_sem_geo(self, df_validos, tenant_id: int, input_id: str, descricao: str) -> int:
+        if df_validos is None or df_validos.empty:
+            return 0
+
+        registros = {}
+
+        for _, row in df_validos.iterrows():
+            cep = str(row.get("cep", "")).replace("-", "").zfill(8)
+            chave = (tenant_id, input_id, cep)
+
+            registros[chave] = (
+                tenant_id,
+                input_id,
+                descricao.strip()[:60],
+                row.get("cidade", "").strip().upper(),
+                row.get("uf", "").strip().upper(),
+                (str(row.get("bairro") or "")).strip().upper(),
+                cep,
+                int(row.get("clientes_total", 0)),
+                int(row.get("clientes_target", 0)),
+                None,     # RESET LAT
+                None,     # RESET LON
+                "pending" # RESET STATUS
+            )
+
+        valores = list(registros.values())
+
+        sql = """
+            INSERT INTO marketplace_cep (
+                tenant_id, input_id, descricao,
+                cidade, uf, bairro, cep,
+                clientes_total, clientes_target,
+                lat, lon, status_geolocalizacao
+            )
+            VALUES %s
+            ON CONFLICT (tenant_id, input_id, cep)
+            DO UPDATE SET
+                descricao = EXCLUDED.descricao,
+                cidade = EXCLUDED.cidade,
+                uf = EXCLUDED.uf,
+                bairro = EXCLUDED.bairro,
+                clientes_total = EXCLUDED.clientes_total,
+                clientes_target = EXCLUDED.clientes_target,
+                lat = NULL,
+                lon = NULL,
+                status_geolocalizacao = 'pending',
+                atualizado_em = NOW();
+        """
+
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                execute_values(cur, sql, valores)
+            conn.commit()
+            return len(valores)
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"❌ Erro ao inserir MKP sem geo: {e}", exc_info=True)
+            return 0
+
+        finally:
+            POOL.putconn(conn)
+
+
+
+    # ============================================================
+    # 🗺️ Salvar resultado da geocodificação (padronizado)
+    # ============================================================
+    @retry_on_failure()
+    def salvar_geocode(self, cep: str, lat: float, lon: float, origem: str,
+                    tenant_id: int, input_id: str):
+
+        cep = str(cep).replace("-", "").zfill(8)
+
+        # marketplace_cep
+        try:
+            with get_connection_context() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE marketplace_cep
+                        SET lat = %s,
+                            lon = %s,
+                            status_geolocalizacao = %s,
+                            atualizado_em = NOW()
+                        WHERE cep = %s
+                        AND tenant_id = %s
+                        AND input_id = %s;
+                        """,
+                        (lat, lon, origem, cep, tenant_id, input_id)
+                    )
+        except Exception as e:
+            logging.error(f"❌ Erro ao salvar marketplace_cep: {e}")
+
+        # cache MKP
+        self.inserir_localizacao_mkp(cep, lat, lon)
+

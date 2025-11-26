@@ -1,3 +1,5 @@
+#sales_router/src/authentication/api/routes.py
+
 from fastapi import APIRouter, HTTPException, Request
 from authentication.use_case.tenant_use_case import TenantUseCase
 from authentication.use_case.user_use_case import UserUseCase
@@ -135,7 +137,9 @@ def verify_token(payload: dict):
             "user_id": decoded.get("user_id"),
             "tenant_id": decoded.get("tenant_id"),
             "role": decoded.get("role"),
+            "email": decoded.get("email"),   # ← faltava isso!
         }
+
 
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expirado.")

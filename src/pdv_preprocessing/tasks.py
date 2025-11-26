@@ -1,29 +1,54 @@
+#sales_router/src/pdv_preprocessing/tasks.py
+
 # ============================================================
-# 📦 src/pdv_preprocessing/tasks.py
+# 📦 src/pdv_preprocessing/tasks.py  (VERSÃO LIMPA)
 # ============================================================
 
 import sys
 import logging
 from redis import Redis
 from rq import Queue
-from pdv_preprocessing.jobs import processar_csv
+
+from pdv_preprocessing.pdv_jobs import processar_csv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-def main():
-    if len(sys.argv) < 4:
-        print("Uso: python -m src.pdv_preprocessing.tasks <tenant_id> <arquivo> <descricao>")
-        sys.exit(1)
 
-    tenant_id = int(sys.argv[1])
-    file_path = sys.argv[2]
-    descricao = sys.argv[3]
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("tenant_id")
+    parser.add_argument("arquivo")
+    parser.add_argument("descricao")
+    parser.add_argument("--usar_google", action="store_true")
+
+    args = parser.parse_args()
+
+    tenant_id = int(args.tenant_id)
+    file_path = args.arquivo
+    descricao = args.descricao
 
     conn = Redis(host="redis", port=6379)
     q = Queue("pdv_jobs", connection=conn)
 
-    job = q.enqueue(processar_csv, tenant_id, file_path, descricao)
-    logging.info(f"🚀 Job enfileirado: {job.id} → tenant={tenant_id}, arquivo={file_path}")
+    meta = {"usar_google": args.usar_google}
+
+    job = q.enqueue(
+        processar_csv,
+        tenant_id,
+        file_path,
+        descricao,
+        meta=meta,
+        job_timeout=36000
+    )
+
+
+    logging.info(
+        f"🚀 Job enfileirado: {job.id} | tenant={tenant_id} | google={args.usar_google}"
+    )
+
+
 
 if __name__ == "__main__":
     main()

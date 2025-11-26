@@ -1,3 +1,5 @@
+#sales_router/src/sales_clusterization/application/cluster_cep_ativa_use_case.py
+
 # ============================================================
 # 📦 src/sales_clusterization/application/cluster_cep_ativa_use_case.py
 # ============================================================
@@ -6,9 +8,11 @@ import pandas as pd
 import numpy as np
 import uuid
 import time
+import os
 from loguru import logger
 from sales_clusterization.domain.haversine_utils import haversine
-from pdv_preprocessing.domain.geolocation_service import GeolocationService
+from sales_clusterization.domain.centers_geolocation_service import CentersGeolocationService
+
 
 
 class ClusterCEPAtivaUseCase:
@@ -34,7 +38,9 @@ class ClusterCEPAtivaUseCase:
         caminho_centros,
         cidade=None,
         usar_clientes_total=False,
+        usar_marketplace=False,
     ):
+
         self.reader = reader
         self.writer = writer
         self.tenant_id = tenant_id
@@ -45,8 +51,15 @@ class ClusterCEPAtivaUseCase:
         self.tempo_max_min = tempo_max_min
         self.cidade = cidade
         self.caminho_centros = caminho_centros
-        self.geo_service = GeolocationService(reader=self.reader, writer=self.writer)
+        self.geo_service = CentersGeolocationService(
+            reader=self.reader,
+            writer=self.writer,
+            google_key=os.getenv("GMAPS_API_KEY")
+        )
+
         self.usar_clientes_total = usar_clientes_total
+        self.usar_marketplace = usar_marketplace
+
 
     # ------------------------------------------------------------
     # Execução principal
@@ -98,10 +111,33 @@ class ClusterCEPAtivaUseCase:
             raise ValueError(f"❌ O CSV deve conter as colunas: {', '.join(colunas_requeridas)}")
 
         # ============================================================
-        # 🏗️ Monta endereço completo para geocodificação
+        # 🛠️ 1.x – Limpeza de endereço para geocodificação
+        # ============================================================
+        import re
+
+        def extrair_rua(rua_numero):
+            s = str(rua_numero).strip()
+            m = re.search(r'\d+', s)
+            if m:
+                return s[:m.start()].strip().rstrip(",")
+            return s
+
+        def extrair_numero_puro(rua_numero):
+            s = str(rua_numero).strip()
+            m = re.search(r'\d+', s)
+            return m.group(0) if m else ""
+
+
+        # Criar colunas limpas
+        df_centros["rua_limpa"] = df_centros["rua_numero"].apply(extrair_rua)
+        df_centros["numero_puro"] = df_centros["rua_numero"].apply(extrair_numero_puro)
+
+        # ============================================================
+        # 🏗️ Endereço FINAL para geocodificação (limpo)
         # ============================================================
         df_centros["endereco"] = (
-            df_centros["rua_numero"].astype(str).str.strip() + ", "
+            df_centros["rua_limpa"].astype(str).str.strip() + ", "
+            + df_centros["numero_puro"].astype(str).str.strip() + ", "
             + df_centros["bairro"].astype(str).str.strip() + ", "
             + df_centros["cidade"].astype(str).str.strip() + " - "
             + df_centros["uf"].astype(str).str.strip() + ", Brasil"
@@ -110,8 +146,7 @@ class ClusterCEPAtivaUseCase:
         df_centros.dropna(subset=["endereco"], inplace=True)
         df_centros["cluster_id"] = range(len(df_centros))
         logger.info(f"🏗️ {len(df_centros)} endereços de centros carregados e formatados.")
-
-
+        
         # ============================================================
         # 🧩 1.1 Inclui informações adicionais (nome e CNPJ se existirem)
         # ============================================================
@@ -138,7 +173,7 @@ class ClusterCEPAtivaUseCase:
             logger.info(f"📍 ({i+1}/{total_centros}) Geocodificando: '{endereco}'")
 
             try:
-                lat, lon, origem = self.geo_service.buscar_coordenadas(endereco)
+                lat, lon, origem = self.geo_service.buscar(endereco)
                 duracao = round(time.time() - inicio_tempo, 2)
 
                 if lat and lon:
@@ -166,12 +201,15 @@ class ClusterCEPAtivaUseCase:
         df_centros["lat"] = latitudes
         df_centros["lon"] = longitudes
         df_centros["origem_geo"] = origens
+       
+        # Salvar centros inválidos ANTES de removê-los
+        salvar_centros_invalidos(df_centros, tenant_id=self.tenant_id)
 
         # Remove centros sem coordenadas válidas
         df_centros = df_centros.dropna(subset=["lat", "lon"]).reset_index(drop=True)
 
         logger.success(f"✅ Geocodificação de centros concluída: {len(df_centros)} válidos / {total_centros} totais.")
-
+      
         # ============================================================
         # 🏙️ 2.1 Obtém bairro para cada centro (preferencialmente do CSV)
         # ============================================================
@@ -187,13 +225,17 @@ class ClusterCEPAtivaUseCase:
             bairros.append(bairro)
         df_centros["cluster_bairro"] = bairros
 
-
         # ============================================================
         # 📦 3. Carrega base de CEPs do marketplace
         # ============================================================
-        registros = self.reader.buscar_marketplace_ceps(
-            self.tenant_id, self.uf, self.input_id, self.cidade
+        registros = self.reader.buscar_ceps(
+            usar_marketplace=self.usar_marketplace,
+            tenant_id=self.tenant_id,
+            input_id=self.input_id,
+            uf=self.uf,
+            cidade=self.cidade
         )
+
         if not registros:
             logger.warning("⚠️ Nenhum registro marketplace_cep encontrado.")
             return None
@@ -225,7 +267,6 @@ class ClusterCEPAtivaUseCase:
                 logger.warning(f"🧹 Removidos {removidos} CEPs com clientes_target = 0 (sem relevância).")
 
 
-
         # ============================================================
         # 🧮 4. Atribui cada CEP ao centro mais próximo
         # ============================================================
@@ -250,8 +291,24 @@ class ClusterCEPAtivaUseCase:
 
         df_ceps["distancia_km"] = dist_matrix[np.arange(len(coords_ceps)), idx_min]
         df_ceps["tempo_min"] = (df_ceps["distancia_km"] / self.velocidade_media) * 60
-        df_ceps["is_outlier"] = df_ceps["tempo_min"] > self.tempo_max_min
-        logger.info("✅ Atribuição de CEPs concluída.")
+
+        # ============================================================
+        # 🧹 REMOVER OUTLIERS ANTES DO RESTO DO PROCESSAMENTO
+        # ============================================================
+        OUTLIER_MAX_KM = 30  # você pode ajustar (SP ideal = 20–30 km)
+
+        antes = len(df_ceps)
+        df_ceps["is_outlier"] = (
+            (df_ceps["tempo_min"] > self.tempo_max_min) |
+            (df_ceps["distancia_km"] > OUTLIER_MAX_KM)
+        )
+
+        df_ceps = df_ceps[~df_ceps["is_outlier"]].copy()
+        removidos = antes - len(df_ceps)
+
+        logger.warning(f"🧹 Outliers removidos no início: {removidos} (>{OUTLIER_MAX_KM} km ou tempo > {self.tempo_max_min} min)")
+        logger.info("✅ Atribuição de CEPs concluída (após limpeza).")
+
 
         # ============================================================
         # 🧭 5. Associa coordenadas do centro
@@ -374,3 +431,31 @@ class ClusterCEPAtivaUseCase:
             "duracao_segundos": duracao,
             "resumo_operacional": resumo,
         }
+
+# ============================================================
+# 📄 Função auxiliar: salvar centros inválidos
+# ============================================================
+from datetime import datetime
+import os
+from pdv_preprocessing.domain.utils_geo import coordenada_generica
+
+def salvar_centros_invalidos(df_centros, tenant_id):
+        df_invalidos = df_centros[
+            (df_centros["lat"].isna()) |
+            (df_centros["lon"].isna()) |
+            df_centros.apply(lambda r: coordenada_generica(r["lat"], r["lon"]), axis=1)
+        ].copy()
+
+        if df_invalidos.empty:
+            logger.info("🟢 Nenhum centro inválido para salvar.")
+            return
+
+        pasta = f"output/erros_geocodificacao/{tenant_id}"
+        os.makedirs(pasta, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        caminho_csv = f"{pasta}/centros_invalidos_{timestamp}.csv"
+
+        df_invalidos.to_csv(caminho_csv, index=False, sep=";")
+        logger.warning(f"⚠️ CSV gerado com centros inválidos: {caminho_csv}")
+

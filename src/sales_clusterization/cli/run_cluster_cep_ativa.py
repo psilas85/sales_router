@@ -1,3 +1,5 @@
+#sales_router/src/sales_clusterization/cli/run_cluster_cep_ativa.py
+
 # ============================================================
 # 📦 src/sales_clusterization/cli/run_cluster_cep_ativa.py
 # ============================================================
@@ -40,6 +42,12 @@ def main():
     parser.add_argument("--max_ceps", type=int, required=False, help="Número máximo de CEPs por cluster")
     parser.add_argument("--max_merge_km", type=float, default=1.0, help="Distância máxima (km) para fusão de clusters vizinhos")
 
+    parser.add_argument(
+        "--usar_marketplace",
+        action="store_true",
+        help="Usa marketplace_cep em vez de CEPs de PDVs"
+    )
+
     args = parser.parse_args()
 
     # ======================================================
@@ -79,6 +87,9 @@ def main():
             min_ceps=args.min_ceps,
             max_ceps=args.max_ceps,
             max_merge_km=args.max_merge_km,
+
+            # ✔️ PADRÃO = usar PDVs
+            usar_marketplace=args.usar_marketplace,
         )
 
     else:
@@ -95,6 +106,9 @@ def main():
             caminho_centros=args.centros_csv,
             cidade=args.cidade,
             usar_clientes_total=args.clientes_total,
+
+            # ✔️ PADRÃO = usar PDVs
+            usar_marketplace=args.usar_marketplace,
         )
 
     # ======================================================

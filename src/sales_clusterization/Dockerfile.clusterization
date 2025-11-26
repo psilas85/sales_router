@@ -1,24 +1,16 @@
-# ==========================================================
-# SalesRouter - Clusterization Service
-# ==========================================================
-# Baseado na imagem padrão do SalesRouter
-# ==========================================================
+#sales_router/src/sales_clusterization/Dockerfile.clusterization
+
 FROM psilas85/sales_router-base:latest
 
 WORKDIR /app
 
-# Copia apenas o módulo de clusterização e dependências compartilhadas
 COPY ./src/sales_clusterization ./src/sales_clusterization
 COPY ./src/database ./src/database
 COPY ./requirements.txt ./requirements.txt
 
-# Instala apenas os pacotes necessários (sem cache)
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Porta padrão para FastAPI (caso usemos API futuramente)
 EXPOSE 8004
 
-# Comando padrão — pode ser trocado para CLI se quiser
-CMD ["sleep", "infinity"]
+CMD ["uvicorn", "sales_clusterization.api.cluster_api:app", "--host", "0.0.0.0", "--port", "8004"]
 
-#CMD ["uvicorn", "src.sales_clusterization.main:app", "--host", "0.0.0.0", "--port", "8004"]
