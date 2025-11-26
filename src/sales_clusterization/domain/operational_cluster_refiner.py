@@ -194,20 +194,39 @@ class OperationalClusterRefiner:
         dias_uteis: int,
         freq: int,
         max_pdv_cluster: int,
+        k_inicial_param: int = None,
     ):
+        """
+        Refinamento operacional sem recalcular o K.
+        Agora respeita o K gerado pelo KMeans balanceado.
+        """
+
         total_pdvs = len(pdvs)
-        n_sub_planejado = max(1, int(dias_uteis / max(freq, 1)))
-        k_inicial = max(1, int(total_pdvs // (max_pdv_cluster * max(freq, 1))))
-        logger.info(f"🚀 K inicial = {k_inicial} | {total_pdvs} PDVs | max {max_pdv_cluster} x freq {freq}")
+
+        # -----------------------------------------------------------
+        # 🟢 1. Usa o K vindo do pipeline — NÃO recalcula mais
+        # -----------------------------------------------------------
+        if k_inicial_param is not None:
+            k_inicial = max(1, int(k_inicial_param))
+        else:
+            # fallback seguro
+            k_inicial = max(1, math.ceil(total_pdvs / (max_pdv_cluster * max(freq, 1))))
+
+        logger.info(f"🚀 Refinamento operacional iniciado com K={k_inicial}")
 
         k_atual = k_inicial
         setores_finais = []
+        setores_refinados = []  # precisa existir fora do loop
 
         for it in range(self.max_iter):
             logger.info(f"🔁 Iteração {it+1}/{self.max_iter} — K={k_atual}")
+
             setores_macro, labels = kmeans_setores(pdvs, k_atual)
+
+            # atribui labels
             for i, p in enumerate(pdvs):
-                p.cluster_label = int(labels[i]) if i < len(labels) else -1
+                if i < len(labels):
+                    p.cluster_label = int(labels[i])
 
             houve_excesso = False
             setores_refinados = []
@@ -217,8 +236,10 @@ class OperationalClusterRefiner:
                 if not pdvs_local:
                     continue
 
-                n_sub_seguro = min(n_sub_planejado, len(pdvs_local))
-                sub_setores, _ = kmeans_setores(pdvs_local, n_sub_seguro)
+                n_sub = max(1, int(dias_uteis / max(freq, 1)))
+                n_sub = min(n_sub, len(pdvs_local))
+
+                sub_setores, _ = kmeans_setores(pdvs_local, n_sub)
                 s.subclusters = []
 
                 for j, sub in enumerate(sub_setores):
@@ -226,45 +247,51 @@ class OperationalClusterRefiner:
                     if not coords_sub:
                         continue
 
-                    dist_km, tempo_min, rota_seq = self.calcular_rota_simulada(coords_sub, (sub.centro_lat, sub.centro_lon))
-                    status = "EXCEDIDO" if tempo_min > self.max_time_min or dist_km > self.max_dist_km else "OK"
+                    dist_km, tempo_min, rota = self.calcular_rota_simulada(
+                        coords_sub, (sub.centro_lat, sub.centro_lon)
+                    )
 
-                    if status == "EXCEDIDO":
-                        houve_excesso = True
+                    excedeu = tempo_min > self.max_time_min or dist_km > self.max_dist_km
 
                     s.subclusters.append({
                         "seq": j + 1,
                         "centro_lat": sub.centro_lat,
                         "centro_lon": sub.centro_lon,
                         "n_pdvs": len(coords_sub),
-                        "dist_km": round(dist_km, 2),
-                        "tempo_min": round(tempo_min, 2),
-                        "status": status,
-                        "rota_sequencia": rota_seq,
+                        "dist_km": dist_km,
+                        "tempo_min": tempo_min,
+                        "status": "EXCEDIDO" if excedeu else "OK",
+                        "rota_sequencia": rota,
                     })
+
+                    if excedeu:
+                        houve_excesso = True
 
                 setores_refinados.append(s)
 
+            # -----------------------------------------------------------
+            # 🟢 Se excedeu → aumenta o K
+            # -----------------------------------------------------------
             if houve_excesso:
                 k_atual += 1
-                logger.warning(f"⚠️ Limites excedidos — aumentando K para {k_atual}")
+                logger.warning(f"⚠️ Excedeu limites — aumentando K para {k_atual}")
                 continue
-            else:
-                logger.success(f"✅ Todos os subclusters dentro dos limites operacionais (K={k_atual})")
-                setores_finais = setores_refinados
-                break
+
+            # -----------------------------------------------------------
+            # 🟢 Caso contrário → solução encontrada
+            # -----------------------------------------------------------
+            logger.success(f"✅ Subclusters OK com K={k_atual}")
+            setores_finais = setores_refinados
+            break
 
         # ============================================================
-        # 🔒 SEGURANÇA — garantir retorno válido
+        # 🔒 SEGURANÇA — fallback
         # ============================================================
         if not setores_finais:
-            if setores_refinados:
-                setores_finais = setores_refinados
-            else:
-                setores_finais = setores_macro
+            setores_finais = setores_refinados
 
         # ============================================================
-        # 🔑 NORMALIZAÇÃO DOS LABELS — evita KeyError no cluster_use_case
+        # 🔑 NORMALIZAÇÃO DOS LABELS
         # ============================================================
         labels_originais = sorted(s.cluster_label for s in setores_finais)
         mapa_labels = {old: new for new, old in enumerate(labels_originais)}
@@ -274,7 +301,6 @@ class OperationalClusterRefiner:
             new = mapa_labels[old]
             s.cluster_label = new
 
-            # atualiza PDVs vinculados ao setor
             if hasattr(s, "pdvs") and s.pdvs:
                 for p in s.pdvs:
                     p.cluster_label = new
@@ -282,6 +308,7 @@ class OperationalClusterRefiner:
         logger.info(f"🔒 Labels normalizados: {mapa_labels}")
 
         return setores_finais
+
 
 
     # ============================================================

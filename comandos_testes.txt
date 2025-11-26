@@ -1,8 +1,11 @@
 curl -X POST "http://localhost/auth/login?email=paulo.silas@igotech.com.br&senha=Admin@2025"
 
 docker exec -it pdv_preprocessing   python3 -m src.pdv_preprocessing.main_pdv_preprocessing   --tenant 1   --arquivo data/pdvs_enderecos.csv   --descricao "SC_10K_251028"
-docker exec -it pdv_preprocessing python3 -m src.pdv_preprocessing.tasks 1 data/pdvs_enderecos.csv "Teste_Job_Refatorado"
+docker exec -it pdv_preprocessing python3 -m src.pdv_preprocessing.tasks 1 /app/data/pdvs_enderecos.csv "SC_10K_251028"
 docker exec -it pdv_preprocessing python3 -m src.pdv_preprocessing.visualization.pdv_plotting --tenant_id 1 --input_id 491d5430-2de9-451c-9453-c358fb9e4aca --uf RJ
+
+docker logs -f pdv_jobs_worker
+
 
 docker exec -it clusterization_jobs_worker python3 -m src.jobs.clusterization_jobs   --tenant 1   --uf SP   --usuario paulo  --descricao "SC_10K_251103_SP"  --workday 500 --max_pdv_cluster 250 --input_id 3d698e49-af07-4eab-b8ee-468f13e80fb7  --excluir_outliers 
 docker exec -it sales_clusterization python3 -m src.sales_clusterization.visualization.cluster_plotting   --tenant_id 1   --clusterization_id 54ed2eb3-30c1-413c-824d-e0f5fd5bbadc   --modo_interativo
@@ -24,7 +27,7 @@ docker exec -it sales_clusterization bash -c "
 python3 -m src.sales_clusterization.cli.run_cluster_cep \
     --tenant 1 \
     --uf SP \
-    --input_id ca582dad-3782-4a89-bb49-0dda00449d8f \
+    --input_id 131b5b08-8a6e-4594-913a-841d70c7eb08 \
     --descricao 'Clusterização MKP SP_PicPay_20251104' \
     --velocidade_media 40 \
     --tempo_max_min 480 \

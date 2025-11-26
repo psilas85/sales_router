@@ -254,6 +254,71 @@ class DatabaseReader:
         cur.close()
         return rows
 
+    def buscar_ceps_pdv(self, tenant_id: int, input_id: str, uf: str, cidade: str = None):
+        """
+        Retorna CEPs vindos dos PDVs com coordenadas.
+        Formato compatível com clusterização de CEP:
+        cep, lat, lon, clientes_total, clientes_target
+        """
+        cur = self.conn.cursor()
+
+        sql = """
+            SELECT 
+                cep,
+                pdv_lat AS lat,
+                pdv_lon AS lon,
+                1 AS clientes_total,
+                1 AS clientes_target
+            FROM pdvs
+            WHERE tenant_id = %s
+            AND input_id = %s
+            AND UPPER(uf) = UPPER(%s)
+            AND cep IS NOT NULL
+            AND cep <> ''
+            AND pdv_lat IS NOT NULL
+            AND pdv_lon IS NOT NULL
+        """
+
+        params = [tenant_id, input_id, uf]
+
+        if cidade:
+            sql += " AND UPPER(cidade) = UPPER(%s)"
+            params.append(cidade)
+
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+
+    def buscar_ceps(
+        self,
+        usar_marketplace: bool,
+        tenant_id: int,
+        input_id: str,
+        uf: str,
+        cidade: str = None
+    ):
+        """
+        Método unificado.
+        - Se usar_marketplace=True → marketplace_cep
+        - Caso contrário → CEPs de PDVs
+        """
+        if usar_marketplace:
+            return self.buscar_marketplace_ceps(
+                tenant_id=tenant_id,
+                uf=uf,
+                input_id=input_id,
+                cidade=cidade
+            )
+        else:
+            return self.buscar_ceps_pdv(
+                tenant_id=tenant_id,
+                input_id=input_id,
+                uf=uf,
+                cidade=cidade
+            )
+
+
     # ============================================================
     # 🔍 Busca coordenadas no cache de endereços
     # ============================================================
@@ -284,3 +349,33 @@ class DatabaseReader:
             import logging
             logging.warning(f"⚠️ Erro ao consultar cache de endereços: {e}")
             return None
+
+    def buscar_endereco_cache(self, endereco: str):
+        if not endereco:
+            return None
+
+        try:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT endereco, lat, lon, origem
+                FROM enderecos_cache
+                WHERE endereco = %s
+                LIMIT 1;
+            """, (endereco,))
+            row = cur.fetchone()
+            cur.close()
+
+            if row:
+                return {
+                    "endereco": row[0],
+                    "lat": row[1],
+                    "lon": row[2],
+                    "origem": row[3],
+                }
+            return None
+
+        except Exception as e:
+            import logging
+            logging.warning(f"⚠️ Erro ao consultar cache de endereços: {e}")
+            return None
+

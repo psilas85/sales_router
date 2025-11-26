@@ -1,0 +1,11 @@
+docker exec -it pdv_preprocessing   python3 -m pdv_preprocessing.main_mkp_preprocessing     --tenant 1     --arquivo "/app/data/mkp_enderecos.xlsx"     --descricao "TesteNovo"
+
+docker logs -f worker_mkp_master_finalize
+docker logs -f worker_mkp_1
+
+
+docker exec -it sales_clusterization python3 -m src.sales_clusterization.cli.run_cluster_cep_ativa   --tenant 1   --uf SP   --input_id 54e409d0-9eab-41fb-bc5c-00cf05fc1e10   --descricao "Clusterização ativa SP - teste inicial"   --velocidade_media 40   --tempo_max_min 15   --centros_csv data/centros_enderecos.csv --modo "balanceada" --min_ceps 1 --max_ceps 100 --max_merge_km 5
+
+SELECT COUNT(*)
+FROM marketplace_cep
+WHERE input_id = '7aebf5b6-83ea-4acf-b214-9be7e30075a9';

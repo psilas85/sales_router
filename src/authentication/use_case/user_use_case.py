@@ -67,7 +67,13 @@ class UserUseCase:
         user = self.repo.find_by_email(email)
         if not user or not self.auth.verify_password(senha, user.senha_hash):
             return None
-        return self.auth.generate_token(user.id, user.tenant_id, user.role)
+        return self.auth.generate_token(
+            user.id,
+            user.tenant_id,
+            user.role,
+            user.email   # ← obrigatório para os outros módulos
+        )
+
 
 
     # =====================================================

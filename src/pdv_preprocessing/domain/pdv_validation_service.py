@@ -1,3 +1,5 @@
+#sales_router/src/pdv_preprocessing/domain/pdv_validation_service.py
+
 import pandas as pd
 import numpy as np
 import re
@@ -9,6 +11,7 @@ class PDVValidationService:
     Serviço de validação de PDVs.
     - Limpa e valida CNPJ/CEP.
     - Detecta campos obrigatórios ausentes (exceto 'bairro', que é opcional).
+    - Aceita PDVs sem número quando CEP está presente.
     - Evita duplicados no CSV e no banco para o mesmo tenant.
     """
 
@@ -52,14 +55,16 @@ class PDVValidationService:
         Retorna dois DataFrames: válidos e inválidos (com motivo).
         """
 
-        campos_obrigatorios = ["cnpj", "logradouro", "numero", "cidade", "uf", "cep"]
+        # ------------------------------------------------------------------
+        # CAMPOS REALMENTE OBRIGATÓRIOS
+        # número NÃO pode ser obrigatório
+        # ------------------------------------------------------------------
+        campos_obrigatorios = ["cnpj", "logradouro", "cidade", "uf"]
 
-        # ============================================================
-        # 🧹 Normaliza strings vazias
-        # ============================================================
+        # Normaliza strings vazias
         df[campos_obrigatorios] = df[campos_obrigatorios].replace("", np.nan)
 
-        # ℹ️ Log de auditoria: ausência de bairro
+        # Log ausência de bairro (opcional)
         if "bairro" in df.columns:
             total_sem_bairro = df["bairro"].eq("").sum()
             logger.info(f"ℹ️ [{tenant_id}] {total_sem_bairro} PDV(s) sem bairro informado.")
@@ -67,18 +72,43 @@ class PDVValidationService:
             logger.info(f"ℹ️ [{tenant_id}] Coluna 'bairro' ausente (opcional).")
 
         # ============================================================
-        # 🚫 Campos obrigatórios ausentes
+        # 🚫 Campos obrigatórios ausentes (exceto número)
         # ============================================================
         registros_invalidos = df[df[campos_obrigatorios].isna().any(axis=1)].copy()
+
         if not registros_invalidos.empty:
             registros_invalidos["motivo_invalidade"] = registros_invalidos.apply(
                 lambda row: ", ".join([c for c in campos_obrigatorios if pd.isna(row[c])]),
                 axis=1,
             )
-            logger.warning(f"⚠️ [{tenant_id}] {len(registros_invalidos)} registro(s) com campos obrigatórios faltando.")
+            logger.warning(
+                f"⚠️ [{tenant_id}] {len(registros_invalidos)} registro(s) com campos essenciais faltando."
+            )
 
         # Mantém válidos
         df_validos = df.dropna(subset=campos_obrigatorios).copy()
+
+        # ============================================================
+        # 🔍 Validação especial para número:
+        # • Se número está vazio e NÃO tem CEP → inválido
+        # • Se número está vazio mas tem CEP → ACEITA
+        # ============================================================
+        registros_sem_numero = df_validos[df_validos["numero"].replace("", np.nan).isna()].copy()
+
+        if not registros_sem_numero.empty:
+            # Apenas inválidos quando número ausente + CEP ausente
+            sem_numero_sem_cep = registros_sem_numero[
+                registros_sem_numero["cep"].replace("", np.nan).isna()
+            ].copy()
+
+            if not sem_numero_sem_cep.empty:
+                sem_numero_sem_cep["motivo_invalidade"] = "numero"
+                registros_invalidos = pd.concat(
+                    [registros_invalidos, sem_numero_sem_cep], ignore_index=True
+                )
+
+                # Remover dos válidos
+                df_validos = df_validos[~df_validos.index.isin(sem_numero_sem_cep.index)]
 
         # ============================================================
         # 1️⃣ Duplicados no próprio arquivo
@@ -86,7 +116,9 @@ class PDVValidationService:
         duplicados_csv = df_validos[df_validos.duplicated(subset=["cnpj"], keep=False)].copy()
         if not duplicados_csv.empty:
             duplicados_csv["motivo_invalidade"] = "CNPJ duplicado no arquivo"
-            registros_invalidos = pd.concat([registros_invalidos, duplicados_csv], ignore_index=True)
+            registros_invalidos = pd.concat(
+                [registros_invalidos, duplicados_csv], ignore_index=True
+            )
             df_validos = df_validos[~df_validos["cnpj"].isin(duplicados_csv["cnpj"])]
             logger.warning(f"⚠️ [{tenant_id}] {len(duplicados_csv)} CNPJs duplicados no arquivo CSV.")
 
@@ -103,7 +135,9 @@ class PDVValidationService:
                         registros_invalidos = pd.concat(
                             [registros_invalidos, duplicados_banco], ignore_index=True
                         )
-                        df_validos = df_validos[~df_validos["cnpj"].isin(duplicados_banco["cnpj"])]
+                        df_validos = df_validos[
+                            ~df_validos["cnpj"].isin(duplicados_banco["cnpj"])
+                        ]
                         logger.warning(
                             f"⚠️ [{tenant_id}] {len(duplicados_banco)} CNPJs já existentes neste input_id foram ignorados."
                         )
@@ -113,7 +147,9 @@ class PDVValidationService:
         # ============================================================
         # ✅ Resultado final
         # ============================================================
-        registros_invalidos = registros_invalidos.drop_duplicates(subset=["cnpj"]).reset_index(drop=True)
+        registros_invalidos = registros_invalidos.drop_duplicates(subset=["cnpj"]).reset_index(
+            drop=True
+        )
         df_validos = df_validos.reset_index(drop=True)
 
         logger.info(f"✅ [{tenant_id}] {len(df_validos)} válidos / {len(registros_invalidos)} inválidos após validação.")

@@ -26,6 +26,8 @@ from src.sales_clusterization.domain.sector_generator import kmeans_balanceado
 
 # 🟢 Sweep com capacidade
 from src.sales_clusterization.domain.capacitated_sweep import capacitated_sweep
+from src.sales_clusterization.domain.dense_subset import dense_subset
+
 
 
 # ============================================================
@@ -220,6 +222,38 @@ def executar_clusterizacao(
                 )
                 for p in cluster_points:
                     p.cluster_label = cid
+
+        # ============================================================
+        # 🟣 DENSE SUBSET — cluster único, compacto
+        # ============================================================
+        elif algo == "dense_subset":
+            logger.info(f"🟣 Executando DENSE SUBSET | capacidade={max_pdv_cluster}")
+
+            selecionados = dense_subset(pdvs, capacidade=max_pdv_cluster)
+
+            # centro = média dos selecionados
+            lat_med = float(np.mean([p.lat for p in selecionados]))
+            lon_med = float(np.mean([p.lon for p in selecionados]))
+
+            # Criar setor único
+            setores_finais = [
+                Setor(
+                    cluster_label=0,
+                    centro_lat=lat_med,
+                    centro_lon=lon_med,
+                    n_pdvs=len(selecionados),
+                    raio_med_km=0,
+                    raio_p95_km=0,
+                )
+            ]
+
+            # marcar cluster_label nos PDVs selecionados
+            for p in selecionados:
+                p.cluster_label = 0
+
+            # ⚠️ Só esses PDVs vão ser persistidos
+            pdvs = selecionados
+
 
         # ============================================================
         # 💾 Persistência

@@ -429,31 +429,71 @@ class DatabaseWriter:
 
     def inserir_mkp_cluster_cep(self, lista_clusters):
         """
-        Insere resultado da clusterização de CEPs na tabela mkp_cluster_cep.
-        Cada execução tem clusterization_id único (sem sobrescrever execuções anteriores).
-        Agora suporta o campo 'modo_clusterizacao' ('ativa' ou 'passiva').
+        Inserção blindada com:
+        - CEP sanitizado
+        - Remoção de duplicidade
+        - Proteção contra lat/lon inválido
+        - Proteção cluster_id None
+        - Campos obrigatórios coerentes
         """
         if not lista_clusters:
             return 0
 
         from psycopg2.extras import execute_values
-        from loguru import logger
 
         cur = self.conn.cursor()
 
-        # Adiciona campos opcionais no insert
-        valores = [
-            (
-                c["tenant_id"], c["input_id"], c["clusterization_id"], c["uf"], c["cep"],
-                c["cluster_id"], c.get("clientes_total", 0), c.get("clientes_target", 0),
-                c["lat"], c["lon"], c["cluster_lat"], c["cluster_lon"],
-                c["distancia_km"], c["tempo_min"], c["is_outlier"],
-                c.get("modo_clusterizacao", "passiva"),
-                c.get("centro_nome", ""), c.get("centro_cnpj", ""),
-                c.get("cluster_bairro", "") 
-            )
-            for c in lista_clusters
-        ]
+        valores = []
+        vistos = set()
+
+        for c in lista_clusters:
+            cep = str(c["cep"]).replace("-", "").strip()
+            if len(cep) != 8 or not cep.isdigit():
+                continue
+
+            chave = (c["tenant_id"], c["input_id"], c["clusterization_id"], cep)
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+
+            # Coordenadas obrigatórias
+            lat = c.get("lat")
+            lon = c.get("lon")
+            if lat is None or lon is None:
+                continue
+            if not (-90 <= float(lat) <= 90 and -180 <= float(lon) <= 180):
+                continue
+
+            # cluster_id obrigatório
+            cluster_id = c.get("cluster_id")
+            if cluster_id is None:
+                continue
+
+            valores.append((
+                c["tenant_id"],
+                c["input_id"],
+                c["clusterization_id"],
+                c["uf"],
+                cep,
+                int(cluster_id),
+                c.get("clientes_total", 0),
+                c.get("clientes_target", 0),
+                float(lat),
+                float(lon),
+                float(c["cluster_lat"]),
+                float(c["cluster_lon"]),
+                float(c["distancia_km"]),
+                float(c["tempo_min"]),
+                bool(c["is_outlier"]),
+                c.get("modo_clusterizacao", "ativa"),
+                c.get("centro_nome", ""),
+                c.get("centro_cnpj", ""),
+                c.get("cluster_bairro", ""),
+            ))
+
+        if not valores:
+            logger.error("❌ Nenhum registro válido para inserir em mkp_cluster_cep.")
+            return 0
 
         sql = """
             INSERT INTO mkp_cluster_cep (
@@ -480,27 +520,15 @@ class DatabaseWriter:
                 atualizado_em = NOW();
         """
 
-
-
         try:
-            logger.info(
-                f"💾 Inserindo {len(valores)} linhas em mkp_cluster_cep "
-                f"(clusterization_id={lista_clusters[0]['clusterization_id']})"
-            )
+            logger.info(f"💾 Inserindo {len(valores)} linhas em mkp_cluster_cep (clusterization_id={valores[0][2]})")
             execute_values(cur, sql, valores)
             self.conn.commit()
 
-            cur.execute(
-                "SELECT COUNT(*) FROM mkp_cluster_cep WHERE clusterization_id = %s;",
-                (lista_clusters[0]["clusterization_id"],)
-            )
+            cur.execute("SELECT COUNT(*) FROM mkp_cluster_cep WHERE clusterization_id = %s;", (valores[0][2],))
             inseridos = cur.fetchone()[0]
 
-            logger.success(
-                f"✅ {inseridos} registros gravados em mkp_cluster_cep "
-                f"(clusterization_id={lista_clusters[0]['clusterization_id']})"
-            )
-
+            logger.success(f"✅ {inseridos} registros gravados em mkp_cluster_cep (clusterization_id={valores[0][2]})")
             cur.close()
             return inseridos
 
@@ -510,16 +538,25 @@ class DatabaseWriter:
             cur.close()
             return 0
 
+
     # ============================================================
     # 💾 Salva endereço no cache de geocodificação
     # ============================================================
     def salvar_cache(self, endereco: str, lat: float, lon: float, tipo: str = "geral"):
         """
         Insere ou atualiza endereço no cache (enderecos_cache).
-        Campo 'origem' armazena a fonte dos dados (ex: nominatim, google, etc.).
+        Bloqueia automaticamente CEP inválido quando tipo='mkp'.
         """
+
         if not endereco or lat is None or lon is None:
             return
+
+        # 🚫 BLOQUEIA CEPS INVÁLIDOS NO CACHE MKP
+        from pdv_preprocessing.domain.utils_geo import cep_invalido
+        if tipo == "mkp":
+            cep_clean = endereco.strip().replace("-", "").zfill(8)
+            if cep_invalido(cep_clean):
+                return  # não salvar
 
         try:
             cur = self.conn.cursor()
@@ -538,3 +575,4 @@ class DatabaseWriter:
         except Exception as e:
             import logging
             logging.warning(f"⚠️ Erro ao salvar cache de endereço: {e}")
+

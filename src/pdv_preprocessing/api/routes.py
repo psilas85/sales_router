@@ -1,3 +1,5 @@
+#sales_router/src/pdv_preprocessing/api/routes.py
+
 # ==========================================================
 # 📦 src/pdv_preprocessing/api/routes.py
 # ==========================================================
@@ -156,7 +158,7 @@ def atualizar_pdv(
 # ==========================================================
 from redis import Redis
 from rq import Queue
-from pdv_preprocessing.jobs import processar_csv
+from pdv_preprocessing.pdv_jobs import processar_csv
 
 @router.post("/upload", dependencies=[Depends(verify_token)], tags=["Jobs"])
 def upload_pdv(

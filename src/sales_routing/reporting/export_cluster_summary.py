@@ -11,12 +11,18 @@ from loguru import logger
 from src.database.db_connection import get_connection
 
 
+BASE_OUTPUT = Path("/app/output/reports")   # 🔥 Caminho correto ABSOLUTO
+
+
 def exportar_resumo_cluster(tenant_id: int, routing_id: str):
     """
     Exporta o resumo da view vw_sales_routing_resumo_cluster
     para um arquivo CSV organizado por tenant e routing_id.
     Inclui o campo de valor total de vendas (pdv_vendas).
     """
+
+    conn = None
+
     try:
         logger.info(f"📊 Exportando resumo de clusters | tenant={tenant_id} | routing_id={routing_id}")
 
@@ -50,8 +56,10 @@ def exportar_resumo_cluster(tenant_id: int, routing_id: str):
             logger.warning("⚠️ Nenhum dado encontrado para exportação.")
             return None
 
-        pasta_output = Path(f"output/reports/{tenant_id}")
+        # 🔥 Caminho correto para salvar dentro do container
+        pasta_output = BASE_OUTPUT / str(tenant_id)
         pasta_output.mkdir(parents=True, exist_ok=True)
+
         arquivo_csv = pasta_output / f"routing_resumo_{routing_id}.csv"
 
         with open(arquivo_csv, "w", newline="", encoding="utf-8") as f:
