@@ -1,4 +1,5 @@
 curl -X POST "http://localhost/auth/login?email=paulo.silas@igotech.com.br&senha=Admin@2025"
+curl -X POST "http://34.227.175.23/auth/login?email=paulo.silas@igotech.com.br&senha=Psilas@85"
 
 docker exec -it pdv_preprocessing   python3 -m src.pdv_preprocessing.main_pdv_preprocessing   --tenant 1   --arquivo data/pdvs_enderecos.csv   --descricao "SC_10K_251028"
 docker exec -it pdv_preprocessing python3 -m src.pdv_preprocessing.tasks 1 /app/data/pdvs_enderecos.csv "SC_10K_251028"

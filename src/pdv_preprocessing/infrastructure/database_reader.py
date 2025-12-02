@@ -640,3 +640,121 @@ class DatabaseReader:
                 )
         finally:
             POOL.putconn(conn)
+
+        # ============================================================
+    # 📋 Listar últimos 10 jobs (para /jobs/ultimos)
+    # ============================================================
+    @retry_on_failure()
+    def listar_ultimos_jobs(self, tenant_id: int, limite: int = 10) -> pd.DataFrame:
+        conn = POOL.getconn()
+        try:
+            query = """
+                SELECT 
+                    id, tenant_id, input_id, descricao, arquivo, status,
+                    total_processados, validos, invalidos, arquivo_invalidos,
+                    mensagem, criado_em, inseridos, sobrescritos
+                FROM historico_pdv_jobs
+                WHERE tenant_id = %s
+                ORDER BY criado_em DESC
+                LIMIT %s;
+            """
+            df = pd.read_sql_query(query, conn, params=(tenant_id, limite))
+            df = df.replace([float("inf"), float("-inf")], pd.NA)
+            df = df.where(pd.notnull(df), None)
+            return df
+        except Exception as e:
+            logging.error(f"❌ Erro ao listar últimos jobs: {e}", exc_info=True)
+            return pd.DataFrame()
+        finally:
+            POOL.putconn(conn)
+
+    # ============================================================
+    # 📋 Listar jobs (para /jobs) — máximo 100
+    # ============================================================
+    @retry_on_failure()
+    def listar_jobs(self, tenant_id: int, limite: int = 100) -> pd.DataFrame:
+        conn = POOL.getconn()
+        try:
+            query = """
+                SELECT 
+                    id, tenant_id, input_id, descricao, arquivo, status,
+                    total_processados, validos, invalidos, arquivo_invalidos,
+                    mensagem, criado_em, inseridos, sobrescritos
+                FROM historico_pdv_jobs
+                WHERE tenant_id = %s
+                ORDER BY criado_em DESC
+                LIMIT %s;
+            """
+            df = pd.read_sql_query(query, conn, params=(tenant_id, limite))
+            df = df.replace([float("inf"), float("-inf")], pd.NA)
+            df = df.where(pd.notnull(df), None)
+            return df
+        except Exception as e:
+            logging.error(f"❌ Erro ao listar jobs: {e}", exc_info=True)
+            return pd.DataFrame()
+        finally:
+            POOL.putconn(conn)
+
+    # ============================================================
+    # 🔍 Filtrar jobs por data + descrição (para /jobs/filtrar)
+    # ============================================================
+    @retry_on_failure()
+    def filtrar_jobs(
+        self,
+        tenant_id: int,
+        data_inicio: str = None,
+        data_fim: str = None,
+        descricao: str = None,
+        limite: int = 10
+    ) -> pd.DataFrame:
+
+        filtros = ["tenant_id = %s"]
+        params = [tenant_id]
+
+        # converte dd/mm/aaaa → yyyy-mm-dd
+        def normalizar_data(data: str):
+            if "/" in data:
+                d, m, a = data.split("/")
+                return f"{a}-{m}-{d}"
+            return data
+
+        if data_inicio:
+            data_inicio = normalizar_data(data_inicio)
+            filtros.append("DATE(criado_em) >= %s")
+            params.append(data_inicio)
+
+        if data_fim:
+            data_fim = normalizar_data(data_fim)
+            filtros.append("DATE(criado_em) <= %s")
+            params.append(data_fim)
+
+        if descricao:
+            filtros.append("descricao ILIKE %s")
+            params.append(f"%{descricao}%")
+
+        where = " AND ".join(filtros)
+
+        sql = f"""
+            SELECT 
+                id, tenant_id, input_id, descricao, arquivo, status,
+                total_processados, validos, invalidos, arquivo_invalidos,
+                mensagem, criado_em, inseridos, sobrescritos
+            FROM historico_pdv_jobs
+            WHERE {where}
+            ORDER BY criado_em DESC
+            LIMIT %s;
+        """
+
+        params.append(limite)
+
+        conn = POOL.getconn()
+        try:
+            df = pd.read_sql_query(sql, conn, params=tuple(params))
+            df = df.replace([float("inf"), float("-inf")], pd.NA)
+            df = df.where(pd.notnull(df), None)
+            return df
+        except Exception as e:
+            logging.error(f"❌ Erro ao filtrar jobs: {e}", exc_info=True)
+            return pd.DataFrame()
+        finally:
+            POOL.putconn(conn)

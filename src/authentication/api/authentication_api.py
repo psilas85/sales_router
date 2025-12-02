@@ -1,7 +1,6 @@
 #sales_router/src/authentication/api/authentication_api.py
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from authentication.api.routes import router as auth_router
 
 # ==========================================================
@@ -17,17 +16,6 @@ app = FastAPI(
     docs_url="/docs",
 
     servers=[{"url": "/auth", "description": "Auth service behind API Gateway"}],
-)
-
-# ==========================================================
-# 🌍 Middleware CORS
-# ==========================================================
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
 )
 
 # ==========================================================

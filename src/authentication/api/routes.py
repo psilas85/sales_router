@@ -97,8 +97,9 @@ def deactivate_user(request: Request, user_id: int):
 # 🔐 LOGIN / AUTENTICAÇÃO
 # =====================================================
 
-@router.post("/login", tags=["Autenticação"])
+@router.post("/auth/login", tags=["Autenticação"])
 def login(email: str, senha: str):
+
     """Autentica o usuário e retorna token JWT."""
     token = user_use_case.login(email, senha)
     if not token:

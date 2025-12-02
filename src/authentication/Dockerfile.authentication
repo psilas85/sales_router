@@ -31,10 +31,6 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # 6️⃣ Instala libs críticas específicas de autenticação
 RUN pip install --no-cache-dir fastapi uvicorn bcrypt PyJWT psycopg2-binary loguru==0.7.2
 
-# 7️⃣ Copia módulos da aplicação
-COPY ./src/authentication /app/authentication
-COPY ./src/database /app/database
-
 # 8️⃣ Porta padrão e startup
 EXPOSE 8000
 

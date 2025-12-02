@@ -37,9 +37,11 @@ services:
     depends_on:
       - sales_router_db
     volumes:
-      - ./src:/app/src
+      - ./src/authentication:/app/authentication   # <-- correto
+      - ./src/database:/app/database
       - ./data:/app/data
       - ./output:/app/output
+
     networks:
       - sales_router_net
     restart: always
@@ -151,19 +153,26 @@ services:
     environment:
       - DB_HOST=sales_router_db
       - DB_PORT=5432
+      - AUTH_SERVICE_URL=http://authentication_service:8000
+      - PYTHONPATH=/app/src
     depends_on:
       - sales_router_db
       - redis
-    user: "${UID:-1000}:${GID:-1000}"
+      - authentication_service
     volumes:
       - ./src/sales_routing:/app/src/sales_routing
       - ./src/database:/app/src/database
       - ./src/cli:/app/src/cli
       - ./output:/app/output
       - ./data:/app/data
+    expose:
+      - "8005"
+    ports:
+      - "8012:8005"   # opcional para debug
     networks:
       - sales_router_net
     restart: always
+
 
   # ======================
   # Banco de Dados (PostgreSQL + PostGIS)
@@ -354,6 +363,22 @@ services:
     <<: *worker_mkp_base
     container_name: worker_mkp_master
     command: ["mkp_master"]
+
+  sales_router_frontend:
+    build:
+      context: ../sales_router_frontend
+      dockerfile: Dockerfile
+    container_name: sales_router_frontend
+    env_file:
+      - ../sales_router_frontend/.env.local
+    ports:
+      - "3100:3000"
+    depends_on:
+      - api_gateway
+    networks:
+      - sales_router_net
+    restart: always
+
 
 # ======================
 # Volumes persistentes

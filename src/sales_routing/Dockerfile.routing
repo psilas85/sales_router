@@ -1,29 +1,25 @@
 # src/sales_routing/Dockerfile.routing
 
-# Imagem base do Python
-FROM python:3.11-slim
+# ============================================
+# 🚀 Sales Routing - API + Engine (FastAPI)
+# ============================================
+FROM psilas85/sales_router-base:latest
 
-# Configura variáveis de ambiente
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    TZ=America/Sao_Paulo
-
-# Instala dependências do sistema
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential gcc g++ libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Define diretório de trabalho
 WORKDIR /app
 
-# Copia requirements gerais da aplicação
-COPY requirements.txt /app/requirements.txt
+# Copia requirements
+COPY ./requirements.txt ./requirements.txt
 
 # Instala dependências
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia o módulo de Sales Routing
-COPY ./src/sales_routing /app/src/sales_routing
+# Copia o módulo completo
+COPY ./src/sales_routing ./src/sales_routing
+COPY ./src/database ./src/database
+COPY ./src/cli ./src/cli
 
-# Comando padrão
-CMD ["python3", "-m", "src.sales_routing.main"]
+# Porta da API
+EXPOSE 8005
+
+# Comando padrão — servidor FastAPI
+CMD ["uvicorn", "sales_routing.api.main_routing_api:app", "--host", "0.0.0.0", "--port", "8005"]

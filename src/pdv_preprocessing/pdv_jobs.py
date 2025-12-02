@@ -1,7 +1,7 @@
 #sales_router/src/pdv_preprocessing/pdv_jobs.py
 
 # ============================================================
-# 📦 src/pdv_preprocessing/pdv_jobs.py — versão FINAL
+# 📦 src/pdv_preprocessing/pdv_jobs.py — versão FINAL COM PROGRESSO
 # ============================================================
 
 import logging
@@ -13,8 +13,6 @@ from rq import get_current_job
 
 from database.db_connection import get_connection_context
 from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
-
-logger = logging.getLogger(__name__)
 
 import sys
 
@@ -28,50 +26,6 @@ handler.setFormatter(formatter)
 
 logger.handlers = [handler]
 
-# ============================================================
-# 🧾 Salvar histórico fallback (quando main quebra)
-# ============================================================
-def salvar_historico(
-    tenant_id,
-    input_id,
-    descricao,
-    status,
-    arquivo,
-    total,
-    validos,
-    invalidos,
-    arquivo_invalidos,
-    mensagem,
-):
-    try:
-        with get_connection_context() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO historico_pdv_jobs
-                    (tenant_id, input_id, descricao, arquivo, status,
-                     total_processados, validos, invalidos, arquivo_invalidos,
-                     mensagem, criado_em)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        tenant_id,
-                        input_id,
-                        descricao,
-                        arquivo,
-                        status,
-                        total,
-                        validos,
-                        invalidos,
-                        arquivo_invalidos,
-                        mensagem,
-                        datetime.utcnow(),
-                    ),
-                )
-        logger.info(f"💾 Histórico fallback gravado (input_id={input_id})")
-    except Exception as e:
-        logger.error(f"❌ Erro ao salvar histórico fallback: {e}", exc_info=True)
-
 
 # ============================================================
 # 🚀 Função principal do worker
@@ -79,16 +33,14 @@ def salvar_historico(
 def processar_csv(tenant_id, file_path, descricao):
     job = get_current_job()
 
-    # ------------------------------------------------------------
-    # 🔥 Garantir que SEMPRE temos um UUID válido para job_id
-    # ------------------------------------------------------------
+    # Garante UUID válido
     if job:
         try:
-            job_id = str(UUID(job.id))   # garante formato UUID
+            job_id = str(UUID(job.id))
         except:
-            job_id = str(uuid4())        # fallback
+            job_id = str(uuid4())
     else:
-        job_id = str(uuid4())            # CLI também vira UUID
+        job_id = str(uuid4())
 
     writer = DatabaseWriter()
 
@@ -104,7 +56,7 @@ def processar_csv(tenant_id, file_path, descricao):
             "--descricao", descricao,
         ]
 
-        # 🔥 Se o job vier com meta "usar_google", adiciona flag
+        # Verifica flag Google
         try:
             usar_google_job = job.meta.get("usar_google", False) if job else False
         except:
@@ -113,16 +65,14 @@ def processar_csv(tenant_id, file_path, descricao):
         if usar_google_job:
             comando.append("--usar_google")
 
-
+        # Progresso inicial
         if job:
             job.meta.update({"step": "Iniciando", "progress": 0})
             job.save_meta()
 
         logger.info(f"▶️ Executando: {' '.join(comando)}")
 
-        # ------------------------------------------------------------
-        # 🔥 Streaming em tempo real
-        # ------------------------------------------------------------
+        # Execução streaming
         proc = subprocess.Popen(
             comando,
             stdout=subprocess.PIPE,
@@ -135,15 +85,34 @@ def processar_csv(tenant_id, file_path, descricao):
         resumo = {}
         json_line = None
 
+        # ============================================================
+        # STREAMING + PROGRESSO DO MAIN
+        # ============================================================
         for line in proc.stdout:
             line = line.rstrip()
             logger.info(f"[MAIN] {line}")
 
+            # --------- TENTA LER JSON ---------
             try:
                 obj = json.loads(line)
+
+                # -------------- EVENTO DE PROGRESSO --------------
+                if obj.get("event") == "progress":
+                    pct = obj.get("pct", 0)
+                    step = obj.get("step", "")
+
+                    if job:
+                        job.meta.update({"progress": pct, "step": step})
+                        job.save_meta()
+
+                    continue
+
+                # -------------- JSON FINAL DO RESULTADO --------------
                 if isinstance(obj, dict) and "status" in obj:
                     resumo = obj
                     json_line = line
+                    continue
+
             except json.JSONDecodeError:
                 pass
 
@@ -152,15 +121,14 @@ def processar_csv(tenant_id, file_path, descricao):
         if proc.returncode != 0:
             raise RuntimeError(f"main_pdv_preprocessing retornou código {proc.returncode}")
 
+        # Carrega JSON final se necessário
         if not resumo and json_line:
-            try:
-                resumo = json.loads(json_line)
-            except:
-                pass
+            resumo = json.loads(json_line)
 
         if not resumo:
             raise RuntimeError("Não foi possível capturar o JSON final do main_pdv_preprocessing")
 
+        # Extrai dados
         input_id = resumo.get("input_id")
         status = resumo.get("status")
         validos = resumo.get("validos", 0)
@@ -175,9 +143,9 @@ def processar_csv(tenant_id, file_path, descricao):
             job.meta.update({"step": "Finalizado", "progress": 100})
             job.save_meta()
 
-        # ------------------------------------------------------------
-        # 💾 grava no histórico principal
-        # ------------------------------------------------------------
+        # ============================================================
+        # 💾 Historico (único)
+        # ============================================================
         writer.salvar_historico_pdv_job(
             tenant_id=tenant_id,
             arquivo=arquivo_nome,
@@ -207,6 +175,9 @@ def processar_csv(tenant_id, file_path, descricao):
             "arquivo_invalidos": arquivo_invalidos,
         }
 
+    # ============================================================
+    # ❌ ERRO
+    # ============================================================
     except Exception as e:
         logger.error(f"💥 Erro no job {job_id}: {e}", exc_info=True)
 
@@ -214,15 +185,20 @@ def processar_csv(tenant_id, file_path, descricao):
             job.meta.update({"step": "Erro", "progress": 100})
             job.save_meta()
 
-        salvar_historico(
-            tenant_id,
-            resumo.get("input_id") if "resumo" in locals() else None,
-            descricao,
-            "error",
-            file_path.split("/")[-1],
-            0, 0, 0,
-            None,
-            str(e),
+        writer.salvar_historico_pdv_job(
+            tenant_id=tenant_id,
+            arquivo=file_path.split("/")[-1],
+            status="error",
+            total_processados=0,
+            validos=0,
+            invalidos=0,
+            arquivo_invalidos=None,
+            mensagem=str(e),
+            inseridos=0,
+            descricao=descricao,
+            input_id=resumo.get("input_id") if "resumo" in locals() else None,
+            job_id=job_id,
+            sobrescritos=0,
         )
 
         return {
