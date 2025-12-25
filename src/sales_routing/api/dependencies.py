@@ -1,12 +1,31 @@
 #sales_router/src/sales_routing/api/dependencies.py
 
+# sales_routing/api/dependencies.py
+
 import os
-import requests
+import jwt
 from fastapi import Request, HTTPException, status
 
-AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://authentication_service:8000")
+# =====================================================
+# 🔐 Configurações JWT (OBRIGATÓRIO vir do .env)
+# =====================================================
+try:
+    JWT_SECRET_KEY = os.environ["JWT_SECRET_KEY"]
+except KeyError:
+    raise RuntimeError("JWT_SECRET_KEY não definido no ambiente")
 
+JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
+
+
+# =====================================================
+# 🔐 Dependency de autenticação
+# =====================================================
 async def verify_token(request: Request):
+    """
+    Valida JWT localmente.
+    Injeta usuário autenticado em request.state.user
+    """
+
     auth_header = request.headers.get("Authorization")
 
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -15,25 +34,40 @@ async def verify_token(request: Request):
             detail="Token ausente ou inválido."
         )
 
-    token = auth_header.split(" ")[1]
+    token = auth_header.replace("Bearer ", "").strip()
 
     try:
-        response = requests.post(
-            f"{AUTH_SERVICE_URL}/auth/verify-token",
-            json={"token": token},
-            timeout=5
+        payload = jwt.decode(
+            token,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM]
         )
 
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token inválido ou expirado."
-            )
+        # Campos mínimos obrigatórios
+        required_fields = ["user_id", "tenant_id", "role", "email"]
+        for field in required_fields:
+            if field not in payload:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=f"Token inválido: campo '{field}' ausente."
+                )
 
-        request.state.user = response.json()
+        # Injetar usuário no request
+        request.state.user = {
+            "user_id": payload["user_id"],
+            "tenant_id": payload["tenant_id"],
+            "role": payload["role"],
+            "email": payload["email"],
+        }
 
-    except requests.RequestException:
+    except jwt.ExpiredSignatureError:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Serviço de autenticação indisponível."
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expirado."
+        )
+
+    except jwt.InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token inválido."
         )

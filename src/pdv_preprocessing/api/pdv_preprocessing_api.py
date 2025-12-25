@@ -5,7 +5,6 @@
 # ==========================================================
 
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from .routes import router as pdv_router
 import numpy as np
@@ -22,15 +21,18 @@ app = FastAPI(
 )
 
 # ==========================================================
-# 🌍 CORS
+# 🚫 REMOVIDO — Middleware CORS (CORS agora somente no Nginx)
 # ==========================================================
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ❗ O CORS do backend gerava `Access-Control-Allow-Origin: *`
+# ❗ Isso conflitava com o header do Nginx e quebrava o download.
+#
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
 
 # ==========================================================
 # 🧹 Middleware global de saneamento JSON
@@ -41,7 +43,6 @@ async def sanitize_json_response(request: Request, call_next):
 
     if "application/json" in response.headers.get("content-type", ""):
         try:
-            # lê o corpo da resposta
             raw_body = b"".join([chunk async for chunk in response.body_iterator])
             content = json.loads(raw_body)
 
@@ -68,7 +69,6 @@ async def sanitize_json_response(request: Request, call_next):
 # ==========================================================
 # 🔀 Rotas principais
 # ==========================================================
-
 app.include_router(pdv_router, prefix="/pdv")
 
 
@@ -78,6 +78,7 @@ app.include_router(pdv_router, prefix="/pdv")
 @app.get("/", tags=["Status"])
 def root():
     return {"status": "SalesRouter PDV Preprocessing API online 🚀"}
+
 
 # ==========================================================
 # 🚀 Execução standalone (dev)

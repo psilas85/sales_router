@@ -3,7 +3,6 @@
 # ==========================================================
 # 📦 src/pdv_preprocessing/api/routes.py
 # ==========================================================
-
 from fastapi import APIRouter, HTTPException, Query, Depends, Request
 from loguru import logger
 from database.db_connection import get_connection
@@ -173,7 +172,14 @@ def upload_pdv(
         conn_redis = Redis(host="redis", port=6379)
         queue = Queue("pdv_jobs", connection=conn_redis)
 
-        job = queue.enqueue(processar_csv, tenant_id, arquivo, descricao)
+        job = queue.enqueue(
+            processar_csv,
+            tenant_id,
+            arquivo,
+            descricao,
+            job_timeout=36000  # 🔥 10 horas de timeout
+        )
+
 
         logger.info(f"🚀 Novo job enfileirado: {job.id} | tenant={tenant_id} | arquivo={arquivo}")
         return {
@@ -266,7 +272,14 @@ def upload_arquivo(
         # 🚀 Enfileira o processamento
         conn_redis = Redis(host="redis", port=6379)
         queue = Queue("pdv_jobs", connection=conn_redis)
-        job = queue.enqueue(processar_csv, tenant_id, caminho_final, descricao)
+        job = queue.enqueue(
+            processar_csv,
+            tenant_id,
+            caminho_final,
+            descricao,
+            job_timeout=36000  # 🔥 10 horas de timeout
+        )
+
 
         logger.info(f"📤 Arquivo salvo em {caminho_final}")
         logger.info(f"🚀 Job enfileirado: {job.id} | tenant={tenant_id}")
@@ -419,7 +432,7 @@ def ver_mapa_pdv(
 
 
 # ==========================================================
-# GET /pdv/jobs/ultimos  → LISTA OS ÚLTIMOS 10 JOBS
+# GET /pdv/ultimos  → LISTA OS ÚLTIMOS 10 JOBS
 # ==========================================================
 @router.get("/jobs/ultimos", dependencies=[Depends(verify_token)], tags=["Jobs"])
 def listar_ultimos_jobs(request: Request):
@@ -437,7 +450,7 @@ def listar_ultimos_jobs(request: Request):
         FROM historico_pdv_jobs
         WHERE tenant_id = %s
         ORDER BY criado_em DESC
-        LIMIT 10;
+        LIMIT 20;
     """
 
     cur.execute(sql, (tenant_id,))
@@ -533,7 +546,7 @@ def filtrar_jobs(
         FROM historico_pdv_jobs
         WHERE {where_clause}
         ORDER BY criado_em DESC
-        LIMIT 10;
+        LIMIT 20;
     """
 
     conn = get_connection()
@@ -560,12 +573,12 @@ def listar_jobs(request: Request):
     df = pd.read_sql_query(
         """
         SELECT id, tenant_id, input_id, descricao, arquivo, status,
-               total_processados, validos, invalidos, arquivo_invalidos,
-               mensagem, criado_em
+            total_processados, validos, invalidos, arquivo_invalidos,
+            mensagem, criado_em
         FROM historico_pdv_jobs
         WHERE tenant_id = %s
         ORDER BY criado_em DESC
-        LIMIT 100;
+        LIMIT 20;
         """,
         conn,
         params=(tenant_id,),
@@ -577,11 +590,299 @@ def listar_jobs(request: Request):
     return {"total": int(len(df)), "jobs": df.to_dict(orient="records")}
 
 
+# ============================================================================
+# 📍 Gestão de Locais — LISTAR (GET /pdv/locais)
+# ============================================================================
+@router.get("/locais", dependencies=[Depends(verify_token)], tags=["Locais"])
+def listar_locais(
+    request: Request,
+    input_id: str = Query(..., description="Input ID obrigatório"),
+    uf: str = Query(..., description="UF obrigatória (SP, RJ etc.)"),
+    cidade: str = Query(None),
+    cnpj: str = Query(None),
+    logradouro: str = Query(None),
+    bairro: str = Query(None),
+    cep: str = Query(None),
+):
+    user = request.state.user
+    tenant_id = user["tenant_id"]
+
+    filtros = ["tenant_id = %s", "input_id = %s", "uf = %s"]
+    params = [tenant_id, input_id, uf]
+
+    if cidade:
+        filtros.append("cidade ILIKE %s")
+        params.append(f"%{cidade}%")
+
+    if cnpj:
+        filtros.append("cnpj = %s")
+        params.append(cnpj)
+
+    if logradouro:
+        filtros.append("logradouro ILIKE %s")
+        params.append(f"%{logradouro}%")
+
+    if bairro:
+        filtros.append("bairro ILIKE %s")
+        params.append(f"%{bairro}%")
+
+    if cep:
+        filtros.append("cep = %s")
+        params.append(cep)
+
+    where = " AND ".join(filtros)
+
+    sql = f"""
+        SELECT 
+            id, tenant_id, input_id, descricao,
+            cnpj, logradouro, numero, bairro, cidade, uf, cep,
+            pdv_lat, pdv_lon, pdv_endereco_completo,
+            status_geolocalizacao, pdv_vendas,
+            criado_em, atualizado_em
+        FROM pdvs
+        WHERE {where}
+        ORDER BY cidade, bairro, logradouro
+        LIMIT 500;
+    """
+
+    conn = get_connection()
+    df = pd.read_sql_query(sql, conn, params=tuple(params))
+    conn.close()
+
+    if df.empty:
+        return {"total": 0, "pdvs": []}
+
+    df = df.astype(object).replace({np.nan: None, np.inf: None, -np.inf: None})
+
+    return {
+        "total": int(len(df)),
+        "pdvs": df.to_dict(orient="records")
+    }
+
+
+from pydantic import BaseModel
+
+class EditarLocalPayload(BaseModel):
+    logradouro: str | None = None
+    numero: str | None = None
+    bairro: str | None = None
+    cidade: str | None = None
+    uf: str | None = None
+    cep: str | None = None
+    pdv_lat: float | None = None
+    pdv_lon: float | None = None
+
+
+# ============================================================
+# ✏️ Gestão de Locais — EDITAR (PUT /pdv/locais/{pdv_id})
+# ============================================================
+@router.put("/locais/{pdv_id}", dependencies=[Depends(verify_token)], tags=["Locais"])
+def editar_local(
+    request: Request,
+    pdv_id: int,
+    payload: EditarLocalPayload,
+):
+    user = request.state.user
+    tenant_id = user["tenant_id"]
+
+    # permissão
+    if user.get("role") not in ["sales_router_adm", "tenant_adm", "tenant_operacional"]:
+        raise HTTPException(status_code=403, detail="Sem permissão para editar.")
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    # verifica se existe
+    cur.execute(
+        "SELECT id FROM pdvs WHERE id=%s AND tenant_id=%s",
+        (pdv_id, tenant_id)
+    )
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="PDV não encontrado.")
+
+    # campos editáveis permitidos
+    campos = [
+        "logradouro", "numero", "bairro", "cidade", "uf", "cep",
+        "pdv_lat", "pdv_lon"
+    ]
+
+    updates = []
+    params = []
+
+    for campo in campos:
+        valor = getattr(payload, campo)
+        if valor is not None:
+            updates.append(f"{campo} = %s")
+            params.append(valor)
+
+    # alterar status para manual_edit
+    updates.append("status_geolocalizacao = 'manual_edit'")
+
+    if not updates:
+        conn.close()
+        return {"status": "nochange", "message": "Nenhum campo alterado."}
+
+    sql = f"""
+        UPDATE pdvs
+        SET {", ".join(updates)},
+            atualizado_em = NOW()
+        WHERE id = %s AND tenant_id = %s
+        RETURNING 
+            id, tenant_id, input_id, descricao, cnpj,
+            logradouro, numero, bairro, cidade, uf, cep,
+            pdv_endereco_completo, pdv_lat, pdv_lon,
+            status_geolocalizacao, pdv_vendas,
+            criado_em, atualizado_em;
+    """
+
+    params.extend([pdv_id, tenant_id])
+
+    cur.execute(sql, tuple(params))
+    atualizado = cur.fetchone()
+    conn.commit()
+
+    colunas = [
+        "id", "tenant_id", "input_id", "descricao", "cnpj",
+        "logradouro", "numero", "bairro", "cidade", "uf", "cep",
+        "pdv_endereco_completo", "pdv_lat", "pdv_lon",
+        "status_geolocalizacao", "pdv_vendas",
+        "criado_em", "atualizado_em"
+    ]
+
+    pdv_dict = dict(zip(colunas, atualizado))
+
+    # ============================================================
+    # 🔄 Sincronizar endereço + cache (COMPORTAMENTO CORRETO)
+    # ============================================================
+    try:
+        writer = DatabaseWriter()
+
+        # 1) Montar endereço humano
+        endereco_completo = (
+            f"{pdv_dict['logradouro']}, {pdv_dict['numero']}, "
+            f"{pdv_dict['bairro']}, {pdv_dict['cidade']} - {pdv_dict['uf']}, "
+            f"{pdv_dict['cep']}, Brasil"
+        )
+
+        pdv_dict["pdv_endereco_completo"] = endereco_completo
+
+        # 2) Normalizar para chave de cache
+        endereco_norm = writer.normalizar_endereco(endereco_completo)
+
+        # 3) Tentar buscar no cache — NÃO CRIAR SE NÃO EXISTIR
+        cache_row = writer.buscar_por_endereco(endereco_norm)
+
+        if cache_row:
+            # cache existe → usa coordenadas oficiais do cache
+            lat_cache, lon_cache = cache_row
+
+            writer.atualizar_lat_lon_pdv(pdv_id, lat_cache, lon_cache)
+            writer.atualizar_endereco_pdv(pdv_id, endereco_completo)
+
+            pdv_dict["pdv_lat"] = lat_cache
+            pdv_dict["pdv_lon"] = lon_cache
+
+        else:
+            # cache NÃO existe → NÃO criar cache
+            # apenas atualiza o endereço no PDV
+            writer.atualizar_endereco_pdv(pdv_id, endereco_completo)
+
+    except Exception as e:
+        logger.error(f"⚠️ Erro ao sincronizar cache (IGNORADO): {e}")
+
+    cur.close()
+    conn.close()
+
+    return {
+        "status": "success",
+        "pdv": pdv_dict
+    }
+
+
+from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
+writer = DatabaseWriter()
+
+# ============================================================
+# ❌ Excluir PDV (DELETE /pdv/locais/{pdv_id})
+# ============================================================
+@router.delete("/locais/{pdv_id}", tags=["PDVs"], dependencies=[Depends(verify_token)])
+def excluir_pdv(request: Request, pdv_id: int):
+    user = request.state.user
+    tenant_id = user["tenant_id"]
+
+    writer = DatabaseWriter()
+
+    # executa exclusão com tenant_id
+    ok = writer.excluir_pdv(pdv_id, tenant_id)
+
+    if not ok:
+        raise HTTPException(status_code=404, detail="PDV não encontrado.")
+
+    return {
+        "status": "ok",
+        "message": "PDV excluído com sucesso.",
+        "id": pdv_id
+    }
+
+
 # ==========================================================
-# 🔍 Buscar detalhes de um job específico
+# 🔍 Buscar detalhes de um job específico (REDIS + BANCO)
 # ==========================================================
 @router.get("/jobs/{job_id}", dependencies=[Depends(verify_token)], tags=["Jobs"])
 def detalhar_job(request: Request, job_id: str):
+    user = request.state.user
+    tenant_id = user["tenant_id"]
+
+    # --------------------------------------------------
+    # 1️⃣ TENTA BUSCAR NO BANCO (RESUMO FINAL)
+    # --------------------------------------------------
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT
+                job_id,
+                status,
+                descricao,
+                arquivo,
+                input_id,
+                total_processados,
+                validos,
+                invalidos
+            FROM historico_pdv_jobs
+            WHERE tenant_id = %s
+              AND job_id = %s
+            LIMIT 1;
+            """,
+            (tenant_id, job_id),
+        )
+
+        row = cur.fetchone()
+        conn.close()
+
+        if row:
+            return {
+                "job_id": row[0],
+                "status": row[1],
+                "descricao": row[2],
+                "arquivo": row[3],
+                "input_id": row[4],
+                "total_processados": row[5],
+                "validos": row[6],
+                "invalidos": row[7],
+            }
+
+    except Exception as e:
+        logger.warning(f"⚠️ Falha ao buscar job no banco, usando Redis: {e}")
+
+    # --------------------------------------------------
+    # 2️⃣ FALLBACK — REDIS (COMPORTAMENTO ANTIGO)
+    # --------------------------------------------------
     from redis import Redis
     from rq.job import Job
 
@@ -597,6 +898,7 @@ def detalhar_job(request: Request, job_id: str):
             "arquivo": job.args[1] if len(job.args) > 1 else None,
             "descricao": job.args[2] if len(job.args) > 2 else None,
         }
+
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Job não encontrado: {e}")
 
@@ -651,3 +953,57 @@ def progresso_job(request: Request, job_id: str):
     except Exception as e:
         logger.error(f"❌ Erro ao consultar progresso do job {job_id}: {e}", exc_info=True)
         raise HTTPException(status_code=404, detail=f"Job não encontrado ou expirado: {e}")
+
+
+# ==========================================================
+# 📥 Download CSV de registros inválidos
+# ==========================================================
+from fastapi.responses import FileResponse
+import os
+
+@router.get(
+    "/jobs/{job_id}/download-invalidos",
+    dependencies=[Depends(verify_token)],
+    tags=["Jobs"],
+)
+def download_invalidos(request: Request, job_id: str):
+    user = request.state.user
+    tenant_id = user["tenant_id"]
+
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT arquivo_invalidos
+        FROM historico_pdv_jobs
+        WHERE tenant_id = %s
+          AND job_id = %s
+          AND arquivo_invalidos IS NOT NULL
+        LIMIT 1;
+        """,
+        (tenant_id, job_id),
+    )
+
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Arquivo de inválidos não encontrado para este job.",
+        )
+
+    caminho_arquivo = row[0]
+
+    if not os.path.exists(caminho_arquivo):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Arquivo não existe no disco: {caminho_arquivo}",
+        )
+
+    return FileResponse(
+        path=caminho_arquivo,
+        media_type="text/csv",
+        filename=os.path.basename(caminho_arquivo),
+    )

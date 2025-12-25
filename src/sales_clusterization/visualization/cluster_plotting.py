@@ -240,10 +240,11 @@ def main():
 
     logger.info(f"🗺️ Gerando mapa | tenant_id={args.tenant_id} | clusterization_id={args.clusterization_id} | run_id={run_id}")
 
-    output_dir = Path(f"output/maps/{args.tenant_id}")
+    output_dir = Path(f"/app/output/maps/{args.tenant_id}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     mapa_html = output_dir / f"clusterization_{args.clusterization_id}.html"
+
 
     dados = buscar_clusters(args.tenant_id, run_id)
     gerar_mapa_clusters(dados, mapa_html)

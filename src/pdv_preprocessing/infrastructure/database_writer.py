@@ -766,3 +766,279 @@ class DatabaseWriter:
         # cache MKP
         self.inserir_localizacao_mkp(cep, lat, lon)
 
+
+    # ============================================================
+    # 🔄 Buscar endereço no cache com base em lat/lon
+    # ============================================================
+    @retry_on_failure()
+    def buscar_endereco_por_coordenada(self, lat: float, lon: float) -> Optional[str]:
+        """
+        Busca no cache (enderecos_cache) o endereço correspondente à coordenada.
+        Retorna o endereço original (string) ou None caso não exista.
+        """
+
+        if lat is None or lon is None:
+            return None
+
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT endereco
+                    FROM enderecos_cache
+                    WHERE lat = %s AND lon = %s
+                    LIMIT 1;
+                    """,
+                    (lat, lon),
+                )
+                row = cur.fetchone()
+
+            if row:
+                return row[0]
+
+            return None
+
+        except Exception as e:
+            logging.error(f"❌ Erro ao buscar endereço por coordenada: {e}", exc_info=True)
+            return None
+
+        finally:
+            POOL.putconn(conn)
+
+    # ============================================================
+    # 📝 Atualizar endereço completo do PDV
+    # ============================================================
+    @retry_on_failure()
+    def atualizar_endereco_pdv(self, pdv_id: int, novo_endereco: str) -> bool:
+        """
+        Atualiza pdv_endereco_completo no banco para o PDV informado.
+        """
+
+        if not novo_endereco:
+            return False
+
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE pdvs
+                    SET pdv_endereco_completo = %s,
+                        atualizado_em = NOW()
+                    WHERE id = %s
+                    """,
+                    (novo_endereco, pdv_id),
+                )
+            conn.commit()
+            return True
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"❌ Erro ao atualizar endereço do PDV: {e}", exc_info=True)
+            return False
+
+        finally:
+            POOL.putconn(conn)
+
+    # ============================================================
+    # 🧹 Normalizar endereço (igual ao padrão do cache PDV)
+    # ============================================================
+    def normalizar_endereco(self, endereco: str) -> str:
+        if not endereco:
+            return ""
+
+        # tentativa de corrigir encoding
+        try:
+            endereco = endereco.encode("latin1").decode("utf-8")
+        except Exception:
+            pass
+
+        import unicodedata, re
+
+        # limpar acentuação e padronizar
+        endereco = endereco.strip().lower()
+        endereco = unicodedata.normalize("NFKD", endereco)
+        endereco = endereco.encode("ascii", "ignore").decode("ascii")
+        endereco = " ".join(endereco.split())
+
+        # ============================================================
+        # 🧹 Remoção de padrões problemáticos
+        # ============================================================
+
+        # 1) vírgulas duplas ou vazias: ", ," → ","
+        endereco = re.sub(r",\s*,", ",", endereco)
+
+        # 2) vírgula no começo ou no final
+        endereco = re.sub(r"^\s*,\s*", "", endereco)
+        endereco = re.sub(r",\s*$", "", endereco)
+
+        # 3) espaço antes ou depois indevido: " ,rua" ou "rua,  " etc.
+        endereco = re.sub(r"\s+,", ",", endereco)
+        endereco = re.sub(r",\s+", ", ", endereco)
+
+        # 4) múltiplos espaços
+        endereco = re.sub(r"\s{2,}", " ", endereco)
+
+        return endereco
+
+
+
+    # ============================================================
+    # 🔍 Buscar coordenadas no cache com base NO ENDEREÇO NORMALIZADO
+    # ============================================================
+    @retry_on_failure()
+    def buscar_por_endereco(self, endereco_norm: str) -> Optional[Tuple[float, float]]:
+        if not endereco_norm:
+            return None
+
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT lat, lon
+                    FROM enderecos_cache
+                    WHERE endereco = %s
+                    LIMIT 1;
+                    """,
+                    (endereco_norm,)
+                )
+                row = cur.fetchone()
+                return (row[0], row[1]) if row else None
+
+        except Exception as e:
+            logging.error(f"❌ Erro ao buscar_por_endereco: {e}", exc_info=True)
+            return None
+
+        finally:
+            POOL.putconn(conn)
+
+
+    # ============================================================
+    # ✏️ Atualizar lat/lon do PDV (edição manual)
+    # ============================================================
+    @retry_on_failure()
+    def atualizar_lat_lon_pdv(self, pdv_id: int, lat: float, lon: float) -> bool:
+        if lat is None or lon is None:
+            return False
+
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE pdvs
+                    SET pdv_lat = %s,
+                        pdv_lon = %s,
+                        status_geolocalizacao = 'manual_edit',
+                        atualizado_em = NOW()
+                    WHERE id = %s
+                    """,
+                    (lat, lon, pdv_id)
+                )
+            conn.commit()
+            return True
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"❌ Erro ao atualizar_lat_lon_pdv: {e}", exc_info=True)
+            return False
+
+        finally:
+            POOL.putconn(conn)
+
+    # ============================================================
+    # ✏️ Atualizar lat/lon no cache usando o ENDEREÇO NORMALIZADO
+    # ============================================================
+    @retry_on_failure()
+    def atualizar_cache_por_endereco(self, endereco_completo: str, nova_lat: float, nova_lon: float) -> bool:
+        """
+        Atualiza o cache (enderecos_cache) para o endereço COMPLETO informado.
+        Usa a chave normalizada, igual ao salvar_cache().
+        """
+
+        if not endereco_completo or nova_lat is None or nova_lon is None:
+            logging.warning("⚠️ atualizar_cache_por_endereco chamado com dados inválidos.")
+            return False
+
+        # proteção: nunca salvar coordenada suspeita
+        if coordenada_generica(nova_lat, nova_lon):
+            logging.warning(f"⚠️ Coordenada suspeita ignorada ao atualizar cache: {endereco_completo}")
+            return False
+
+        # normalizar igual ao salvar_cache()
+        endereco_norm = self.normalizar_endereco(endereco_completo)
+
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE enderecos_cache
+                    SET lat = %s,
+                        lon = %s,
+                        atualizado_em = NOW()
+                    WHERE endereco = %s
+                    """,
+                    (nova_lat, nova_lon, endereco_norm)
+                )
+
+            conn.commit()
+
+            if cur.rowcount > 0:
+                logging.info(f"📝 Cache atualizado para endereço '{endereco_norm}' -> {nova_lat}, {nova_lon}")
+                return True
+            else:
+                logging.warning(f"⚠️ Nenhum cache encontrado para '{endereco_norm}'. Inserindo novo.")
+
+                # insere novo cache
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO enderecos_cache (endereco, lat, lon)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (endereco)
+                        DO UPDATE SET
+                            lat = EXCLUDED.lat,
+                            lon = EXCLUDED.lon,
+                            atualizado_em = NOW()
+                        """,
+                        (endereco_norm, nova_lat, nova_lon)
+                    )
+                conn.commit()
+                return True
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"❌ Erro ao atualizar cache por endereço: {e}", exc_info=True)
+            return False
+
+        finally:
+            POOL.putconn(conn)
+
+    # ============================================================
+    # ❌ Excluir PDV (com proteção por tenant_id)
+    # ============================================================
+    @retry_on_failure()
+    def excluir_pdv(self, pdv_id: int, tenant_id: int) -> bool:
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    DELETE FROM pdvs
+                    WHERE id = %s AND tenant_id = %s
+                    """,
+                    (pdv_id, tenant_id)
+                )
+            conn.commit()
+            return cur.rowcount > 0
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"❌ Erro ao excluir PDV: {e}", exc_info=True)
+            return False
+
+        finally:
+            POOL.putconn(conn)

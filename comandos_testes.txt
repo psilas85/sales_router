@@ -1,6 +1,10 @@
 curl -X POST "http://localhost/auth/login?email=paulo.silas@igotech.com.br&senha=Admin@2025"
 curl -X POST "http://34.227.175.23/auth/login?email=paulo.silas@igotech.com.br&senha=Psilas@85"
 
+docker build -t psilas85/sales_router-base:latest -f Dockerfile.base .
+tree -a -I 'node_modules|.next|dist' -L 20
+
+
 docker exec -it pdv_preprocessing   python3 -m src.pdv_preprocessing.main_pdv_preprocessing   --tenant 1   --arquivo data/pdvs_enderecos.csv   --descricao "SC_10K_251028"
 docker exec -it pdv_preprocessing python3 -m src.pdv_preprocessing.tasks 1 /app/data/pdvs_enderecos.csv "SC_10K_251028"
 docker exec -it pdv_preprocessing python3 -m src.pdv_preprocessing.visualization.pdv_plotting --tenant_id 1 --input_id 491d5430-2de9-451c-9453-c358fb9e4aca --uf RJ
@@ -28,11 +32,12 @@ docker exec -it sales_clusterization bash -c "
 python3 -m src.sales_clusterization.cli.run_cluster_cep \
     --tenant 1 \
     --uf SP \
-    --input_id 131b5b08-8a6e-4594-913a-841d70c7eb08 \
-    --descricao 'Clusterização MKP SP_PicPay_20251104' \
-    --velocidade_media 40 \
+    --input_id f7bf5c0d-4c95-41e4-ae5f-0ae0e2f767dd \
+    --descricao 'Clusterização MKP SP_PicPay_20251209' \
+    --velocidade_media 35 \
     --tempo_max_min 480 \
     --clientes_target \
+    --ceps_max_cluster 5000 \
     --excluir_outliers
 "
 docker exec -it sales_clusterization bash -c "

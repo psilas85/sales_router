@@ -131,6 +131,14 @@ services:
     depends_on:
       - sales_router_db
       - redis
+    
+    command: >
+      uvicorn sales_clusterization.api.cluster_api:app
+      --host 0.0.0.0
+      --port 8004
+      --workers 1
+
+
     volumes:
       - ./src/sales_clusterization:/app/src/sales_clusterization
       - ./src/database:/app/src/database
@@ -165,13 +173,15 @@ services:
       - ./src/cli:/app/src/cli
       - ./output:/app/output
       - ./data:/app/data
+
     expose:
       - "8005"
     ports:
-      - "8012:8005"   # opcional para debug
+      - "8012:8005"
     networks:
       - sales_router_net
     restart: always
+
 
 
   # ======================
@@ -368,16 +378,20 @@ services:
     build:
       context: ../sales_router_frontend
       dockerfile: Dockerfile
+      target: dev             # <-- usa o stage DEV
     container_name: sales_router_frontend
     env_file:
       - ../sales_router_frontend/.env.local
+    command: npm run dev      # <-- ativa hot reload
     ports:
       - "3100:3000"
-    depends_on:
-      - api_gateway
+    volumes:
+      - ../sales_router_frontend:/app
+      - /app/node_modules     # evita conflito do host
     networks:
       - sales_router_net
     restart: always
+
 
 
 # ======================
