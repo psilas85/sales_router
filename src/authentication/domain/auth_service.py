@@ -43,41 +43,46 @@ class AuthService:
 
 
 def role_required(roles: list[str]):
-    """Decorator para proteger rotas FastAPI com base no role do usuário."""
     def decorator(func):
         @wraps(func)
-        async def wrapper(request: Request, *args, **kwargs):
+        async def wrapper(*args, **kwargs):
+            request: Request | None = kwargs.get("request")
+            if not request:
+                for arg in args:
+                    if isinstance(arg, Request):
+                        request = arg
+                        break
+
+            if not request:
+                raise HTTPException(status_code=500, detail="Request não encontrado")
+
             auth_header = request.headers.get("Authorization")
             if not auth_header or not auth_header.startswith("Bearer "):
                 raise HTTPException(status_code=401, detail="Token não fornecido")
 
             token = auth_header.split(" ")[1]
             auth = AuthService()
-
-            try:
-                payload = auth.decode_token(token)
-            except HTTPException as e:
-                raise e
+            payload = auth.decode_token(token)
 
             if payload.get("role") not in roles:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Acesso negado: privilégio insuficiente"
+                    detail="Acesso negado"
                 )
 
             request.state.user = {
                 "user_id": payload.get("user_id"),
                 "tenant_id": payload.get("tenant_id"),
                 "role": payload.get("role"),
-                "email": payload.get("email"),  # ← necessário
+                "email": payload.get("email"),
             }
-
 
             import inspect
             if inspect.iscoroutinefunction(func):
-                return await func(request, *args, **kwargs)
+                return await func(*args, **kwargs)
             else:
-                return func(request, *args, **kwargs)
+                return func(*args, **kwargs)
 
         return wrapper
     return decorator
+

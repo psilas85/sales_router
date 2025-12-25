@@ -1,5 +1,12 @@
 curl -X POST "http://localhost/auth/login?email=paulo.silas@igotech.com.br&senha=Admin@2025"
 curl -X POST "http://34.227.175.23/auth/login?email=paulo.silas@igotech.com.br&senha=Psilas@85"
+curl -X POST http://34.227.175.23/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "paulo.silas@igotech.com.br",
+    "senha": "Psilas@85"
+  }'
+
 
 docker build -t psilas85/sales_router-base:latest -f Dockerfile.base .
 tree -a -I 'node_modules|.next|dist' -L 20

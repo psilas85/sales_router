@@ -1,28 +1,24 @@
 # sales_router/src/authentication/use_case/user_use_case.py
 
+# sales_router/src/authentication/use_case/user_use_case.py
+
 import os
 from authentication.domain.auth_service import AuthService
 from authentication.infrastructure.user_repository import UserRepository
 from authentication.entities.user import User
+
 
 class UserUseCase:
     def __init__(self):
         self.repo = UserRepository()
         self.auth = AuthService()
 
-    def setup_table(self):
-        self.repo.create_table()
-
     # =====================================================
     # CRIAÇÕES
     # =====================================================
 
     def create_sales_router_admin(self, tenant_id):
-        """
-        Cria o administrador master do SalesRouter.
-        Usa senha vinda de variável de ambiente ADMIN_PASSWORD para maior segurança.
-        """
-        admin_password = os.getenv("ADMIN_PASSWORD", "Psilas@85")  # fallback para dev
+        admin_password = os.getenv("ADMIN_PASSWORD", "Psilas@85")
         senha_hash = self.auth.hash_password(admin_password)
 
         user = User(
@@ -36,28 +32,24 @@ class UserUseCase:
         return self.repo.create(user)
 
     def create_tenant_admin(self, tenant_id, nome, email, senha):
-        senha_hash = self.auth.hash_password(senha)
-        user = User(
+        return self.repo.create(User(
             tenant_id=tenant_id,
             nome=nome,
             email=email,
-            senha_hash=senha_hash,
+            senha_hash=self.auth.hash_password(senha),
             role="tenant_adm",
             ativo=True
-        )
-        return self.repo.create(user)
+        ))
 
     def create_tenant_operacional(self, tenant_id, nome, email, senha):
-        senha_hash = self.auth.hash_password(senha)
-        user = User(
+        return self.repo.create(User(
             tenant_id=tenant_id,
             nome=nome,
             email=email,
-            senha_hash=senha_hash,
+            senha_hash=self.auth.hash_password(senha),
             role="tenant_operacional",
             ativo=True
-        )
-        return self.repo.create(user)
+        ))
 
     # =====================================================
     # LOGIN
@@ -67,17 +59,16 @@ class UserUseCase:
         user = self.repo.find_by_email(email)
         if not user or not self.auth.verify_password(senha, user.senha_hash):
             return None
+
         return self.auth.generate_token(
             user.id,
             user.tenant_id,
             user.role,
-            user.email   # ← obrigatório para os outros módulos
+            user.email
         )
 
-
-
     # =====================================================
-    # LISTAGEM / ADMIN
+    # LISTAGEM
     # =====================================================
 
     def list_users(self):
@@ -86,5 +77,81 @@ class UserUseCase:
     def list_users_by_tenant(self, tenant_id):
         return self.repo.list_by_tenant(tenant_id)
 
-    def deactivate_user(self, user_id):
-        return self.repo.deactivate(user_id)
+    # =====================================================
+    # ATIVA / DESATIVA
+    # =====================================================
+
+    def deactivate_user(self, user_id, requester):
+        user = self.repo.find_by_id(user_id)
+        if not user:
+            raise Exception("Usuário não encontrado")
+
+        # 🔒 MASTER NÃO PODE SER DESATIVADO
+        if user.role == "sales_router_adm":
+            raise Exception("Usuário master não pode ser desativado")
+
+        # 🔒 NÃO PODE SE AUTO-DESATIVAR
+        if requester["user_id"] == user.id:
+            raise Exception("Você não pode desativar a si mesmo")
+
+        # 🔒 TENANT ADM SÓ NO PRÓPRIO TENANT
+        if (
+            requester["role"] == "tenant_adm"
+            and user.tenant_id != requester["tenant_id"]
+        ):
+            raise Exception("Permissão insuficiente")
+
+        user.ativo = False
+        return self.repo.update_partial(user)
+
+    def activate_user(self, user_id, requester):
+        user = self.repo.find_by_id(user_id)
+        if not user:
+            raise Exception("Usuário não encontrado")
+
+        # 🔒 TENANT ADM SÓ NO PRÓPRIO TENANT
+        if (
+            requester["role"] == "tenant_adm"
+            and user.tenant_id != requester["tenant_id"]
+        ):
+            raise Exception("Permissão insuficiente")
+
+        user.ativo = True
+        return self.repo.update_partial(user)
+
+    # =====================================================
+    # EDIÇÃO SEGURA
+    # =====================================================
+
+    def update_user(self, user_id, nome, email, role, senha, requester):
+        user = self.repo.find_by_id(user_id)
+        if not user:
+            raise Exception("Usuário não encontrado")
+
+        # 🔒 MASTER É INTOCÁVEL
+        if user.role == "sales_router_adm":
+            raise Exception("Usuário master não pode ser alterado")
+
+        # 🔒 TENANT ADM SÓ NO PRÓPRIO TENANT
+        if (
+            requester["role"] == "tenant_adm"
+            and user.tenant_id != requester["tenant_id"]
+        ):
+            raise Exception("Permissão insuficiente")
+
+        # 🔒 AUTO-EDIÇÃO CRÍTICA BLOQUEADA
+        if requester["user_id"] == user.id:
+            if email != user.email:
+                raise Exception("Você não pode alterar seu próprio email")
+            if role != user.role:
+                raise Exception("Você não pode alterar seu próprio perfil")
+
+        user.nome = nome
+        user.email = email
+        user.role = role
+
+        # 🔥 senha só se vier
+        if senha:
+            user.senha_hash = self.auth.hash_password(senha)
+
+        return self.repo.update_partial(user)

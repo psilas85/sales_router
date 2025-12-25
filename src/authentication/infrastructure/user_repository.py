@@ -151,3 +151,72 @@ class UserRepository:
         cur.close()
         conn.close()
         return user
+
+    def find_by_id(self, user_id: int):
+        conn = get_connection()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT id, tenant_id, nome, email, senha_hash, role, ativo
+            FROM usuario
+            WHERE id = %s
+        """, (user_id,))
+
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not row:
+            return None
+
+        return User(
+            id=row[0],
+            tenant_id=row[1],
+            nome=row[2],
+            email=row[3],
+            senha_hash=row[4],
+            role=row[5],
+            ativo=row[6],
+        )
+
+    def update_partial(self, user: User):
+        conn = get_connection()
+        cur = conn.cursor()
+
+        if user.senha_hash:
+            cur.execute("""
+                UPDATE usuario
+                SET nome = %s,
+                    email = %s,
+                    senha_hash = %s,
+                    role = %s,
+                    ativo = %s
+                WHERE id = %s;
+            """, (
+                user.nome,
+                user.email,
+                user.senha_hash,
+                user.role,
+                user.ativo,
+                user.id
+            ))
+        else:
+            cur.execute("""
+                UPDATE usuario
+                SET nome = %s,
+                    email = %s,
+                    role = %s,
+                    ativo = %s
+                WHERE id = %s;
+            """, (
+                user.nome,
+                user.email,
+                user.role,
+                user.ativo,
+                user.id
+            ))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return user

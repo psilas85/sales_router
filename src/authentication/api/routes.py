@@ -1,6 +1,8 @@
 #sales_router/src/authentication/api/routes.py
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Body
+
+from authentication.api.schemas import UserUpdateSchema, UserCreateSchema
 from authentication.use_case.tenant_use_case import TenantUseCase
 from authentication.use_case.user_use_case import UserUseCase
 from authentication.domain.auth_service import AuthService, role_required
@@ -53,26 +55,36 @@ def list_tenants(request: Request):
 # 👤 USUÁRIOS
 # =====================================================
 
+
+
 @router.post("/users", tags=["Usuários"])
 @role_required(["sales_router_adm", "tenant_adm"])
 def create_user(
     request: Request,
-    nome: str,
-    email: str,
-    senha: str,
-    role: str,
-    tenant_id: int,
+    payload: UserCreateSchema
 ):
     creator_role = request.state.user["role"]
 
-    if creator_role == "sales_router_adm" and role == "tenant_adm":
-        user = user_use_case.create_tenant_admin(tenant_id, nome, email, senha)
-    elif creator_role == "tenant_adm" and role == "tenant_operacional":
-        user = user_use_case.create_tenant_operacional(tenant_id, nome, email, senha)
+    if creator_role == "sales_router_adm" and payload.role == "tenant_adm":
+        user = user_use_case.create_tenant_admin(
+            payload.tenant_id,
+            payload.nome,
+            payload.email,
+            payload.senha
+        )
+
+    elif creator_role == "tenant_adm" and payload.role == "tenant_operacional":
+        user = user_use_case.create_tenant_operacional(
+            payload.tenant_id,
+            payload.nome,
+            payload.email,
+            payload.senha
+        )
     else:
-        raise HTTPException(status_code=403, detail="Permissão insuficiente.")
+        raise HTTPException(status_code=403, detail="Permissão insuficiente")
 
     return {"message": "Usuário criado com sucesso", "user": user.__dict__}
+
 
 
 @router.get("/users", tags=["Usuários"])
@@ -93,7 +105,10 @@ def list_users(request: Request):
 @role_required(["tenant_adm", "sales_router_adm"])
 def deactivate_user(request: Request, user_id: int):
     try:
-        user = user_use_case.deactivate_user(user_id)
+        user = user_use_case.deactivate_user(
+            user_id=user_id,
+            requester=request.state.user
+        )
         return {"message": f"Usuário {user.nome} inativado"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -103,17 +118,19 @@ def deactivate_user(request: Request, user_id: int):
 # 🔐 AUTENTICAÇÃO
 # =====================================================
 
-from fastapi import Query
+from pydantic import BaseModel
+
+class LoginSchema(BaseModel):
+    email: str
+    senha: str
 
 @router.post("/login", tags=["Autenticação"])
-def login(
-    email: str = Query(...),
-    senha: str = Query(...)
-):
-    token = user_use_case.login(email, senha)
+def login(payload: LoginSchema):
+    token = user_use_case.login(payload.email, payload.senha)
     if not token:
         raise HTTPException(status_code=401, detail="Credenciais inválidas")
     return {"token": token}
+
 
 
 @router.get("/me", tags=["Autenticação"])
@@ -146,3 +163,38 @@ def verify_token(payload: dict):
         raise HTTPException(status_code=401, detail="Token expirado")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Token inválido")
+
+
+@router.put("/users/{user_id}", tags=["Usuários"])
+@role_required(["tenant_adm", "sales_router_adm"])
+def update_user(
+    request: Request,
+    user_id: int,
+    payload: UserUpdateSchema
+):
+    try:
+        user = user_use_case.update_user(
+            user_id=user_id,
+            nome=payload.nome,
+            email=payload.email,
+            role=payload.role,
+            senha=payload.senha,
+            requester=request.state.user
+        )
+        return {"message": "Usuário atualizado", "user": user.__dict__}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.put("/users/{user_id}/activate", tags=["Usuários"])
+@role_required(["tenant_adm", "sales_router_adm"])
+def activate_user(request: Request, user_id: int):
+    try:
+        user = user_use_case.activate_user(
+            user_id=user_id,
+            requester=request.state.user
+        )
+        return {"message": f"Usuário {user.nome} ativado"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
