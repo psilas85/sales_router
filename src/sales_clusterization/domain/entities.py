@@ -6,21 +6,24 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, List
 
 
-# ==========================================================
-# 🏪 Entidade PDV
-# ==========================================================
 @dataclass
 class PDV:
     """Representa um ponto de venda (cliente)."""
     id: int
-    cnpj: str
+    cnpj: Optional[str]
     nome: Optional[str]
     cidade: Optional[str]
     uf: Optional[str]
     lat: float
     lon: float
-    cluster_label: Optional[int] = None  # Cluster principal (macro)
-    subcluster_seq: Optional[int] = None  # 🔹 Subcluster dentro do cluster principal
+
+    # 🔹 Clusterização
+    cluster_label: Optional[int] = None   # rótulo lógico (0..k-1)
+    cluster_id: Optional[int] = None      # 🔴 ID real do banco (cluster_setor.id)
+
+    # 🔹 Planejamento operacional
+    subcluster_seq: Optional[int] = None  # dia / sequência do vendedor
+
 
 
 # ==========================================================

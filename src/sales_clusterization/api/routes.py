@@ -68,8 +68,8 @@ def listar_inputs(
         FROM historico_pdv_jobs h
         WHERE h.tenant_id = %s
           AND h.status = 'done'
-          AND (%s IS NULL OR h.criado_em >= %s)
-          AND (%s IS NULL OR h.criado_em <= %s)
+          AND (%s IS NULL OR DATE(h.criado_em) >= %s)
+          AND (%s IS NULL OR DATE(h.criado_em) <= %s)
           AND (%s IS NULL OR LOWER(h.descricao) LIKE %s)
     """
 
@@ -79,9 +79,10 @@ def listar_inputs(
         params=(
             tenant_id,
             data_inicio, data_inicio,
-            data_fim, f"{data_fim} 23:59:59" if data_fim else None,
+            data_fim, data_fim,
             descricao, f"%{descricao.lower()}%" if descricao else None,
         ),
+
     ).iloc[0, 0]
 
     # ============================================================
@@ -101,8 +102,8 @@ def listar_inputs(
          AND p.input_id  = h.input_id
         WHERE h.tenant_id = %s
           AND h.status = 'done'
-          AND (%s IS NULL OR h.criado_em >= %s)
-          AND (%s IS NULL OR h.criado_em <= %s)
+          AND (%s IS NULL OR DATE(h.criado_em) >= %s)
+          AND (%s IS NULL OR DATE(h.criado_em) <= %s)
           AND (%s IS NULL OR LOWER(h.descricao) LIKE %s)
         GROUP BY h.input_id, h.criado_em, h.descricao
         ORDER BY h.criado_em DESC
@@ -115,11 +116,12 @@ def listar_inputs(
         params=(
             tenant_id,
             data_inicio, data_inicio,
-            data_fim, f"{data_fim} 23:59:59" if data_fim else None,
+            data_fim, data_fim,
             descricao, f"%{descricao.lower()}%" if descricao else None,
             limit,
             offset,
-        ),
+        )
+
     )
 
     conn.close()
@@ -202,20 +204,25 @@ def listar_jobs(
     import pandas as pd
     import numpy as np
 
-    filtros = ["tenant_id = %s"]
-    params: list = [tenant_id]
-
-    if descricao:
-        filtros.append("LOWER(metadata->>'descricao') LIKE %s")
-        params.append(f"%{descricao.lower()}%")
+    # -----------------------------------
+    # Filtros dinâmicos
+    # -----------------------------------
+    filtros = ["h.tenant_id = %s"]
+    where_params = [tenant_id]
 
     if data_inicio:
-        filtros.append("criado_em >= %s")
-        params.append(data_inicio)
+        filtros.append("DATE(h.criado_em) >= %s")
+        where_params.append(data_inicio)   # <<< FALTAVA ISSO
 
     if data_fim:
-        filtros.append("criado_em <= %s")
-        params.append(f"{data_fim} 23:59:59")
+        filtros.append("DATE(h.criado_em) <= %s")
+        where_params.append(data_fim)       # <<< FALTAVA ISSO
+
+    if descricao:
+        filtros.append("LOWER(h.descricao) LIKE %s")
+        where_params.append(f"%{descricao.lower()}%")
+
+
 
     where_clause = " AND ".join(filtros)
 
@@ -227,7 +234,12 @@ def listar_jobs(
         FROM historico_pipeline_jobs
         WHERE {where_clause};
     """
-    total = pd.read_sql_query(sql_total, conn, params=params).iloc[0, 0]
+    total = pd.read_sql_query(
+        sql_total,
+        conn,
+        params=where_params
+    ).iloc[0, 0]
+
 
     # DADOS PAGINADOS
     sql = f"""
@@ -250,8 +262,9 @@ def listar_jobs(
     df = pd.read_sql_query(
         sql,
         conn,
-        params=(*params, limit, offset),
+        params=(*where_params, limit, offset),
     )
+
 
     conn.close()
 
@@ -286,16 +299,17 @@ def listar_historico_clusterizacao(
     where_params = [tenant_id]
 
     if data_inicio:
-        filtros.append("h.criado_em >= %s")
+        filtros.append("DATE(h.criado_em) >= %s")
         where_params.append(data_inicio)
 
     if data_fim:
-        filtros.append("h.criado_em <= %s")
-        where_params.append(f"{data_fim} 23:59:59")
+        filtros.append("DATE(h.criado_em) <= %s")
+        where_params.append(data_fim)
 
     if descricao:
         filtros.append("LOWER(h.descricao) LIKE %s")
         where_params.append(f"%{descricao.lower()}%")
+
 
     where_clause = " AND ".join(filtros)
 

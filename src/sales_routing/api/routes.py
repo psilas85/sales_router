@@ -465,17 +465,18 @@ def listar_relatorios_roteirizacao(
     filtros = ["r.tenant_id = %s"]
     params = [tenant_id]
 
-    if data_inicio:
-        filtros.append("r.criado_em >= %s")
+    if data_inicio and data_inicio.strip():
+        filtros.append("DATE(r.criado_em) >= %s")
         params.append(data_inicio)
 
-    if data_fim:
-        filtros.append("r.criado_em <= %s")
+    if data_fim and data_fim.strip():
+        filtros.append("DATE(r.criado_em) <= %s")
         params.append(data_fim)
 
-    if descricao:
+    if descricao and descricao.strip():
         filtros.append("LOWER(h.descricao) LIKE %s")
         params.append(f"%{descricao.lower()}%")
+
 
     where_sql = " AND ".join(filtros)
 

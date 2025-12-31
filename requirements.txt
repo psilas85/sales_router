@@ -12,12 +12,18 @@ psycopg2-binary==2.9.9
 redis==5.0.7
 
 # ===== Web / APIs =====
-fastapi==0.115.0
+fastapi==0.109.2
 uvicorn[standard]==0.30.1
+pydantic[email]==1.10.13
+python-multipart
+
 
 # ===== Segurança e Autenticação =====
-bcrypt==4.1.3
 PyJWT==2.9.0
+bcrypt==3.2.2
+passlib[bcrypt]==1.7.4
+
+
 
 # ===== Ciência de Dados e ML (Clusterization / Simulation) =====
 pandas==2.2.3
@@ -37,8 +43,6 @@ pytz==2024.1
 loguru
 
 # Sales Clusterization - Requisitos específicos
-fastapi
-uvicorn
 psycopg2-binary
 scikit-learn
 numpy

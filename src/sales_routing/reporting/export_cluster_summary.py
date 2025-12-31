@@ -5,78 +5,101 @@
 # ============================================================
 
 import os
-import csv
 from pathlib import Path
+import pandas as pd
 from loguru import logger
 from src.database.db_connection import get_connection
+from openpyxl.styles import Font, Alignment
+from openpyxl.utils import get_column_letter
 
-
-BASE_OUTPUT = Path("/app/output/reports")   # 🔥 Caminho correto ABSOLUTO
+BASE_OUTPUT = Path("/app/output/reports")  # caminho absoluto no container
 
 
 def exportar_resumo_cluster(tenant_id: int, routing_id: str):
     """
     Exporta o resumo da view vw_sales_routing_resumo_cluster
-    para um arquivo CSV organizado por tenant e routing_id.
-    Inclui o campo de valor total de vendas (pdv_vendas).
+    em XLSX com formatação executiva.
     """
 
-    conn = None
+    logger.info(
+        f"📊 Exportando resumo XLSX | tenant={tenant_id} | routing_id={routing_id}"
+    )
 
+    sql = """
+        SELECT 
+            cluster_id              AS "Cluster",
+            qtd_pdvs                AS "PDVs",
+            tempo_medio_min         AS "Tempo médio (min)",
+            tempo_max_min           AS "Tempo máximo (min)",
+            tempo_total_min         AS "Tempo total (min)",
+            dist_media_km           AS "Distância média (km)",
+            dist_max_km             AS "Distância máxima (km)",
+            dist_total_km           AS "Distância total (km)",
+            valor_total_vendas      AS "Valor total vendas",
+            centro_lat              AS "Latitude centro",
+            centro_lon              AS "Longitude centro"
+        FROM vw_sales_routing_resumo_cluster
+        WHERE tenant_id = %s
+          AND routing_id = %s
+        ORDER BY cluster_id;
+    """
+
+    conn = get_connection()
     try:
-        logger.info(f"📊 Exportando resumo de clusters | tenant={tenant_id} | routing_id={routing_id}")
+        df = pd.read_sql_query(sql, conn, params=(tenant_id, routing_id))
 
-        sql = """
-            SELECT 
-                tenant_id,
-                routing_id,
-                cluster_id,
-                centro_lat,
-                centro_lon,
-                qtd_pdvs,
-                tempo_medio_min,
-                tempo_max_min,
-                tempo_total_min,
-                dist_media_km,
-                dist_max_km,
-                dist_total_km,
-                valor_total_vendas
-            FROM vw_sales_routing_resumo_cluster
-            WHERE tenant_id = %s AND routing_id = %s
-            ORDER BY cluster_id;
-        """
-
-        conn = get_connection()
-        with conn.cursor() as cur:
-            cur.execute(sql, (tenant_id, routing_id))
-            rows = cur.fetchall()
-            colnames = [desc[0] for desc in cur.description]
-
-        if not rows:
+        if df.empty:
             logger.warning("⚠️ Nenhum dado encontrado para exportação.")
             return None
 
-        # 🔥 Caminho correto para salvar dentro do container
-        pasta_output = BASE_OUTPUT / str(tenant_id)
-        pasta_output.mkdir(parents=True, exist_ok=True)
+        # 📁 pasta por tenant
+        pasta = BASE_OUTPUT / str(tenant_id)
+        pasta.mkdir(parents=True, exist_ok=True)
 
-        arquivo_csv = pasta_output / f"routing_resumo_{routing_id}.csv"
+        arquivo = pasta / f"routing_resumo_{routing_id}.xlsx"
 
-        with open(arquivo_csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(colnames)
-            writer.writerows(rows)
+        # ===============================
+        # 🧾 Escrita EXECUTIVA
+        # ===============================
+        with pd.ExcelWriter(arquivo, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="Resumo por Cluster", index=False)
+            ws = writer.book["Resumo por Cluster"]
 
-        logger.success(f"✅ Resumo exportado: {arquivo_csv} ({len(rows)} registros)")
-        return str(arquivo_csv)
+            # 🔒 Freeze header
+            ws.freeze_panes = "A2"
 
-    except Exception as e:
-        logger.error(f"❌ Erro ao exportar resumo: {e}")
-        raise
+            # 🎨 Header
+            header_font = Font(bold=True)
+            header_align = Alignment(horizontal="center", vertical="center")
+
+            for cell in ws[1]:
+                cell.font = header_font
+                cell.alignment = header_align
+
+            # 📐 Largura das colunas
+            widths = {
+                1: 10,   # Cluster
+                2: 8,    # PDVs
+                3: 20,
+                4: 22,
+                5: 22,
+                6: 22,
+                7: 24,
+                8: 24,
+                9: 22,
+                10: 18,
+                11: 18,
+            }
+
+            for col_idx, width in widths.items():
+                ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+        logger.success(f"✅ XLSX gerado: {arquivo}")
+        return str(arquivo)
 
     finally:
-        if conn:
-            conn.close()
+        conn.close()
+
 
 
 if __name__ == "__main__":

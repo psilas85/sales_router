@@ -14,6 +14,7 @@ from psycopg2.pool import ThreadedConnectionPool
 from contextlib import closing
 from typing import Optional, Dict, List, Tuple, Any
 from functools import wraps
+from pdv_preprocessing.domain.address_normalizer import normalize_for_cache
 
 
 # ============================================================
@@ -89,33 +90,10 @@ class DatabaseReader:
 
     @retry_on_failure()
     def buscar_localizacao(self, endereco: str) -> Optional[Tuple[float, float]]:
-        """
-        Cache de PDV: busca lat/lon na tabela enderecos_cache.
-        Agora com normalização idêntica ao Writer/GeolocationService.
-        """
-
-        def fix_encoding(x: str) -> str:
-            if not x:
-                return ""
-            try:
-                x = x.encode("latin1").decode("utf-8")
-            except Exception:
-                pass
-            return x
-
-        def normalize_endereco(x: str) -> str:
-            import unicodedata
-            if not x:
-                return ""
-            x = fix_encoding(x).strip().lower()
-            x = unicodedata.normalize("NFKD", x).encode("ascii", "ignore").decode("ascii")
-            x = " ".join(x.split())
-            return x
-
         if not endereco:
             return None
 
-        endereco_norm = normalize_endereco(endereco)
+        endereco_norm = normalize_for_cache(endereco)
 
         conn = POOL.getconn()
         try:
@@ -133,11 +111,12 @@ class DatabaseReader:
                 return (row["lat"], row["lon"]) if row else None
 
         except Exception as e:
-            logging.warning(f"⚠️ [CACHE_DB] Falha ao buscar '{endereco}': {e}")
+            logging.warning(f"⚠️ [CACHE_DB] Falha ao buscar '{endereco_norm}': {e}")
             return None
 
         finally:
             POOL.putconn(conn)
+
 
     # ============================================================
     # 🔍 ViaCEP Cache — Buscar 1 CEP
@@ -301,32 +280,10 @@ class DatabaseReader:
 
     @retry_on_failure()
     def buscar_enderecos_cache(self, enderecos: List[str]) -> Dict[str, Tuple[float, float]]:
-        """
-        Cache de PDV em batch com normalização consistente.
-        """
-
-        def fix_encoding(x: str) -> str:
-            if not x:
-                return ""
-            try:
-                x = x.encode("latin1").decode("utf-8")
-            except Exception:
-                pass
-            return x
-
-        def normalize_endereco(x: str) -> str:
-            import unicodedata
-            if not x:
-                return ""
-            x = fix_encoding(x).strip().lower()
-            x = unicodedata.normalize("NFKD", x).encode("ascii", "ignore").decode("ascii")
-            x = " ".join(x.split())
-            return x
-
         if not enderecos:
             return {}
 
-        end_norm = [normalize_endereco(e) for e in enderecos]
+        end_norm = [normalize_for_cache(e) for e in enderecos if e]
 
         conn = POOL.getconn()
         try:
@@ -340,12 +297,10 @@ class DatabaseReader:
                     (end_norm,),
                 )
 
-                result = {}
-                for row in cur.fetchall():
-                    endereco = row["endereco"]
-                    result[endereco] = (row["lat"], row["lon"])
-
-                return result
+                return {
+                    row["endereco"]: (row["lat"], row["lon"])
+                    for row in cur.fetchall()
+                }
 
         except Exception as e:
             logging.warning(f"⚠️ [CACHE_DB] Erro batch: {e}")
@@ -353,6 +308,7 @@ class DatabaseReader:
 
         finally:
             POOL.putconn(conn)
+
 
 
 

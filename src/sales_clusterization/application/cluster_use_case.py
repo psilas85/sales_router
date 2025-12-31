@@ -57,8 +57,10 @@ def detectar_outliers_geograficos(pdvs: List[PDV], z_thresh: float = 1.5):
 
 
 # ============================================================
-# 🚀 Execução principal
+# 🚀 Execução principal  (VERSÃO COMPLETA CORRIGIDA)
 # ============================================================
+from time import time  # ✅ tempo real da execução
+
 def executar_clusterizacao(
     tenant_id: int,
     uf: Optional[str],
@@ -79,6 +81,8 @@ def executar_clusterizacao(
     z_thresh: float,
     max_iter: int,
 ) -> Dict[str, Any]:
+
+    inicio_execucao = time()  # ✅ start cronômetro
 
     logger.info(f"🏁 Iniciando clusterização | tenant={tenant_id} | algo={algo}")
 
@@ -155,24 +159,13 @@ def executar_clusterizacao(
 
     try:
         # ============================================================
-        # 🔵 KMEANS — único com refinamento operacional
+        # 🔵 KMEANS — refinamento operacional
         # ============================================================
         if algo == "kmeans":
             logger.info("🔵 Executando KMEANS + refinamento.")
 
-            k0, _ = estimar_k_inicial(
-                pdvs=pdvs,
-                workday_min=workday_min,
-                route_km_max=route_km_max,
-                service_min=service_min,
-                v_kmh=v_kmh,
-                dias_uteis=dias_uteis,
-                freq=freq,
-                max_pdv_cluster=max_pdv_cluster,
-                alpha_path=alpha_path,
-            )
-
-            setores = kmeans_balanceado(
+            # (opcional) se você não usa o retorno, pode remover esta linha
+            _ = kmeans_balanceado(
                 pdvs=pdvs,
                 max_pdv_cluster=max_pdv_cluster,
                 v_kmh=v_kmh,
@@ -224,18 +217,16 @@ def executar_clusterizacao(
                     p.cluster_label = cid
 
         # ============================================================
-        # 🟣 DENSE SUBSET — cluster único, compacto
+        # 🟣 DENSE SUBSET — cluster único
         # ============================================================
         elif algo == "dense_subset":
             logger.info(f"🟣 Executando DENSE SUBSET | capacidade={max_pdv_cluster}")
 
             selecionados = dense_subset(pdvs, capacidade=max_pdv_cluster)
 
-            # centro = média dos selecionados
             lat_med = float(np.mean([p.lat for p in selecionados]))
             lon_med = float(np.mean([p.lon for p in selecionados]))
 
-            # Criar setor único
             setores_finais = [
                 Setor(
                     cluster_label=0,
@@ -247,13 +238,13 @@ def executar_clusterizacao(
                 )
             ]
 
-            # marcar cluster_label nos PDVs selecionados
             for p in selecionados:
                 p.cluster_label = 0
 
-            # ⚠️ Só esses PDVs vão ser persistidos
             pdvs = selecionados
 
+        else:
+            raise ValueError(f"Algoritmo inválido: {algo}")
 
         # ============================================================
         # 💾 Persistência
@@ -278,6 +269,24 @@ def executar_clusterizacao(
         salvar_mapeamento_pdvs(tenant_id, run_id, pdvs)
 
         finalizar_run(run_id, status="done", k_final=len(setores_finais))
+
+        # ============================================================
+        # 📘 Atualiza histórico do job (tempo REAL)
+        # ============================================================
+        from src.sales_clusterization.infrastructure.persistence.database_writer import (
+            atualizar_historico_cluster_job,
+        )
+
+        duracao_segundos = time() - inicio_execucao  # ✅ tempo real
+
+        atualizar_historico_cluster_job(
+            tenant_id=tenant_id,
+            job_id=clusterization_id,  # ✅ seu job_id é o UUID do clusterization_id
+            k_final=len(setores_finais),
+            n_pdvs=len(pdvs),
+            duracao_segundos=float(duracao_segundos),
+            status="done",
+        )
 
         return {
             "tenant_id": tenant_id,

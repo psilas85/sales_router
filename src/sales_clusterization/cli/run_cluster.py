@@ -131,7 +131,7 @@ def main():
         route_km_max=args.routekm,
         service_min=args.service,
         v_kmh=args.vel,
-        alpha_path=None,  # removido — não existe
+        alpha_path=1.0,
         max_pdv_cluster=args.max_pdv_cluster,
         descricao=args.descricao,
         input_id=input_id,

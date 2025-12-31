@@ -9,6 +9,10 @@ import psycopg2
 
 from pdv_preprocessing.infrastructure.database_reader import POOL
 from pdv_preprocessing.domain.utils_geo import coordenada_generica
+from pdv_preprocessing.domain.address_normalizer import normalize_for_cache
+from pdv_preprocessing.entities.pdv_entity import PDV
+
+
 
 from database.db_connection import get_connection_context
 
@@ -43,8 +47,7 @@ def retry_on_failure(max_retries=3, delay=1.0, backoff=2.0):
 class DatabaseWriter:
     def __init__(self):
         pass
-
-
+    
     # ============================================================
     # 💾 Inserção de PDVs
     # ============================================================
@@ -55,18 +58,44 @@ class DatabaseWriter:
 
         valores = [
             (
-                p.tenant_id, p.input_id, p.descricao, p.cnpj, p.logradouro, p.numero,
-                p.bairro, p.cidade, p.uf, p.cep, p.pdv_endereco_completo,
-                p.pdv_lat, p.pdv_lon, p.status_geolocalizacao, p.pdv_vendas
+                p.tenant_id,
+                p.input_id,
+                p.descricao,
+                p.cnpj,
+                p.logradouro,
+                p.numero,
+                p.bairro,
+                p.cidade,
+                p.uf,
+                p.cep,
+                p.pdv_endereco_completo,
+                p.endereco_cache_key,   # 👈 NOVO
+                p.pdv_lat,
+                p.pdv_lon,
+                p.status_geolocalizacao,
+                p.pdv_vendas,
             )
             for p in lista_pdvs
         ]
 
         sql = """
             INSERT INTO pdvs (
-                tenant_id, input_id, descricao, cnpj, logradouro, numero, bairro,
-                cidade, uf, cep, pdv_endereco_completo,
-                pdv_lat, pdv_lon, status_geolocalizacao, pdv_vendas
+                tenant_id,
+                input_id,
+                descricao,
+                cnpj,
+                logradouro,
+                numero,
+                bairro,
+                cidade,
+                uf,
+                cep,
+                pdv_endereco_completo,
+                endereco_cache_key,
+                pdv_lat,
+                pdv_lon,
+                status_geolocalizacao,
+                pdv_vendas
             )
             VALUES %s
             ON CONFLICT (tenant_id, input_id, cnpj)
@@ -79,10 +108,12 @@ class DatabaseWriter:
                 execute_values(cur, sql, valores)
             conn.commit()
             return len(valores)
+
         except Exception as e:
             conn.rollback()
             logging.error(f"❌ Erro ao inserir PDVs: {e}", exc_info=True)
             return 0
+
         finally:
             POOL.putconn(conn)
 
@@ -90,76 +121,92 @@ class DatabaseWriter:
     # ============================================================
     # 🗺️ Inserção no cache de endereços (PDV e MKP unificado)
     # ============================================================
+    
     @retry_on_failure()
-    def salvar_cache(self, chave: str, lat: float, lon: float, tipo: str, fonte: str = "desconhecido"):
+    def salvar_cache(
+        self,
+        endereco_cache: str,
+        lat: float,
+        lon: float,
+        origem: str = "pipeline",
+    ):
+        """
+        Cache thread-safe.
+        Usa UPSERT para evitar race condition.
+        - Normaliza endereço
+        - Bloqueia coordenada genérica
+        - NÃO sobrescreve origem = manual_edit
+        """
 
-        def fix_encoding(x: str) -> str:
-            if not x:
-                return ""
-            try:
-                x = x.encode("latin1").decode("utf-8")
-            except Exception:
-                pass
-            return x
-
-        def normalize_endereco(x: str) -> str:
-            import unicodedata
-            if not x:
-                return ""
-            x = fix_encoding(x).strip().lower()
-            x = unicodedata.normalize("NFKD", x).encode("ascii", "ignore").decode("ascii")
-            x = " ".join(x.split())
-            return x
-
-        if lat is None or lon is None or coordenada_generica(lat, lon):
-            logging.warning(f"⚠️ Ignorando salvar_cache coordenada inválida ({tipo}) para {chave}")
+        # --------------------------------------------------------
+        # Validações básicas
+        # --------------------------------------------------------
+        if not endereco_cache or lat is None or lon is None:
+            logging.warning(
+                f"[CACHE][IGNORADO] endereco='{endereco_cache}' lat={lat} lon={lon}"
+            )
             return
+
+        if coordenada_generica(lat, lon):
+            logging.warning(
+                f"[CACHE][IGNORADO][GENERICA] endereco='{endereco_cache}' lat={lat} lon={lon}"
+            )
+            return
+
+        # --------------------------------------------------------
+        # Normalização ÚNICA (regra de ouro)
+        # --------------------------------------------------------
+        endereco_norm = normalize_for_cache(endereco_cache)
 
         conn = POOL.getconn()
         try:
             with conn.cursor() as cur:
-
-                # PDV → tabela: enderecos_cache (sem campo 'fonte')
-                if tipo == "pdv":
-                    endereco_norm = normalize_endereco(chave)
-                    cur.execute(
-                        """
-                        INSERT INTO enderecos_cache (endereco, lat, lon)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (endereco)
-                        DO UPDATE SET
-                            lat = EXCLUDED.lat,
-                            lon = EXCLUDED.lon,
-                            atualizado_em = NOW();
-                        """,
-                        (endereco_norm, lat, lon),
+                cur.execute(
+                    """
+                    INSERT INTO enderecos_cache (
+                        endereco,
+                        lat,
+                        lon,
+                        origem,
+                        atualizado_em
                     )
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (endereco)
+                    DO UPDATE SET
+                        lat = EXCLUDED.lat,
+                        lon = EXCLUDED.lon,
+                        origem = EXCLUDED.origem,
+                        atualizado_em = NOW()
+                    WHERE enderecos_cache.origem IS DISTINCT FROM 'manual_edit';
+                    """,
+                    (
+                        endereco_norm,
+                        lat,
+                        lon,
+                        origem,
+                    ),
+                )
 
-                # MKP → tabela: mkp_enderecos_cache (tem 'fonte')
-                else:
-                    cep = str(chave).replace("-", "").zfill(8)
-                    cur.execute(
-                        """
-                        INSERT INTO mkp_enderecos_cache (cep, lat, lon, fonte)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (cep)
-                        DO UPDATE SET
-                            lat = EXCLUDED.lat,
-                            lon = EXCLUDED.lon,
-                            fonte = EXCLUDED.fonte,
-                            atualizado_em = NOW();
-                        """,
-                        (cep, lat, lon, fonte),
-                    )
+                logging.debug(
+                    f"[CACHE][UPSERT] origem={origem} | "
+                    f"endereco='{endereco_norm}' | "
+                    f"lat={lat} lon={lon}"
+                )
 
             conn.commit()
 
         except Exception as e:
             conn.rollback()
-            logging.error(f"❌ Erro ao salvar no cache ({tipo}): {e}", exc_info=True)
+            logging.error(
+                f"[CACHE][ERRO] endereco='{endereco_norm}' erro={e}",
+                exc_info=True,
+            )
+            raise
 
         finally:
             POOL.putconn(conn)
+
+
 
     # ============================================================
     # 💾 ViaCEP Cache — Inserir ou atualizar 1 CEP
@@ -252,65 +299,27 @@ class DatabaseWriter:
         finally:
             POOL.putconn(conn)
 
-
-
-
-
+    
     # ============================================================
-    # 🗺️ Inserção individual em cache PDV
-    # ============================================================
-    @retry_on_failure()
-    def inserir_localizacao(self, endereco: str, lat: float, lon: float) -> None:
-        if not endereco or lat is None or lon is None or coordenada_generica(lat, lon):
-            return
-
-        conn = POOL.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO enderecos_cache (endereco, lat, lon)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (endereco) DO NOTHING;
-                    """,
-                    (endereco.strip().lower(), lat, lon),
-                )
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            logging.error(f"❌ Erro ao inserir localização no cache: {e}", exc_info=True)
-        finally:
-            POOL.putconn(conn)
-
-
-    # ============================================================
-    # 🧾 Registro de histórico de execução (VERSÃO FINAL CORRIGIDA)
+    # 🧾 Registro de histórico de execução PDV
     # ============================================================
     @retry_on_failure()
     def salvar_historico_pdv_job(
         self,
         tenant_id: int,
+        job_id: str,
         arquivo: str,
         status: str,
-        total_processados: int,
-        validos: int,
-        invalidos: int,
-        arquivo_invalidos: Optional[str] = None,
-        mensagem: Optional[str] = None,
+        total_processados: int = 0,
+        validos: int = 0,
+        invalidos: int = 0,
         inseridos: int = 0,
         sobrescritos: int = 0,
+        arquivo_invalidos: Optional[str] = None,
+        mensagem: Optional[str] = None,
         descricao: Optional[str] = None,
         input_id: Optional[str] = None,
-        job_id: Optional[str] = None,
     ) -> None:
-
-        # 🔥 Garantir que job_id seja válido e obrigatório
-        if job_id is None:
-            raise ValueError("job_id não pode ser None (coluna NOT NULL no banco).")
-
-        # 🔥 Converter para string (psycopg2 exige)
-        job_id = str(job_id)
-        input_id = str(input_id) if input_id is not None else None
 
         conn = POOL.getconn()
         try:
@@ -318,35 +327,56 @@ class DatabaseWriter:
                 cur.execute(
                     """
                     INSERT INTO historico_pdv_jobs (
-                        tenant_id, job_id, arquivo, status, total_processados,
-                        validos, invalidos, arquivo_invalidos, mensagem,
-                        inseridos, sobrescritos, criado_em, descricao, input_id
+                        tenant_id, job_id, arquivo, status,
+                        total_processados, validos, invalidos,
+                        inseridos, sobrescritos,
+                        arquivo_invalidos, mensagem, descricao,
+                        input_id, criado_em
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s);
+                    VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s,
+                        %s, %s, %s,
+                        %s, NOW()
+                    )
+                    ON CONFLICT (tenant_id, job_id)
+                    DO UPDATE SET
+                        status = EXCLUDED.status,
+                        total_processados = EXCLUDED.total_processados,
+                        validos = EXCLUDED.validos,
+                        invalidos = EXCLUDED.invalidos,
+                        inseridos = EXCLUDED.inseridos,
+                        sobrescritos = EXCLUDED.sobrescritos,
+                        arquivo_invalidos = EXCLUDED.arquivo_invalidos,
+                        mensagem = EXCLUDED.mensagem,
+                        descricao = EXCLUDED.descricao,
+                        input_id = EXCLUDED.input_id,
+                        atualizado_em = NOW();
+
                     """,
                     (
                         tenant_id,
-                        job_id,
+                        str(job_id),
                         arquivo,
                         status,
                         total_processados,
                         validos,
                         invalidos,
-                        arquivo_invalidos,
-                        mensagem,
                         inseridos,
                         sobrescritos,
+                        arquivo_invalidos,
+                        mensagem,
                         descricao,
-                        input_id,
+                        str(input_id) if input_id else None,
                     ),
                 )
             conn.commit()
         except Exception as e:
             conn.rollback()
-            logging.error(f"❌ Erro ao salvar histórico: {e}", exc_info=True)
+            logging.error(f"❌ Erro ao salvar histórico PDV: {e}", exc_info=True)
         finally:
             POOL.putconn(conn)
-
 
 
     # ============================================================
@@ -787,7 +817,8 @@ class DatabaseWriter:
                     """
                     SELECT endereco
                     FROM enderecos_cache
-                    WHERE lat = %s AND lon = %s
+                    WHERE abs(lat - %s) < 0.000001
+                        AND abs(lon - %s) < 0.000001
                     LIMIT 1;
                     """,
                     (lat, lon),
@@ -841,56 +872,22 @@ class DatabaseWriter:
         finally:
             POOL.putconn(conn)
 
-    # ============================================================
-    # 🧹 Normalizar endereço (igual ao padrão do cache PDV)
-    # ============================================================
-    def normalizar_endereco(self, endereco: str) -> str:
-        if not endereco:
-            return ""
-
-        # tentativa de corrigir encoding
-        try:
-            endereco = endereco.encode("latin1").decode("utf-8")
-        except Exception:
-            pass
-
-        import unicodedata, re
-
-        # limpar acentuação e padronizar
-        endereco = endereco.strip().lower()
-        endereco = unicodedata.normalize("NFKD", endereco)
-        endereco = endereco.encode("ascii", "ignore").decode("ascii")
-        endereco = " ".join(endereco.split())
-
-        # ============================================================
-        # 🧹 Remoção de padrões problemáticos
-        # ============================================================
-
-        # 1) vírgulas duplas ou vazias: ", ," → ","
-        endereco = re.sub(r",\s*,", ",", endereco)
-
-        # 2) vírgula no começo ou no final
-        endereco = re.sub(r"^\s*,\s*", "", endereco)
-        endereco = re.sub(r",\s*$", "", endereco)
-
-        # 3) espaço antes ou depois indevido: " ,rua" ou "rua,  " etc.
-        endereco = re.sub(r"\s+,", ",", endereco)
-        endereco = re.sub(r",\s+", ", ", endereco)
-
-        # 4) múltiplos espaços
-        endereco = re.sub(r"\s{2,}", " ", endereco)
-
-        return endereco
-
-
-
+    
     # ============================================================
     # 🔍 Buscar coordenadas no cache com base NO ENDEREÇO NORMALIZADO
     # ============================================================
     @retry_on_failure()
-    def buscar_por_endereco(self, endereco_norm: str) -> Optional[Tuple[float, float]]:
-        if not endereco_norm:
+    def buscar_por_endereco(self, endereco_completo: str) -> Optional[Tuple[float, float]]:
+        """
+        Busca coordenadas no cache a partir do endereço COMPLETO.
+        ⚠️ Método legado. Evitar uso em novos fluxos.
+        """
+
+        if not endereco_completo:
             return None
+
+        # Normaliza usando a mesma regra do pipeline
+        endereco_norm = normalize_for_cache(endereco_completo)
 
         conn = POOL.getconn()
         try:
@@ -915,12 +912,28 @@ class DatabaseWriter:
             POOL.putconn(conn)
 
 
+
     # ============================================================
     # ✏️ Atualizar lat/lon do PDV (edição manual)
     # ============================================================
     @retry_on_failure()
     def atualizar_lat_lon_pdv(self, pdv_id: int, lat: float, lon: float) -> bool:
+        """
+        Atualiza APENAS lat/lon do PDV.
+        Usado exclusivamente para edição manual.
+        """
+
+        # --------------------------------------------------------
+        # Validações mínimas
+        # --------------------------------------------------------
         if lat is None or lon is None:
+            logging.warning("⚠️ atualizar_lat_lon_pdv chamado com lat/lon nulos.")
+            return False
+
+        if coordenada_generica(lat, lon):
+            logging.warning(
+                f"⚠️ Coordenada genérica ignorada para PDV {pdv_id}: lat={lat}, lon={lon}"
+            )
             return False
 
         conn = POOL.getconn()
@@ -929,7 +942,8 @@ class DatabaseWriter:
                 cur.execute(
                     """
                     UPDATE pdvs
-                    SET pdv_lat = %s,
+                    SET
+                        pdv_lat = %s,
                         pdv_lon = %s,
                         status_geolocalizacao = 'manual_edit',
                         atualizado_em = NOW()
@@ -937,12 +951,24 @@ class DatabaseWriter:
                     """,
                     (lat, lon, pdv_id)
                 )
+
             conn.commit()
+
+            if cur.rowcount == 0:
+                logging.warning(f"⚠️ Nenhum PDV atualizado (id={pdv_id}).")
+                return False
+
+            logging.info(
+                f"📝 PDV {pdv_id} atualizado manualmente → lat={lat}, lon={lon}"
+            )
             return True
 
         except Exception as e:
             conn.rollback()
-            logging.error(f"❌ Erro ao atualizar_lat_lon_pdv: {e}", exc_info=True)
+            logging.error(
+                f"❌ Erro ao atualizar_lat_lon_pdv (pdv_id={pdv_id}): {e}",
+                exc_info=True
+            )
             return False
 
         finally:
@@ -952,23 +978,28 @@ class DatabaseWriter:
     # ✏️ Atualizar lat/lon no cache usando o ENDEREÇO NORMALIZADO
     # ============================================================
     @retry_on_failure()
-    def atualizar_cache_por_endereco(self, endereco_completo: str, nova_lat: float, nova_lon: float) -> bool:
+    def atualizar_cache_por_endereco(
+        self,
+        endereco_completo: str,
+        nova_lat: float,
+        nova_lon: float
+    ) -> bool:
         """
         Atualiza o cache (enderecos_cache) para o endereço COMPLETO informado.
-        Usa a chave normalizada, igual ao salvar_cache().
+        Usa a chave normalizada, igual ao pipeline.
         """
 
         if not endereco_completo or nova_lat is None or nova_lon is None:
             logging.warning("⚠️ atualizar_cache_por_endereco chamado com dados inválidos.")
             return False
 
-        # proteção: nunca salvar coordenada suspeita
         if coordenada_generica(nova_lat, nova_lon):
-            logging.warning(f"⚠️ Coordenada suspeita ignorada ao atualizar cache: {endereco_completo}")
+            logging.warning(
+                f"⚠️ Coordenada suspeita ignorada ao atualizar cache: {endereco_completo}"
+            )
             return False
 
-        # normalizar igual ao salvar_cache()
-        endereco_norm = self.normalizar_endereco(endereco_completo)
+        endereco_norm = normalize_for_cache(endereco_completo)
 
         conn = POOL.getconn()
         try:
@@ -976,8 +1007,10 @@ class DatabaseWriter:
                 cur.execute(
                     """
                     UPDATE enderecos_cache
-                    SET lat = %s,
+                    SET
+                        lat = %s,
                         lon = %s,
+                        origem = 'manual_edit',
                         atualizado_em = NOW()
                     WHERE endereco = %s
                     """,
@@ -987,35 +1020,45 @@ class DatabaseWriter:
             conn.commit()
 
             if cur.rowcount > 0:
-                logging.info(f"📝 Cache atualizado para endereço '{endereco_norm}' -> {nova_lat}, {nova_lon}")
+                logging.info(
+                    f"📝 Cache atualizado (manual_edit) | '{endereco_norm}' "
+                    f"→ {nova_lat}, {nova_lon}"
+                )
                 return True
-            else:
-                logging.warning(f"⚠️ Nenhum cache encontrado para '{endereco_norm}'. Inserindo novo.")
 
-                # insere novo cache
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO enderecos_cache (endereco, lat, lon)
-                        VALUES (%s, %s, %s)
-                        ON CONFLICT (endereco)
-                        DO UPDATE SET
-                            lat = EXCLUDED.lat,
-                            lon = EXCLUDED.lon,
-                            atualizado_em = NOW()
-                        """,
-                        (endereco_norm, nova_lat, nova_lon)
-                    )
-                conn.commit()
-                return True
+            logging.warning(
+                f"⚠️ Cache não encontrado para '{endereco_norm}'. Criando registro manual_edit."
+            )
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO enderecos_cache (endereco, lat, lon, origem)
+                    VALUES (%s, %s, %s, 'manual_edit')
+                    ON CONFLICT (endereco)
+                    DO UPDATE SET
+                        lat = EXCLUDED.lat,
+                        lon = EXCLUDED.lon,
+                        origem = 'manual_edit',
+                        atualizado_em = NOW()
+                    """,
+                    (endereco_norm, nova_lat, nova_lon)
+                )
+
+            conn.commit()
+            return True
 
         except Exception as e:
             conn.rollback()
-            logging.error(f"❌ Erro ao atualizar cache por endereço: {e}", exc_info=True)
+            logging.error(
+                f"❌ Erro ao atualizar cache por endereço: {e}",
+                exc_info=True
+            )
             return False
 
         finally:
             POOL.putconn(conn)
+
 
     # ============================================================
     # ❌ Excluir PDV (com proteção por tenant_id)
@@ -1042,3 +1085,126 @@ class DatabaseWriter:
 
         finally:
             POOL.putconn(conn)
+
+    @retry_on_failure()
+    def atualizar_pdv_completo(self, pdv: PDV) -> bool:
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE pdvs
+                    SET
+                        logradouro = %s,
+                        numero = %s,
+                        bairro = %s,
+                        cidade = %s,
+                        uf = %s,
+                        cep = %s,
+                        pdv_lat = %s,
+                        pdv_lon = %s,
+                        pdv_endereco_completo = %s,
+                        status_geolocalizacao = %s,
+                        atualizado_em = NOW()
+                    WHERE tenant_id = %s AND cnpj = %s
+                    """,
+                    (
+                        pdv.logradouro,
+                        pdv.numero,
+                        pdv.bairro,
+                        pdv.cidade,
+                        pdv.uf,
+                        pdv.cep,
+                        pdv.pdv_lat,
+                        pdv.pdv_lon,
+                        pdv.pdv_endereco_completo,
+                        pdv.status_geolocalizacao,
+                        pdv.tenant_id,
+                        pdv.cnpj,
+                    )
+                )
+            conn.commit()
+            return True
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"❌ Erro ao atualizar PDV: {e}", exc_info=True)
+            return False
+        finally:
+            POOL.putconn(conn)
+
+    # ============================================================
+    # ✏️ Atualizar lat/lon no cache usando CHAVE CANÔNICA
+    # ============================================================
+    @retry_on_failure()
+    def atualizar_cache_por_chave(
+        self,
+        cache_key: str,
+        nova_lat: float,
+        nova_lon: float
+    ) -> bool:
+        """
+        Atualiza o cache (enderecos_cache) usando APENAS a chave canônica.
+        Uso exclusivo da edição manual.
+        """
+
+        if not cache_key or nova_lat is None or nova_lon is None:
+            logging.warning("⚠️ atualizar_cache_por_chave chamado com dados inválidos.")
+            return False
+
+        if coordenada_generica(nova_lat, nova_lon):
+            logging.warning(
+                f"⚠️ Coordenada suspeita ignorada (cache_key={cache_key})"
+            )
+            return False
+
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE enderecos_cache
+                    SET
+                        lat = %s,
+                        lon = %s,
+                        origem = 'manual_edit',
+                        atualizado_em = NOW()
+                    WHERE endereco = %s
+                    """,
+                    (nova_lat, nova_lon, cache_key)
+                )
+
+            # não existia → cria
+            if cur.rowcount == 0:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO enderecos_cache (endereco, lat, lon, origem)
+                        VALUES (%s, %s, %s, 'manual_edit')
+                        ON CONFLICT (endereco)
+                        DO UPDATE SET
+                            lat = EXCLUDED.lat,
+                            lon = EXCLUDED.lon,
+                            origem = 'manual_edit',
+                            atualizado_em = NOW()
+                        """,
+                        (cache_key, nova_lat, nova_lon)
+                    )
+
+            conn.commit()
+
+            logging.info(
+                f"📝 Cache atualizado por chave | '{cache_key}' → {nova_lat}, {nova_lon}"
+            )
+            return True
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(
+                f"❌ Erro ao atualizar_cache_por_chave ({cache_key}): {e}",
+                exc_info=True
+            )
+            return False
+
+        finally:
+            POOL.putconn(conn)
+

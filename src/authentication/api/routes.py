@@ -63,27 +63,68 @@ def create_user(
     request: Request,
     payload: UserCreateSchema
 ):
-    creator_role = request.state.user["role"]
+    current = request.state.user
+    role = current["role"]
+    current_tenant_id = current["tenant_id"]
 
-    if creator_role == "sales_router_adm" and payload.role == "tenant_adm":
-        user = user_use_case.create_tenant_admin(
-            payload.tenant_id,
-            payload.nome,
-            payload.email,
-            payload.senha
-        )
+    # ===============================
+    # SALES ROUTER ADMIN (GLOBAL)
+    # ===============================
+    if role == "sales_router_adm":
 
-    elif creator_role == "tenant_adm" and payload.role == "tenant_operacional":
+        if payload.role == "tenant_adm":
+            user = user_use_case.create_tenant_admin(
+                tenant_id=payload.tenant_id,
+                nome=payload.nome,
+                email=payload.email,
+                senha=payload.senha
+            )
+
+        elif payload.role == "tenant_operacional":
+            user = user_use_case.create_tenant_operacional(
+                tenant_id=payload.tenant_id,
+                nome=payload.nome,
+                email=payload.email,
+                senha=payload.senha
+            )
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Role inválida para criação"
+            )
+
+    # ===============================
+    # TENANT ADMIN (RESTRITO)
+    # ===============================
+    elif role == "tenant_adm":
+
+        if payload.tenant_id != current_tenant_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Tenant admin só pode criar usuários do próprio tenant"
+            )
+
+        if payload.role != "tenant_operacional":
+            raise HTTPException(
+                status_code=403,
+                detail="Tenant admin só pode criar usuários operacionais"
+            )
+
         user = user_use_case.create_tenant_operacional(
-            payload.tenant_id,
-            payload.nome,
-            payload.email,
-            payload.senha
+            tenant_id=current_tenant_id,
+            nome=payload.nome,
+            email=payload.email,
+            senha=payload.senha
         )
+
     else:
         raise HTTPException(status_code=403, detail="Permissão insuficiente")
 
-    return {"message": "Usuário criado com sucesso", "user": user.__dict__}
+    return {
+        "message": "Usuário criado com sucesso",
+        "user": user.__dict__
+    }
 
 
 

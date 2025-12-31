@@ -218,7 +218,7 @@ def salvar_setores(tenant_id: int, run_id: int, setores: List[Setor]) -> Dict[in
 
 
 # ============================================================
-# 🧩 Salvamento do mapeamento PDV → Cluster (ajustada)
+# 🧩 Salvamento do mapeamento PDV → Cluster (corrigido)
 # ============================================================
 def salvar_mapeamento_pdvs(
     tenant_id: int,
@@ -228,37 +228,52 @@ def salvar_mapeamento_pdvs(
     """
     Grava o relacionamento PDV → Setor (cluster_setor_pdv)
     usando o atributo `cluster_id` já atribuído no PDV.
+    Inclui CNPJ (fix definitivo).
     """
+
     sql = """
         INSERT INTO cluster_setor_pdv
-            (tenant_id, run_id, cluster_id, pdv_id, lat, lon, cidade, uf)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+            (tenant_id, run_id, cluster_id, pdv_id, lat, lon, cidade, uf, cnpj)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
     """
 
     with get_connection() as conn:
         with conn.cursor() as cur:
             count = 0
+
             for p in pdvs:
-                # 🚀 FIX: cluster_id=0 deve ser aceito
-                if getattr(p, "cluster_id", None) is not None:
-                    cur.execute(
-                        sql,
-                        (
-                            int(tenant_id),
-                            int(run_id),
-                            int(p.cluster_id),
-                            int(p.id),
-                            float(p.lat) if p.lat is not None else None,
-                            float(p.lon) if p.lon is not None else None,
-                            p.cidade,
-                            p.uf,
-                        ),
-                    )
-                    count += 1
+                # cluster_id = 0 é válido
+                if getattr(p, "cluster_id", None) is None:
+                    continue
+
+                # Blindagem de CNPJ
+                cnpj = (
+                    p.cnpj.strip()
+                    if isinstance(p.cnpj, str) and p.cnpj.strip()
+                    else None
+                )
+
+                cur.execute(
+                    sql,
+                    (
+                        int(tenant_id),
+                        int(run_id),
+                        int(p.cluster_id),
+                        int(p.id),
+                        float(p.lat) if p.lat is not None else None,
+                        float(p.lon) if p.lon is not None else None,
+                        p.cidade,
+                        p.uf,
+                        cnpj,  # ✅ AGORA GRAVA
+                    ),
+                )
+                count += 1
+
             conn.commit()
 
-    logger.info(f"🧩 {count} PDVs mapeados em clusters (run_id={run_id})")
-
+    logger.info(
+        f"🧩 {count} PDVs mapeados em clusters (run_id={run_id}, tenant={tenant_id})"
+    )
 
 
 # ============================================================
@@ -576,3 +591,50 @@ class DatabaseWriter:
             import logging
             logging.warning(f"⚠️ Erro ao salvar cache de endereço: {e}")
 
+
+# ============================================================
+# 🧾 Atualização do histórico de jobs de clusterização
+# ============================================================
+def atualizar_historico_cluster_job(
+        tenant_id: int,
+        job_id: str,
+        k_final: int,
+        n_pdvs: int,
+        duracao_segundos: float,
+        status: str = "done",
+    ):
+        """
+        Atualiza o registro em historico_cluster_jobs com os
+        resultados reais da execução.
+        """
+
+        sql = """
+            UPDATE historico_cluster_jobs
+            SET
+                status = %s,
+                k_final = %s,
+                n_pdvs = %s,
+                duracao_segundos = %s
+            WHERE tenant_id = %s
+            AND job_id = %s;
+        """
+
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql,
+                    (
+                        status,
+                        int(k_final),
+                        int(n_pdvs),
+                        float(duracao_segundos),
+                        int(tenant_id),
+                        job_id,
+                    ),
+                )
+                conn.commit()
+
+        logger.info(
+            f"📘 Histórico atualizado | job_id={job_id} | "
+            f"k_final={k_final} | n_pdvs={n_pdvs} | duração={duracao_segundos:.2f}s"
+        )

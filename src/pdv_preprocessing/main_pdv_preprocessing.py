@@ -10,6 +10,7 @@ import uuid
 import time
 import json
 import sys
+import re
 from dotenv import load_dotenv
 
 from pdv_preprocessing.application.pdv_preprocessing_use_case import PDVPreprocessingUseCase
@@ -20,11 +21,37 @@ from pdv_preprocessing.logs.logging_config import setup_logging
 
 
 # ============================================================
+# 🧼 Helpers
+# ============================================================
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+def uuid_canonico(valor: str | None = None) -> str:
+    """
+    Gera/garante UUID em formato canônico.
+    - Se valor None: gera uuid4()
+    - Se valor existir: tenta parsear e devolver canônico
+    """
+    if valor is None:
+        return str(uuid.uuid4())
+
+    try:
+        u = str(uuid.UUID(str(valor)))
+        if not _UUID_RE.match(u):
+            return str(uuid.uuid4())
+        return u
+    except Exception:
+        return str(uuid.uuid4())
+
+
+# ============================================================
 # 🔵 Função auxiliar para emitir progresso
 # ============================================================
 def emit_progress(pct, step):
     """Evento de progresso consumido pelo worker."""
-    obj = {"event": "progress", "pct": int(pct), "step": step}
+    obj = {"event": "progress", "pct": int(pct), "step": str(step)}
     print(json.dumps(obj, ensure_ascii=False))
     sys.stdout.flush()
 
@@ -47,31 +74,32 @@ def main():
     parser.add_argument("--tenant", required=True)
     parser.add_argument("--arquivo", required=True)
     parser.add_argument("--descricao", required=True)
-    parser.add_argument("--usar_google", action="store_true")
+    parser.add_argument("--usar_google", action="store_true", default=True)
 
     args = parser.parse_args()
 
     try:
         tenant_id = int(args.tenant)
-    except:
+    except Exception:
         emit_final({"status": "error", "erro": "Tenant inválido"})
         return
 
-    descricao = args.descricao.strip()[:60]
-    input_id = str(uuid.uuid4())
-    input_path = args.arquivo
+    descricao = (args.descricao or "").strip()[:60]
+    input_id = uuid_canonico()  # ✅ sempre canônico
+    input_path = (args.arquivo or "").strip()
 
     load_dotenv()
     setup_logging(tenant_id)
 
     logging.info(f"🚀 Iniciando pré-processamento | tenant={tenant_id}")
     logging.info(f"🆔 input_id={input_id}")
+    logging.info(f"📄 arquivo={input_path}")
 
     # ============================================================
     # 0% → Arquivo existe?
     # ============================================================
     emit_progress(1, "Verificando arquivo")
-    if not os.path.exists(input_path):
+    if not input_path or not os.path.exists(input_path):
         emit_final({
             "status": "error",
             "erro": f"Arquivo não encontrado: {input_path}",
@@ -129,7 +157,6 @@ def main():
             usar_google=args.usar_google
         )
 
-        # let execute() emitir o progresso granular (via atualizar_progresso)
         df_validos, df_invalidos, inseridos = use_case.execute(input_path, sep)
 
         total_validos = len(df_validos)
@@ -156,7 +183,7 @@ def main():
         resultado = {
             "status": "done",
             "tenant_id": tenant_id,
-            "input_id": input_id,
+            "input_id": input_id,  # ✅ canônico
             "descricao": descricao,
             "arquivo": os.path.basename(input_path),
             "total_processados": total,
@@ -182,3 +209,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
