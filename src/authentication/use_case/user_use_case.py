@@ -1,7 +1,5 @@
 # sales_router/src/authentication/use_case/user_use_case.py
 
-# sales_router/src/authentication/use_case/user_use_case.py
-
 import os
 from authentication.domain.auth_service import AuthService
 from authentication.infrastructure.user_repository import UserRepository
@@ -57,7 +55,15 @@ class UserUseCase:
 
     def login(self, email, senha):
         user = self.repo.find_by_email(email)
-        if not user or not self.auth.verify_password(senha, user.senha_hash):
+
+        if not user:
+            return None
+
+        # 🔒 BLOQUEIA USUÁRIO INATIVO
+        if not user.ativo:
+            raise Exception("Usuário inativo")
+
+        if not self.auth.verify_password(senha, user.senha_hash):
             return None
 
         return self.auth.generate_token(
@@ -66,6 +72,7 @@ class UserUseCase:
             user.role,
             user.email
         )
+
 
     # =====================================================
     # LISTAGEM
@@ -128,30 +135,33 @@ class UserUseCase:
         if not user:
             raise Exception("Usuário não encontrado")
 
-        # 🔒 MASTER É INTOCÁVEL
         if user.role == "sales_router_adm":
             raise Exception("Usuário master não pode ser alterado")
 
-        # 🔒 TENANT ADM SÓ NO PRÓPRIO TENANT
         if (
             requester["role"] == "tenant_adm"
             and user.tenant_id != requester["tenant_id"]
         ):
             raise Exception("Permissão insuficiente")
 
-        # 🔒 AUTO-EDIÇÃO CRÍTICA BLOQUEADA
         if requester["user_id"] == user.id:
-            if email != user.email:
+            if email and email != user.email:
                 raise Exception("Você não pode alterar seu próprio email")
-            if role != user.role:
+            if role and role != user.role:
                 raise Exception("Você não pode alterar seu próprio perfil")
 
-        user.nome = nome
-        user.email = email
-        user.role = role
+        if nome:
+            user.nome = nome
+        if email:
+            user.email = email
+        if role:
+            user.role = role
 
-        # 🔥 senha só se vier
         if senha:
+            if len(senha.strip()) < 8:
+                raise Exception("Senha deve ter no mínimo 8 caracteres")
             user.senha_hash = self.auth.hash_password(senha)
 
         return self.repo.update_partial(user)
+
+

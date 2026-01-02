@@ -1,7 +1,5 @@
 #sales_router/src/authentication/api/schemas.py
 
-# sales_router/src/authentication/api/schemas.py
-
 from pydantic import BaseModel, EmailStr
 from typing import Optional, Literal
 
@@ -22,12 +20,13 @@ class UserCreateSchema(BaseModel):
     email: EmailStr
     senha: str
     role: UserRole
-    tenant_id: int
+    tenant_id: Optional[int] = None
 
 
 class UserUpdateSchema(BaseModel):
-    nome: str
-    email: EmailStr
-    role: UserRole
+    nome: Optional[str] = None
+    email: Optional[EmailStr] = None
+    role: Optional[UserRole] = None
     senha: Optional[str] = None
+
 

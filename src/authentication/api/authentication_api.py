@@ -11,6 +11,7 @@ app = FastAPI(
     docs_url="/docs",
 )
 
+
 app.include_router(auth_router, prefix="/auth")
 
 @app.get("/", tags=["Status"])

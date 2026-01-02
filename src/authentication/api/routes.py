@@ -55,8 +55,6 @@ def list_tenants(request: Request):
 # 👤 USUÁRIOS
 # =====================================================
 
-
-
 @router.post("/users", tags=["Usuários"])
 @role_required(["sales_router_adm", "tenant_adm"])
 def create_user(
@@ -99,12 +97,6 @@ def create_user(
     # ===============================
     elif role == "tenant_adm":
 
-        if payload.tenant_id != current_tenant_id:
-            raise HTTPException(
-                status_code=403,
-                detail="Tenant admin só pode criar usuários do próprio tenant"
-            )
-
         if payload.role != "tenant_operacional":
             raise HTTPException(
                 status_code=403,
@@ -112,11 +104,12 @@ def create_user(
             )
 
         user = user_use_case.create_tenant_operacional(
-            tenant_id=current_tenant_id,
+            tenant_id=current_tenant_id,  # 🔒 força tenant correto
             nome=payload.nome,
             email=payload.email,
             senha=payload.senha
         )
+
 
     else:
         raise HTTPException(status_code=403, detail="Permissão insuficiente")
@@ -167,10 +160,14 @@ class LoginSchema(BaseModel):
 
 @router.post("/login", tags=["Autenticação"])
 def login(payload: LoginSchema):
-    token = user_use_case.login(payload.email, payload.senha)
-    if not token:
-        raise HTTPException(status_code=401, detail="Credenciais inválidas")
-    return {"token": token}
+    try:
+        token = user_use_case.login(payload.email, payload.senha)
+        if not token:
+            raise HTTPException(status_code=401, detail="Credenciais inválidas")
+        return {"token": token}
+    except Exception as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
 
 
 
@@ -206,25 +203,33 @@ def verify_token(payload: dict):
         raise HTTPException(status_code=401, detail="Token inválido")
 
 
-@router.put("/users/{user_id}", tags=["Usuários"])
+@router.patch("/users/{user_id}", tags=["Usuários"])
 @role_required(["tenant_adm", "sales_router_adm"])
 def update_user(
     request: Request,
     user_id: int,
     payload: UserUpdateSchema
 ):
-    try:
-        user = user_use_case.update_user(
-            user_id=user_id,
-            nome=payload.nome,
-            email=payload.email,
-            role=payload.role,
-            senha=payload.senha,
-            requester=request.state.user
-        )
-        return {"message": "Usuário atualizado", "user": user.__dict__}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    user = user_use_case.update_user(
+        user_id=user_id,
+        nome=payload.nome,
+        email=payload.email,
+        role=payload.role,
+        senha=payload.senha,
+        requester=request.state.user
+    )
+
+    return {
+        "message": "Usuário atualizado",
+        "user": {
+            "id": user.id,
+            "tenant_id": user.tenant_id,
+            "nome": user.nome,
+            "email": user.email,
+            "role": user.role,
+            "ativo": user.ativo,
+        }
+    }
 
 
 @router.put("/users/{user_id}/activate", tags=["Usuários"])
