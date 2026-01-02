@@ -445,45 +445,62 @@ def ver_mapa_pdv(
 
 
 # ==========================================================
-# GET /pdv/ultimos  → LISTA OS ÚLTIMOS 10 JOBS
+# 📜 Listar últimos jobs de PDV (com paginação)
 # ==========================================================
 @router.get("/jobs/ultimos", dependencies=[Depends(verify_token)], tags=["Jobs"])
-def listar_ultimos_jobs(request: Request):
+def listar_ultimos_jobs(
+    request: Request,
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
     user = request.state.user
     tenant_id = user["tenant_id"]
 
     conn = get_connection()
     cur = conn.cursor()
 
-    sql = """
-        SELECT *
+    cur.execute(
+        """
+        SELECT
+            id,
+            tenant_id,
+            job_id,
+            arquivo,
+            status,
+            total_processados,
+            validos,
+            invalidos,
+            arquivo_invalidos,
+            mensagem,
+            criado_em,
+            inseridos,
+            sobrescritos,
+            descricao,
+            input_id
         FROM (
             SELECT DISTINCT ON (input_id)
-                id,
-                tenant_id,
-                job_id,
-                arquivo,
-                status,
-                total_processados,
-                validos,
-                invalidos,
-                arquivo_invalidos,
-                mensagem,
-                criado_em,
-                inseridos,
-                sobrescritos,
-                descricao,
-                input_id
+                *
             FROM historico_pdv_jobs
             WHERE tenant_id = %s
             ORDER BY input_id, criado_em DESC
         ) t
         ORDER BY criado_em DESC
-        LIMIT 20;
-    """
+        LIMIT %s OFFSET %s
+        """,
+        (tenant_id, limit, offset),
+    )
 
-    cur.execute(sql, (tenant_id,))
     rows = cur.fetchall()
+
+    cur.execute(
+        """
+        SELECT COUNT(DISTINCT input_id)
+        FROM historico_pdv_jobs
+        WHERE tenant_id = %s
+        """,
+        (tenant_id,),
+    )
+    total = cur.fetchone()[0]
 
     colunas = [
         "id",
@@ -509,7 +526,7 @@ def listar_ultimos_jobs(request: Request):
     conn.close()
 
     return {
-        "total": len(jobs),
+        "total": total,
         "jobs": jobs,
     }
 
