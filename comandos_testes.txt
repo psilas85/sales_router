@@ -7,6 +7,9 @@ curl -X POST http://34.227.175.23/auth/login \
     "senha": "Psilas@85"
   }'
 
+🔍  Inspect: https://vercel.com/paulos-projects-745072fe/sales-router-frontend/7zZPVQFbXq2zw5YwEpLkzDbQZ287 [2s]
+✅  Production: https://sales-router-frontend-pyai00f0z-paulos-projects-745072fe.vercel.app [1m]
+🔗  Aliased: https://sales-router-frontend.vercel.app [1m]
 
 docker build -t psilas85/sales_router-base:latest -f Dockerfile.base .
 tree -a -I 'node_modules|.next|dist' -L 20
