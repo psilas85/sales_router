@@ -164,3 +164,8 @@ notebooks/
 *.sh~
 *.bak
 *.old
+
+# ========================================
+# OUTPUT GERADO (MAPAS, RELATÓRIOS, HTMLs)
+# ========================================
+output/
