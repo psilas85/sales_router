@@ -6,6 +6,7 @@
 from fastapi import APIRouter, HTTPException, Query, Depends, Request
 from loguru import logger
 from database.db_connection import get_connection
+from pdv_preprocessing.pdv_jobs import processar_pdv
 from pdv_preprocessing.infrastructure.database_reader import DatabaseReader
 from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
 from pdv_preprocessing.entities.pdv_entity import PDV
@@ -170,12 +171,11 @@ def atualizar_pdv(
 # ==========================================================
 from redis import Redis
 from rq import Queue
-from pdv_preprocessing.pdv_jobs import processar_csv
 
 @router.post("/upload", dependencies=[Depends(verify_token)], tags=["Jobs"])
 def upload_pdv(
     request: Request,
-    arquivo: str = Query(..., description="Caminho do arquivo CSV dentro de /app/data"),
+    arquivo: str = Query(..., description="Caminho do arquivo XLSX ou CSV dentro de /app/data"),
     descricao: str = Query(..., description="Descrição amigável do job"),
 ):
     user = request.state.user
@@ -186,12 +186,13 @@ def upload_pdv(
         queue = Queue("pdv_jobs", connection=conn_redis)
 
         job = queue.enqueue(
-            processar_csv,
+            processar_pdv,
             tenant_id,
             arquivo,
             descricao,
-            job_timeout=36000  # 🔥 10 horas de timeout
+            job_timeout=36000
         )
+
 
 
         logger.info(f"🚀 Novo job enfileirado: {job.id} | tenant={tenant_id} | arquivo={arquivo}")
@@ -231,7 +232,7 @@ def reprocessar_input(request: Request, input_id: str = Query(...), descricao: s
         arquivo = row[0]
         conn_redis = Redis(host="redis", port=6379)
         queue = Queue("pdv_jobs", connection=conn_redis)
-        job = queue.enqueue(processar_csv, tenant_id, arquivo, descricao)
+        job = queue.enqueue(processar_pdv, tenant_id, arquivo, descricao)
 
         logger.info(f"♻️ Reprocessando input_id={input_id} | job={job.id}")
         return {
@@ -249,11 +250,17 @@ def reprocessar_input(request: Request, input_id: str = Query(...), descricao: s
 
 # ==========================================================
 # 📤 Upload direto de arquivo (multipart/form-data)
+#     ➜ XLSX (padrão) ou CSV
 # ==========================================================
-from fastapi import UploadFile, File
+from fastapi import UploadFile, File, HTTPException, Depends, Query, Request
+from redis import Redis
+from rq import Queue
 import shutil
 import os
 from datetime import datetime
+
+from pdv_preprocessing.pdv_jobs import processar_pdv
+
 
 @router.post("/upload-file", dependencies=[Depends(verify_token)], tags=["Jobs"])
 def upload_arquivo(
@@ -262,37 +269,55 @@ def upload_arquivo(
     file: UploadFile = File(...),
 ):
     """
-    Recebe um arquivo CSV enviado pelo cliente (multipart/form-data),
+    Recebe um arquivo XLSX ou CSV enviado pelo cliente (multipart/form-data),
     salva no volume /app/data e enfileira o processamento automaticamente.
     """
     user = request.state.user
     tenant_id = user["tenant_id"]
 
     try:
-        # 📁 Cria diretório de destino
+        # --------------------------------------------------
+        # 🔎 Validação de extensão
+        # --------------------------------------------------
+        ext = os.path.splitext(file.filename)[1].lower()
+        if ext not in [".xlsx", ".xls", ".csv"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Formato inválido. Envie um arquivo XLSX ou CSV."
+            )
+
+        # --------------------------------------------------
+        # 📁 Diretório destino
+        # --------------------------------------------------
         base_dir = "/app/data"
         os.makedirs(base_dir, exist_ok=True)
 
-        # 🕒 Gera nome único para o arquivo
+        # --------------------------------------------------
+        # 🕒 Nome único
+        # --------------------------------------------------
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         nome_final = f"pdvs_{tenant_id}_{timestamp}_{file.filename}"
         caminho_final = os.path.join(base_dir, nome_final)
 
-        # 💾 Salva o arquivo no container
+        # --------------------------------------------------
+        # 💾 Salvar arquivo
+        # --------------------------------------------------
         with open(caminho_final, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # 🚀 Enfileira o processamento
+        # --------------------------------------------------
+        # 🚀 Enfileirar job
+        # --------------------------------------------------
         conn_redis = Redis(host="redis", port=6379)
         queue = Queue("pdv_jobs", connection=conn_redis)
+
         job = queue.enqueue(
-            processar_csv,
+            processar_pdv,
             tenant_id,
             caminho_final,
             descricao,
-            job_timeout=36000  # 🔥 10 horas de timeout
+            job_timeout=36000  # 10 horas
         )
-
 
         logger.info(f"📤 Arquivo salvo em {caminho_final}")
         logger.info(f"🚀 Job enfileirado: {job.id} | tenant={tenant_id}")
@@ -304,8 +329,11 @@ def upload_arquivo(
             "arquivo_salvo": caminho_final,
             "descricao": descricao,
             "arquivo_original": file.filename,
+            "extensao": ext,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ Erro no upload multipart: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

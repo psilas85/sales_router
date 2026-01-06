@@ -222,13 +222,25 @@ class PDVPreprocessingUseCase:
         try:
             logger.info(f"📄 Lendo arquivo: {input_path}")
 
-            df = pd.read_csv(
-                input_path,
-                sep=sep,
-                dtype=str,
-                encoding="utf-8",
-                engine="python"
-            ).fillna("")
+            ext = os.path.splitext(input_path)[1].lower()
+
+            # ============================================================
+            # 📥 LEITURA DO ARQUIVO (XLSX ou CSV)
+            # ============================================================
+            if ext in [".xlsx", ".xls"]:
+                df = pd.read_excel(
+                    input_path,
+                    dtype=str,
+                    engine="openpyxl"
+                ).fillna("")
+            else:
+                df = pd.read_csv(
+                    input_path,
+                    sep=sep,
+                    dtype=str,
+                    encoding="utf-8",
+                    engine="python"
+                ).fillna("")
 
             total_linhas = len(df)
             atualizar_progresso(1, total_linhas, 0, 5, "Lendo arquivo")
@@ -285,10 +297,7 @@ class PDVPreprocessingUseCase:
                 log_raw = row.get("logradouro", "")
                 num_raw = row.get("numero", "")
 
-                # ✅ extrai número do final do logradouro (ex.: "Rua X 3113")
                 log_extraido, num_extraido = extrair_logradouro_numero(log_raw)
-
-                # ✅ prioridade: coluna numero > extraído do logradouro
                 numero_final = num_raw if str(num_raw).strip() else num_extraido
 
                 df.at[i, "logradouro"] = normalizar_logradouro(log_extraido)
@@ -309,7 +318,7 @@ class PDVPreprocessingUseCase:
                 raise ValueError(f"❌ Colunas ausentes: {', '.join(faltantes)}")
 
             # ============================================================
-            # ENDEREÇO COMPLETO (USADO PARA CACHE + GEOCODING)
+            # ENDEREÇO COMPLETO
             # ============================================================
             def montar_endereco(r):
                 log = fix_encoding(r["logradouro"]).strip()
@@ -334,8 +343,6 @@ class PDVPreprocessingUseCase:
 
             df["pdv_endereco_completo"] = df.apply(montar_endereco, axis=1)
 
-            # ✅ NOVO: chave canônica do cache (igual ao pipeline)
-            # regra: cache_key = normalize_for_cache(normalize_base(endereco_completo))
             df["endereco_cache_key"] = df["pdv_endereco_completo"].apply(
                 lambda e: normalize_for_cache(normalize_base(e)) if e else ""
             )
@@ -420,7 +427,6 @@ class PDVPreprocessingUseCase:
             df_validos["input_id"] = self.input_id
             df_validos["descricao"] = self.descricao
 
-            # ✅ dataclass: garante pegar endereco_cache_key também
             campos_validos = PDV.__init__.__code__.co_varnames[1:]
             df_insert = df_validos[[c for c in df_validos.columns if c in campos_validos]]
 

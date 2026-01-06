@@ -9,7 +9,7 @@ import logging
 from redis import Redis
 from rq import Queue
 
-from pdv_preprocessing.pdv_jobs import processar_csv
+from pdv_preprocessing.pdv_jobs import processar_pdv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -35,13 +35,14 @@ def main():
     meta = {"usar_google": args.usar_google}
 
     job = q.enqueue(
-        processar_csv,
+        processar_pdv,
         tenant_id,
         file_path,
         descricao,
         meta=meta,
         job_timeout=36000
     )
+
 
 
     logging.info(

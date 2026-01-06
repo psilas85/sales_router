@@ -14,6 +14,10 @@ import re
 
 from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
 
+# ============================================================
+# 🔧 Logger
+# ============================================================
+
 logger = logging.getLogger("pdv_jobs")
 logger.setLevel(logging.INFO)
 
@@ -25,17 +29,22 @@ logger.handlers = [handler]
 
 
 # ============================================================
-# 🧼 Normalização forte de UUID (remove tabs, newlines, espaços invisíveis)
+# 🧼 Normalização forte de UUID
 # ============================================================
+
 _UUID_RE = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    r"^[0-9a-fA-F]{8}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{12}$"
 )
 
 def normalizar_uuid(valor: str | None) -> str | None:
     """
-    - Remove qualquer whitespace (inclui \t, \n, \r, NBSP)
-    - Remove qualquer caractere que não seja [0-9a-fA-F-]
-    - Valida e retorna string canônica UUID
+    - Remove whitespace (tabs, newlines, NBSP)
+    - Remove qualquer caractere inválido
+    - Retorna UUID canônico ou None
     """
     if valor is None:
         return None
@@ -45,22 +54,20 @@ def normalizar_uuid(valor: str | None) -> str | None:
 
     bruto = valor
 
-    # remove whitespace (tabs/newlines/espaços invisíveis)
+    # remove qualquer whitespace invisível
     valor = re.sub(r"\s+", "", valor)
 
-    # mantém só hex e hífen
+    # mantém apenas hex + hífen
     valor = re.sub(r"[^0-9a-fA-F-]", "", valor)
 
     if not valor:
         return None
 
-    # valida
     try:
         uid = str(UUID(valor))
     except Exception:
         return None
 
-    # garante formato padrão
     if not _UUID_RE.match(uid):
         return None
 
@@ -73,22 +80,17 @@ def normalizar_uuid(valor: str | None) -> str | None:
 # ============================================================
 # 🚀 Função principal do worker
 # ============================================================
-def processar_csv(tenant_id, file_path, descricao):
+
+def processar_pdv(tenant_id, file_path, descricao):
     job = get_current_job()
     writer = DatabaseWriter()
 
     # --------------------------------------------------------
-    # Job ID garantido
+    # Job ID seguro
     # --------------------------------------------------------
-    if job:
-        try:
-            job_id = str(UUID(job.id))
-        except Exception:
-            job_id = str(uuid4())
-    else:
-        job_id = str(uuid4())
+    job_id = str(job.id) if job and job.id else str(uuid4())
 
-    logger.info(f"🚀 Iniciando job {job_id} para tenant {tenant_id}")
+    logger.info(f"🚀 Iniciando job {job_id} | tenant={tenant_id}")
 
     try:
         comando = [
@@ -129,13 +131,13 @@ def processar_csv(tenant_id, file_path, descricao):
             try:
                 obj = json.loads(line)
 
-                # Progresso
+                # Evento de progresso
                 if isinstance(obj, dict) and obj.get("event") == "progress":
-                    pct = obj.get("pct", 0)
-                    step = obj.get("step", "")
-
                     if job:
-                        job.meta.update({"progress": pct, "step": step})
+                        job.meta.update({
+                            "progress": obj.get("pct", 0),
+                            "step": obj.get("step", "")
+                        })
                         job.save_meta()
                     continue
 
@@ -164,7 +166,7 @@ def processar_csv(tenant_id, file_path, descricao):
             )
 
         # ----------------------------------------------------
-        # ✅ FIX CRÍTICO: normaliza input_id vindo do main
+        # Normaliza input_id
         # ----------------------------------------------------
         input_id_norm = normalizar_uuid(resumo.get("input_id"))
 
@@ -176,34 +178,33 @@ def processar_csv(tenant_id, file_path, descricao):
         )
 
         # ----------------------------------------------------
-        # ✅ SALVA HISTÓRICO NO BANCO (PONTO CRÍTICO)
+        # Salva histórico (FONTE DA VERDADE)
         # ----------------------------------------------------
         writer.salvar_historico_pdv_job(
             tenant_id=tenant_id,
             job_id=job_id,
             arquivo=resumo.get("arquivo"),
             status=resumo.get("status"),
-            total_processados=resumo.get("total_processados", 0),
-            validos=resumo.get("validos", 0),
-            invalidos=resumo.get("invalidos", 0),
-            inseridos=resumo.get("inseridos", 0),
-            sobrescritos=resumo.get("sobrescritos", 0),
+            total_processados=int(resumo.get("total_processados") or 0),
+            validos=int(resumo.get("validos") or 0),
+            invalidos=int(resumo.get("invalidos") or 0),
+            inseridos=int(resumo.get("inseridos") or 0),
+            sobrescritos=int(resumo.get("sobrescritos") or 0),
             arquivo_invalidos=resumo.get("arquivo_invalidos"),
             mensagem=resumo.get("mensagem"),
             descricao=descricao,
-            input_id=input_id_norm,  # <- SOMENTE UUID LIMPO
+            input_id=input_id_norm,
         )
 
         if job:
             job.meta.update({"step": "Finalizado", "progress": 100})
             job.save_meta()
 
-        # Retorno leve (frontend busca detalhes no banco)
         return {
             "status": resumo.get("status"),
             "job_id": job_id,
             "tenant_id": tenant_id,
-            "input_id": input_id_norm,  # <- devolve limpo
+            "input_id": input_id_norm,
         }
 
     # ========================================================
@@ -212,7 +213,6 @@ def processar_csv(tenant_id, file_path, descricao):
     except Exception as e:
         logger.error(f"💥 Erro no job {job_id}: {e}", exc_info=True)
 
-        # Salva erro no histórico
         try:
             writer.salvar_historico_pdv_job(
                 tenant_id=tenant_id,

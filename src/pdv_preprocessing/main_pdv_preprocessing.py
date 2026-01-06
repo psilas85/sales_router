@@ -3,6 +3,11 @@
 #     ➜ VERSÃO FINAL COM PROGRESSO TEMPO REAL (MODELO A)
 # ============================================================
 
+# ============================================================
+# 📦 src/pdv_preprocessing/main_pdv_preprocessing.py
+#     ➜ VERSÃO FINAL COM SUPORTE A XLSX + CSV
+# ============================================================
+
 import os
 import argparse
 import logging
@@ -29,36 +34,28 @@ _UUID_RE = re.compile(
 )
 
 def uuid_canonico(valor: str | None = None) -> str:
-    """
-    Gera/garante UUID em formato canônico.
-    - Se valor None: gera uuid4()
-    - Se valor existir: tenta parsear e devolver canônico
-    """
     if valor is None:
         return str(uuid.uuid4())
-
     try:
         u = str(uuid.UUID(str(valor)))
-        if not _UUID_RE.match(u):
-            return str(uuid.uuid4())
-        return u
+        return u if _UUID_RE.match(u) else str(uuid.uuid4())
     except Exception:
         return str(uuid.uuid4())
 
 
 # ============================================================
-# 🔵 Função auxiliar para emitir progresso
+# 🔵 Emissão de progresso
 # ============================================================
+
 def emit_progress(pct, step):
-    """Evento de progresso consumido pelo worker."""
-    obj = {"event": "progress", "pct": int(pct), "step": str(step)}
-    print(json.dumps(obj, ensure_ascii=False))
+    print(json.dumps({
+        "event": "progress",
+        "pct": int(pct),
+        "step": str(step)
+    }, ensure_ascii=False))
     sys.stdout.flush()
 
 
-# ============================================================
-# 🔵 Função auxiliar para emitir JSON final
-# ============================================================
 def emit_final(obj):
     print(json.dumps(obj, ensure_ascii=False))
     sys.stdout.flush()
@@ -67,6 +64,7 @@ def emit_final(obj):
 # ============================================================
 # 🚀 Main
 # ============================================================
+
 def main():
     parser = argparse.ArgumentParser(
         description="Pré-processamento de PDVs (SalesRouter multi-tenant)"
@@ -78,6 +76,9 @@ def main():
 
     args = parser.parse_args()
 
+    # --------------------------------------------------------
+    # Tenant
+    # --------------------------------------------------------
     try:
         tenant_id = int(args.tenant)
     except Exception:
@@ -85,7 +86,7 @@ def main():
         return
 
     descricao = (args.descricao or "").strip()[:60]
-    input_id = uuid_canonico()  # ✅ sempre canônico
+    input_id = uuid_canonico()
     input_path = (args.arquivo or "").strip()
 
     load_dotenv()
@@ -95,9 +96,9 @@ def main():
     logging.info(f"🆔 input_id={input_id}")
     logging.info(f"📄 arquivo={input_path}")
 
-    # ============================================================
-    # 0% → Arquivo existe?
-    # ============================================================
+    # --------------------------------------------------------
+    # Arquivo existe?
+    # --------------------------------------------------------
     emit_progress(1, "Verificando arquivo")
     if not input_path or not os.path.exists(input_path):
         emit_final({
@@ -109,26 +110,32 @@ def main():
         })
         return
 
-    # ============================================================
-    # Detectar separador (5%)
-    # ============================================================
-    emit_progress(5, "Detectando separador do CSV")
-    try:
-        sep = detectar_separador(input_path)
-    except Exception as e:
-        emit_final({
-            "status": "error",
-            "erro": f"Falha ao detectar separador: {e}",
-            "tenant_id": tenant_id,
-            "input_id": input_id
-        })
-        return
+    # --------------------------------------------------------
+    # Tipo de arquivo
+    # --------------------------------------------------------
+    ext = os.path.splitext(input_path)[1].lower()
+    sep = None
+
+    if ext not in [".xlsx", ".xls"]:
+        emit_progress(5, "Detectando separador do CSV")
+        try:
+            sep = detectar_separador(input_path)
+        except Exception as e:
+            emit_final({
+                "status": "error",
+                "erro": f"Falha ao detectar separador: {e}",
+                "tenant_id": tenant_id,
+                "input_id": input_id
+            })
+            return
+    else:
+        emit_progress(5, "Arquivo XLSX detectado")
 
     inicio_execucao = time.time()
 
-    # ============================================================
-    # Abrir DB (10%)
-    # ============================================================
+    # --------------------------------------------------------
+    # Abrir banco
+    # --------------------------------------------------------
     emit_progress(10, "Inicializando conexão com banco")
     try:
         db_reader = DatabaseReader()
@@ -142,9 +149,9 @@ def main():
         })
         return
 
-    # ============================================================
-    # EXECUÇÃO PRINCIPAL (20% → 90%)
-    # ============================================================
+    # --------------------------------------------------------
+    # Execução principal
+    # --------------------------------------------------------
     try:
         emit_progress(20, "Executando pré-processamento")
 
@@ -157,15 +164,18 @@ def main():
             usar_google=args.usar_google
         )
 
-        df_validos, df_invalidos, inseridos = use_case.execute(input_path, sep)
+        df_validos, df_invalidos, inseridos = use_case.execute(
+            input_path=input_path,
+            sep=sep
+        )
 
         total_validos = len(df_validos)
         total_invalidos = len(df_invalidos)
         total = total_validos + total_invalidos
 
-        # ============================================================
-        # Salvando inválidos (90%)
-        # ============================================================
+        # --------------------------------------------------------
+        # Salvar inválidos
+        # --------------------------------------------------------
         emit_progress(90, "Salvando registros inválidos")
         arquivo_invalidos = salvar_invalidos(
             df_invalidos,
@@ -173,17 +183,17 @@ def main():
             input_id
         )
 
-        # ============================================================
-        # Finalização (99%)
-        # ============================================================
+        # --------------------------------------------------------
+        # Finalização
+        # --------------------------------------------------------
         emit_progress(99, "Finalizando execução")
 
-        duracao = time.time() - inicio_execucao
+        duracao = round(time.time() - inicio_execucao, 2)
 
-        resultado = {
+        emit_final({
             "status": "done",
             "tenant_id": tenant_id,
-            "input_id": input_id,  # ✅ canônico
+            "input_id": input_id,
             "descricao": descricao,
             "arquivo": os.path.basename(input_path),
             "total_processados": total,
@@ -191,13 +201,11 @@ def main():
             "invalidos": total_invalidos,
             "inseridos": inseridos,
             "arquivo_invalidos": arquivo_invalidos,
-            "duracao_segundos": round(duracao, 2),
-        }
-
-        emit_final(resultado)
+            "duracao_segundos": duracao
+        })
 
     except Exception as e:
-        logging.error(f"💥 Erro inesperado: {e}", exc_info=True)
+        logging.error("💥 Erro inesperado", exc_info=True)
         emit_final({
             "status": "error",
             "erro": str(e),
@@ -209,4 +217,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
