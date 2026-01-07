@@ -7,10 +7,27 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from .routes import router as pdv_router
+
 import numpy as np
 import json
 import uvicorn
+import unicodedata
 
+# ==========================================================
+# 🔧 Função canônica de normalização de texto
+# ==========================================================
+def normalize_text(value: str):
+    return (
+        unicodedata.normalize("NFD", value)
+        .encode("ascii", "ignore")
+        .decode("utf-8")
+        .upper()
+        .strip()
+    )
+
+# ==========================================================
+# 🧩 FastAPI App
+# ==========================================================
 app = FastAPI(
     title="SalesRouter PDV Preprocessing API",
     description="Serviço de pré-processamento e gestão de PDVs (multi-tenant)",
@@ -21,21 +38,42 @@ app = FastAPI(
 )
 
 # ==========================================================
-# 🚫 REMOVIDO — Middleware CORS (CORS agora somente no Nginx)
+# 🧩 Middleware — NORMALIZA TEXTO (WHITELIST)
 # ==========================================================
-# ❗ O CORS do backend gerava `Access-Control-Allow-Origin: *`
-# ❗ Isso conflitava com o header do Nginx e quebrava o download.
-#
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
+@app.middleware("http")
+async def normalize_text_middleware(request: Request, call_next):
+
+    ALLOWED_FIELDS = {"cidade", "bairro", "logradouro", "uf", "descricao"}
+
+    # -------------------------
+    # Query Params
+    # -------------------------
+    if request.query_params:
+        qp = dict(request.query_params)
+        for k, v in qp.items():
+            if k in ALLOWED_FIELDS and isinstance(v, str):
+                qp[k] = normalize_text(v)
+
+        request._query_params = qp  # override interno
+
+    # -------------------------
+    # Body JSON (PUT / POST / PATCH)
+    # -------------------------
+    if request.method in {"POST", "PUT", "PATCH"}:
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                for k, v in body.items():
+                    if k in ALLOWED_FIELDS and isinstance(v, str):
+                        body[k] = normalize_text(v)
+                request._body = body
+        except Exception:
+            pass  # body não é JSON
+
+    return await call_next(request)
 
 # ==========================================================
-# 🧹 Middleware global de saneamento JSON
+# 🧹 Middleware global de saneamento JSON (JÁ EXISTENTE)
 # ==========================================================
 @app.middleware("http")
 async def sanitize_json_response(request: Request, call_next):
@@ -65,12 +103,10 @@ async def sanitize_json_response(request: Request, call_next):
 
     return response
 
-
 # ==========================================================
 # 🔀 Rotas principais
 # ==========================================================
 app.include_router(pdv_router, prefix="/pdv")
-
 
 # ==========================================================
 # 🩺 Health check
@@ -79,9 +115,12 @@ app.include_router(pdv_router, prefix="/pdv")
 def root():
     return {"status": "SalesRouter PDV Preprocessing API online 🚀"}
 
-
 # ==========================================================
 # 🚀 Execução standalone (dev)
 # ==========================================================
 if __name__ == "__main__":
-    uvicorn.run("pdv_preprocessing.api.pdv_preprocessing_api:app", host="0.0.0.0", port=8000)
+    uvicorn.run(
+        "pdv_preprocessing.api.pdv_preprocessing_api:app",
+        host="0.0.0.0",
+        port=8000,
+    )

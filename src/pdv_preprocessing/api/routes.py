@@ -26,7 +26,22 @@ from pydantic import BaseModel
 from uuid import UUID
 import re
 
+import unicodedata
+
+
 router = APIRouter()
+
+def normalize_text(value: str | None):
+    if not value:
+        return value
+    return (
+        unicodedata.normalize("NFD", value)
+        .encode("ascii", "ignore")
+        .decode("utf-8")
+        .upper()
+        .strip()
+    )
+
 
 # ==========================================================
 # 🧠 Health check (sem autenticação)
@@ -736,8 +751,10 @@ def listar_locais(
     params = [tenant_id, input_id, uf]
 
     if cidade:
-        filtros.append("cidade ILIKE %s")
-        params.append(f"%{cidade}%")
+        cidade_norm = normalize_text(cidade)
+        filtros.append("cidade LIKE %s")
+        params.append(f"%{cidade_norm}%")
+
 
     if cnpj:
         filtros.append("cnpj = %s")
