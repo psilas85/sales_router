@@ -290,3 +290,32 @@ class SalesRoutingDatabaseReader:
                 cidades = [r[0] for r in rows] if rows else []
                 logger.info(f"🌎 {len(cidades)} cidades encontradas (tenant={tenant_id}, UF={uf})")
                 return cidades
+
+    def get_run_by_clusterization_id(self, tenant_id: int, clusterization_id: str):
+        """
+        Retorna o run associado exatamente ao clusterization_id informado.
+        """
+        with get_connection_context() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT id, uf, cidade, algo, k_final, params
+                    FROM cluster_run
+                    WHERE tenant_id = %s
+                    AND clusterization_id = %s
+                    AND status = 'done'
+                    LIMIT 1;
+                """, (tenant_id, clusterization_id))
+
+                row = cur.fetchone()
+
+                if not row:
+                    logger.error(
+                        f"❌ Nenhum run encontrado para clusterization_id={clusterization_id} (tenant={tenant_id})"
+                    )
+                    return None
+
+                logger.success(
+                    f"🎯 Run encontrado por clusterization_id | run_id={row['id']} | algo={row['algo']}"
+                )
+                return dict(row)
+

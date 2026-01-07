@@ -1,12 +1,4 @@
-# ============================================================
-# 📦 src/pdv_preprocessing/main_pdv_preprocessing.py
-#     ➜ VERSÃO FINAL COM PROGRESSO TEMPO REAL (MODELO A)
-# ============================================================
-
-# ============================================================
-# 📦 src/pdv_preprocessing/main_pdv_preprocessing.py
-#     ➜ VERSÃO FINAL COM SUPORTE A XLSX + CSV
-# ============================================================
+#sales_router/src/pdv_preprocessing/main_pdv_preprocessing.py
 
 import os
 import argparse

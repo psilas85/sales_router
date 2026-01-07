@@ -13,7 +13,6 @@ from pdv_preprocessing.domain.address_normalizer import normalize_for_cache
 from pdv_preprocessing.entities.pdv_entity import PDV
 
 
-
 from database.db_connection import get_connection_context
 
 # ============================================================

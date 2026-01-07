@@ -130,15 +130,21 @@ def main():
         return
 
     # ======================================================
-    # CARREGAR RUN
+    # CARREGAR RUN PELO clusterization_id (OBRIGATÓRIO)
     # ======================================================
-    run = db_reader.get_last_run_by_location(args.uf, args.cidade)
+    run = db_reader.get_run_by_clusterization_id(
+        tenant_id=tenant_id,
+        clusterization_id=clusterization_id
+    )
+
     if not run:
-        print(f"❌ Nenhum run encontrado para {args.uf}/{args.cidade or '(todas)'}")
+        print(f"❌ Nenhum run encontrado para clusterization_id={clusterization_id}")
         return
 
     run_id = run["id"]
-    print(f"Clusterização encontrada ID={run_id}")
+    print(f"Clusterização encontrada | run_id={run_id} | clusterization_id={clusterization_id}")
+
+
 
     clusters = db_reader.get_clusters(run_id)
     pdvs = db_reader.get_pdvs(run_id)

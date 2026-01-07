@@ -12,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Tuple, Dict, List
 import threading
 import re
+import unicodedata
+
 
 from pdv_preprocessing.infrastructure.database_reader import DatabaseReader
 from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
@@ -20,8 +22,9 @@ from pdv_preprocessing.domain.address_normalizer import (
     normalize_for_cache,
     normalize_for_geocoding,
 )
-
-
+from pdv_preprocessing.domain.capital_polygon_validator import (
+    ponto_dentro_capital
+)
 
 class GeolocationService:
     """
@@ -63,38 +66,46 @@ class GeolocationService:
             "NOMINATIM_LOCAL_URL", "http://172.31.45.41:8080"
         )
     
-
+    
     # ============================================================
     # 🧭 NOMINATIM — ESTRUTURADO (street / city / state)
     # ============================================================
     def _buscar_nominatim_estruturado(
         self, endereco_normalizado: str
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
 
         try:
-            # cidade - UF (obrigatório)
-            m = re.search(r",\s*([^,]+?)\s*-\s*([A-Za-z]{2})\s*(?:,|$)", endereco_normalizado)
+            # --------------------------------------------------------
+            # Extrai cidade e UF do endereço normalizado
+            # --------------------------------------------------------
+            m = re.search(
+                r",\s*([^,]+?)\s*-\s*([A-Za-z]{2})\s*(?:,|$)",
+                endereco_normalizado,
+            )
             if not m:
-                return None, None
+                return None, None, None, None
 
-            city = m.group(1).strip()
+            city = m.group(1).strip().upper()
             state = m.group(2).strip().upper()
 
-            # street = tudo antes da cidade - UF
+            # --------------------------------------------------------
+            # Street = tudo antes de "cidade - UF"
+            # --------------------------------------------------------
             street_part = endereco_normalizado[: m.start()].strip().strip(",")
             if not street_part:
-                return None, None
+                return None, None, city, state
 
-            # street pode vir "Rua X 145" ou "Rua X, Bairro"
-            # pega só o primeiro pedaço antes da vírgula (logradouro + número)
+            # Ex: "Rua X 123, Bairro" → "Rua X 123"
             street_first = street_part.split(",")[0].strip()
 
-            # tenta com número, se tiver; depois sem número
             street_with_number = street_first
             street_without_number = re.sub(r"\b\d+\b", "", street_first).strip()
 
             headers = {"User-Agent": "SalesRouter/LocalGeocoder"}
 
+            # --------------------------------------------------------
+            # Request helper
+            # --------------------------------------------------------
             def _req(street_value: str):
                 params = {
                     "street": street_value,
@@ -105,36 +116,54 @@ class GeolocationService:
                     "limit": 1,
                     "addressdetails": 1,
                 }
+
                 logger.debug(f"[NOMINATIM][STRUCT][REQ] {params}")
+
                 r = requests.get(
                     f"{self.nominatim_url}/search",
                     params=params,
                     headers=headers,
                     timeout=self.timeout,
                 )
+
                 if r.status_code != 200:
                     return None
+
                 data = r.json()
                 return data[0] if data else None
 
+            # --------------------------------------------------------
+            # Tentativa com número
+            # --------------------------------------------------------
             hit = _req(street_with_number)
+
+            # --------------------------------------------------------
+            # Fallback sem número
+            # --------------------------------------------------------
             if not hit and street_without_number and street_without_number != street_with_number:
                 hit = _req(street_without_number)
 
             if not hit:
-                return None, None
+                return None, None, city, state
 
-            lat = float(hit["lat"])
-            lon = float(hit["lon"])
+            lat = float(hit.get("lat"))
+            lon = float(hit.get("lon"))
 
+            # --------------------------------------------------------
+            # Bloqueia coordenadas genéricas (centro de cidade)
+            # --------------------------------------------------------
             if self._is_generic_location(lat, lon):
-                return None, None
+                logger.warning(
+                    f"[NOMINATIM][STRUCT][GENERICA] {city}-{state} lat={lat} lon={lon}"
+                )
+                return None, None, city, state
 
-            return lat, lon
+            return lat, lon, city, state
 
         except Exception as e:
             logger.warning(f"[NOMINATIM][STRUCT][ERRO] {e}", exc_info=True)
-            return None, None
+            return None, None, None, None
+
 
 
     # ============================================================
@@ -156,14 +185,45 @@ class GeolocationService:
         return False
 
     # ============================================================
-    # 🌍 Busca principal
+    # 🏛️ Helper: capital?
+    # ============================================================
+
+    _CAPITAIS = {
+        ("RIO BRANCO","AC"),("MACEIO","AL"),("MANAUS","AM"),("MACAPA","AP"),
+        ("SALVADOR","BA"),("FORTALEZA","CE"),("BRASILIA","DF"),("VITORIA","ES"),
+        ("GOIANIA","GO"),("SAO LUIS","MA"),("BELO HORIZONTE","MG"),
+        ("CAMPO GRANDE","MS"),("CUIABA","MT"),("BELEM","PA"),
+        ("JOAO PESSOA","PB"),("RECIFE","PE"),("TERESINA","PI"),
+        ("CURITIBA","PR"),("RIO DE JANEIRO","RJ"),("NATAL","RN"),
+        ("PORTO VELHO","RO"),("BOA VISTA","RR"),("PORTO ALEGRE","RS"),
+        ("FLORIANOPOLIS","SC"),("ARACAJU","SE"),("SAO PAULO","SP"),
+        ("PALMAS","TO"),
+    }
+
+    @staticmethod
+    def _to_ascii_upper(txt: str | None) -> str | None:
+        if not txt:
+            return None
+        txt = unicodedata.normalize("NFKD", txt)
+        txt = "".join(c for c in txt if not unicodedata.combining(c))
+        return txt.upper().strip()
+
+    def is_capital(self, city: str | None, state: str | None) -> bool:
+        city = self._to_ascii_upper(city)
+        state = self._to_ascii_upper(state)
+        if not city or not state:
+            return False
+        return (city, state) in self._CAPITAIS
+
+
+
+    # ============================================================
+    # 🌍 Busca principal (CORRIGIDA DEFINITIVA)
     # ============================================================
     def buscar_coordenadas(self, endereco: Optional[str], cep: Optional[str] = None):
-
         trace = f"GEO-{int(time.time() * 1000)}"
 
         if not endereco:
-            logger.warning(f"[{trace}][FALHA] Endereço vazio")
             with self.stats_lock:
                 self.stats["falha"] += 1
             return None, None, "parametro_vazio"
@@ -174,11 +234,26 @@ class GeolocationService:
         endereco_normalizado = normalize_for_geocoding(endereco_base)
         cache_key = normalize_for_cache(endereco_base)
 
+        # ==========================================================
+        # 🔑 EXTRAÇÃO DEFINITIVA DA CIDADE / UF (DO INPUT)
+        # ==========================================================
+        cidade_input = None
+        uf_input = None
+
+        m = re.search(
+            r",\s*([^,]+?)\s*-\s*([A-Za-z]{2})\s*(?:,|$)",
+            endereco_normalizado,
+        )
+        if m:
+            cidade_input = m.group(1).strip().upper()
+            uf_input = m.group(2).strip().upper()
 
         logger.info(
             f"[{trace}][INICIO]\n"
             f"  RAW ..............: {raw}\n"
             f"  NORMALIZADO ......: {endereco_normalizado}\n"
+            f"  CIDADE_INPUT .....: {cidade_input}\n"
+            f"  UF_INPUT .........: {uf_input}\n"
             f"  CACHE_KEY ........: {cache_key}"
         )
 
@@ -192,47 +267,78 @@ class GeolocationService:
             cache_db = self.reader.buscar_localizacao(cache_key)
             if cache_db:
                 lat, lon = cache_db
-                logger.info(
-                    f"[{trace}][CACHE_DB][HIT] "
-                    f"lat={lat} lon={lon}"
-                )
-                with self.stats_lock:
-                    self.stats["cache_db"] += 1
-                return lat, lon, "cache_db"
+
+                # 🔒 PROTEÇÃO: capital do CSV sempre valida polígono
+                if self.is_capital(cidade_input, uf_input):
+                    if not ponto_dentro_capital(lat, lon, cidade_input, uf_input):
+                        logger.error(
+                            f"[{trace}][CACHE_DB][REJEITADO_FORA_CAPITAL] "
+                            f"{cidade_input}-{uf_input} lat={lat} lon={lon}"
+                        )
+                    else:
+                        with self.stats_lock:
+                            self.stats["cache_db"] += 1
+                        return lat, lon, "cache_db"
+                else:
+                    with self.stats_lock:
+                        self.stats["cache_db"] += 1
+                    return lat, lon, "cache_db"
         except Exception as e:
             logger.warning(f"[{trace}][CACHE_DB][ERRO] {e}")
 
         # ==========================================================
         # 2) NOMINATIM ESTRUTURADO
         # ==========================================================
-        lat, lon = self._buscar_nominatim_estruturado(endereco_normalizado)
+        lat, lon, city_geo, state_geo = None, None, None, None
+        try:
+            lat, lon, city_geo, state_geo = self._buscar_nominatim_estruturado(
+                endereco_normalizado
+            )
+        except Exception as e:
+            logger.warning(f"[{trace}][NOMINATIM][STRUCT][ERRO] {e}")
+
         if lat is not None and lon is not None:
-            logger.info(
-                f"[{trace}][NOMINATIM][STRUCT][OK] "
-                f"lat={lat} lon={lon}"
-            )
 
-            self._salvar_cache_detalhado(
-                cache_key=cache_key,
-                endereco_raw=raw,
-                endereco_normalizado=endereco_normalizado,
-                lat=lat,
-                lon=lon,
-                fonte="nominatim_struct",
-                trace=trace,
-            )
+            # 🔒 REGRA DE OURO:
+            # capital é definida PELO CSV, não pelo geocoder
+            if self.is_capital(cidade_input, uf_input):
+                if not ponto_dentro_capital(lat, lon, cidade_input, uf_input):
+                    logger.error(
+                        f"[{trace}][NOMINATIM][REJEITADO_FORA_CAPITAL] "
+                        f"{cidade_input}-{uf_input} lat={lat} lon={lon}"
+                    )
+                else:
+                    self._salvar_cache_detalhado(
+                        cache_key=cache_key,
+                        endereco_raw=raw,
+                        endereco_normalizado=endereco_normalizado,
+                        lat=lat,
+                        lon=lon,
+                        fonte="nominatim_struct",
+                        trace=trace,
+                    )
+                    with self.stats_lock:
+                        self.stats["nominatim_local"] += 1
+                    return lat, lon, "nominatim_struct"
+            else:
+                # interior → não valida polígono (como você definiu)
+                self._salvar_cache_detalhado(
+                    cache_key=cache_key,
+                    endereco_raw=raw,
+                    endereco_normalizado=endereco_normalizado,
+                    lat=lat,
+                    lon=lon,
+                    fonte="nominatim_struct",
+                    trace=trace,
+                )
+                with self.stats_lock:
+                    self.stats["nominatim_local"] += 1
+                return lat, lon, "nominatim_struct"
 
-            with self.stats_lock:
-                self.stats["nominatim_local"] += 1
-
-            return lat, lon, "nominatim_struct"
-
-        logger.warning(f"[{trace}][NOMINATIM][STRUCT][MISS]")
-
-        
+        logger.warning(f"[{trace}][NOMINATIM][MISS_OR_REJECT]")
 
         # ==========================================================
-        # 4) GOOGLE
+        # 3) GOOGLE (fallback)
         # ==========================================================
         if self.usar_google and self.GOOGLE_KEY:
             try:
@@ -243,19 +349,23 @@ class GeolocationService:
                     f"address={quote(endereco_normalizado)}&key={self.GOOGLE_KEY}"
                 )
 
-                logger.debug(f"[{trace}][GOOGLE][REQ] {url}")
-
                 r = requests.get(url, timeout=5)
                 if r.status_code == 200:
                     data = r.json()
                     if data.get("status") == "OK":
-                        loc = data["results"][0]["geometry"]["location"]
+                        result = data["results"][0]
+                        loc = result["geometry"]["location"]
                         lat, lon = loc["lat"], loc["lng"]
 
-                        logger.info(
-                            f"[{trace}][GOOGLE][OK] "
-                            f"lat={lat} lon={lon}"
-                        )
+                        if self.is_capital(cidade_input, uf_input):
+                            if not ponto_dentro_capital(lat, lon, cidade_input, uf_input):
+                                logger.error(
+                                    f"[{trace}][GOOGLE][REJEITADO_FORA_CAPITAL] "
+                                    f"{cidade_input}-{uf_input} lat={lat} lon={lon}"
+                                )
+                                with self.stats_lock:
+                                    self.stats["falha"] += 1
+                                return None, None, "fora_capital"
 
                         self._salvar_cache_detalhado(
                             cache_key=cache_key,
@@ -266,15 +376,9 @@ class GeolocationService:
                             fonte="google",
                             trace=trace,
                         )
-
                         with self.stats_lock:
                             self.stats["google"] += 1
-
                         return lat, lon, "google"
-
-                    logger.warning(
-                        f"[{trace}][GOOGLE][MISS] status={data.get('status')}"
-                    )
 
             except Exception as e:
                 logger.error(f"[{trace}][GOOGLE][ERRO] {e}", exc_info=True)
@@ -282,17 +386,19 @@ class GeolocationService:
         # ==========================================================
         # FALHA FINAL
         # ==========================================================
+        with self.stats_lock:
+            self.stats["falha"] += 1
+
         logger.error(
             f"[{trace}][FALHA_FINAL]\n"
             f"  RAW={raw}\n"
             f"  NORMALIZADO={endereco_normalizado}\n"
-            f"  CACHE_KEY={cache_key}"
+            f"  CIDADE_INPUT={cidade_input}\n"
+            f"  UF_INPUT={uf_input}"
         )
 
-        with self.stats_lock:
-            self.stats["falha"] += 1
-
         return None, None, "falha"
+
 
 
     # ============================================================
