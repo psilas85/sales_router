@@ -1,32 +1,66 @@
 #sales_router/src/pdv_preprocessing/api/routes.py
 
 # ==========================================================
-# 📦 src/pdv_preprocessing/api/routes.py
+# 📦 Imports — BLOCO ÚNICO (OBRIGATÓRIO)
 # ==========================================================
-from fastapi import APIRouter, HTTPException, Query, Depends, Request
+
+# FastAPI
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Query,
+    Depends,
+    Request,
+    UploadFile,
+    Body,
+    File,
+)
+from fastapi.responses import FileResponse, RedirectResponse
+
+# Pydantic
+from pydantic import BaseModel
+
+# Logging
 from loguru import logger
+
+# Banco de dados
 from database.db_connection import get_connection
-from pdv_preprocessing.pdv_jobs import processar_pdv
 from pdv_preprocessing.infrastructure.database_reader import DatabaseReader
 from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
+
+# Entidades e domínio
 from pdv_preprocessing.entities.pdv_entity import PDV
 from pdv_preprocessing.domain.address_normalizer import (
     normalize_base,
     normalize_for_cache,
 )
 from pdv_preprocessing.domain.utils_geo import coordenada_generica
+
+# Jobs / filas
+from pdv_preprocessing.pdv_jobs import processar_pdv
+from redis import Redis
+from rq import Queue
+from rq.job import Job
+
+# Visualização
+from pathlib import Path
+from pdv_preprocessing.visualization.pdv_plotting import (
+    buscar_pdvs,
+    gerar_mapa_pdvs,
+)
+
+# Autenticação
 from .dependencies import verify_token
 
+# Utils padrão
 from datetime import datetime, timedelta
-
+from uuid import UUID
 import pandas as pd
 import numpy as np
-from pydantic import BaseModel
-
-from uuid import UUID
-import re
-
 import unicodedata
+import shutil
+import os
+import re
 
 
 router = APIRouter()
@@ -111,23 +145,27 @@ def listar_pdvs(request: Request):
 # ==========================================================
 # ✏️ Atualizar PDV (autenticado + controle de role)
 # ==========================================================
+
 @router.put("/atualizar", dependencies=[Depends(verify_token)], tags=["PDVs"])
 def atualizar_pdv(
     request: Request,
-    cnpj: str,
-    logradouro: str = None,
-    numero: str = None,
-    bairro: str = None,
-    cidade: str = None,
-    uf: str = None,
-    cep: str = None,
-    lat: float = None,
-    lon: float = None,
+    cnpj: str = Query(...),
+    logradouro: str | None = Query(None),
+    numero: str | None = Query(None),
+    bairro: str | None = Query(None),
+    cidade: str | None = Query(None),
+    uf: str | None = Query(None),
+    cep: str | None = Query(None),
 ):
     user = request.state.user
     tenant_id = user["tenant_id"]
 
-    if user.get("role") not in ["sales_router_adm", "tenant_adm", "tenant_operacional"]:
+    # 🔐 Permissão
+    if user.get("role") not in [
+        "sales_router_adm",
+        "tenant_adm",
+        "tenant_operacional",
+    ]:
         raise HTTPException(status_code=403, detail="Usuário sem permissão.")
 
     conn = get_connection()
@@ -139,7 +177,9 @@ def atualizar_pdv(
         conn.close()
         raise HTTPException(status_code=404, detail="PDV não encontrado.")
 
-    atualizado = {**existente}
+    atualizado = dict(existente)
+
+    # 🔧 Atualiza APENAS campos textuais (se vierem preenchidos)
     for campo, valor in {
         "logradouro": logradouro,
         "numero": numero,
@@ -147,30 +187,27 @@ def atualizar_pdv(
         "cidade": cidade,
         "uf": uf,
         "cep": cep,
-        "pdv_lat": lat,
-        "pdv_lon": lon,
     }.items():
-        if valor is not None:
-            atualizado[campo] = valor
+        if valor is not None and str(valor).strip():
+            atualizado[campo] = normalize_text(valor)
 
+    # 🧩 Recompõe endereço completo
     atualizado["pdv_endereco_completo"] = (
         f"{atualizado.get('logradouro','')}, {atualizado.get('numero','')}, "
         f"{atualizado.get('bairro','')}, {atualizado.get('cidade','')} - "
         f"{atualizado.get('uf','')}, {atualizado.get('cep','')}"
-    )
+    ).strip()
 
-    atualizado["status_geolocalizacao"] = "manual_edit"
+    # ⏱️ Timestamp
+    atualizado["atualizado_em"] = datetime.utcnow()
+
+    # ❗ REGRAS EXPLÍCITAS
+    # - NÃO altera pdv_lat / pdv_lon
+    # - NÃO altera status_geolocalizacao
+    # - NÃO atualiza cache
 
     pdv = PDV(**{**atualizado, "tenant_id": tenant_id})
     writer.atualizar_pdv_completo(pdv)
-
-    # 🔒 Atualiza cache SOMENTE via chave canônica
-    if lat is not None and lon is not None and not coordenada_generica(lat, lon):
-        writer.atualizar_cache_por_chave(
-            cache_key=existente.get("endereco_cache_key"),
-            nova_lat=lat,
-            nova_lon=lon,
-        )
 
     conn.close()
 
@@ -184,8 +221,6 @@ def atualizar_pdv(
 # ==========================================================
 # 🚀 Enfileirar novo processamento de PDVs (upload CSV)
 # ==========================================================
-from redis import Redis
-from rq import Queue
 
 @router.post("/upload", dependencies=[Depends(verify_token)], tags=["Jobs"])
 def upload_pdv(
@@ -267,15 +302,6 @@ def reprocessar_input(request: Request, input_id: str = Query(...), descricao: s
 # 📤 Upload direto de arquivo (multipart/form-data)
 #     ➜ XLSX (padrão) ou CSV
 # ==========================================================
-from fastapi import UploadFile, File, HTTPException, Depends, Query, Request
-from redis import Redis
-from rq import Queue
-import shutil
-import os
-from datetime import datetime
-
-from pdv_preprocessing.pdv_jobs import processar_pdv
-
 
 @router.post("/upload-file", dependencies=[Depends(verify_token)], tags=["Jobs"])
 def upload_arquivo(
@@ -357,8 +383,6 @@ def upload_arquivo(
 # ==========================================================
 # 🗺️ Gerar mapa de PDVs (autenticado)
 # ==========================================================
-from pathlib import Path
-from pdv_preprocessing.visualization.pdv_plotting import buscar_pdvs, gerar_mapa_pdvs
 
 @router.post("/gerar-mapa", dependencies=[Depends(verify_token)], tags=["Visualização"])
 def gerar_mapa_pdv(
@@ -416,8 +440,6 @@ def gerar_mapa_pdv(
 # ==========================================================
 # 📥 Download do mapa de PDVs (autenticado)
 # ==========================================================
-from fastapi.responses import FileResponse
-import os
 
 @router.get("/download-mapa", dependencies=[Depends(verify_token)], tags=["Visualização"])
 def download_mapa_pdv(
@@ -455,7 +477,6 @@ def download_mapa_pdv(
 # ==========================================================
 # 🌐 Visualizar mapa diretamente (redirect)
 # ==========================================================
-from fastapi.responses import RedirectResponse
 
 @router.get("/ver-mapa", dependencies=[Depends(verify_token)], tags=["Visualização"])
 def ver_mapa_pdv(
@@ -579,7 +600,6 @@ def listar_ultimos_jobs(
 # 📋 Filtrar jobs — aceita DD/MM/YYYY e YYYY-MM-DD
 # ==========================================================
 
-from datetime import datetime
 
 def parse_data(valor):
     if not valor:
@@ -719,8 +739,6 @@ def listar_jobs(request: Request):
     }
 
 
-
-
 # ============================================================================
 # 📍 Gestão de Locais — LISTAR (GET /pdv/locais)
 # ============================================================================
@@ -761,12 +779,13 @@ def listar_locais(
         params.append(cnpj)
 
     if logradouro:
-        filtros.append("logradouro ILIKE %s")
-        params.append(f"%{logradouro}%")
+        filtros.append("logradouro LIKE %s")
+        params.append(f"%{normalize_text(logradouro)}%")
 
     if bairro:
-        filtros.append("bairro ILIKE %s")
-        params.append(f"%{bairro}%")
+        filtros.append("bairro LIKE %s")
+        params.append(f"%{normalize_text(bairro)}%")
+
 
     if cep:
         filtros.append("cep = %s")
@@ -797,124 +816,97 @@ def listar_locais(
     }
 
 
-
 # ============================================================
-# ✏️ Gestão de Locais — EDITAR (PUT /pdv/locais/{pdv_id})
-# 👉 MVP: cache sempre por TEXTO NORMALIZADO
+# ✏️ Gestão de Locais — EDITAR COORDENADAS (FINAL)
+# PUT /pdv/locais/{pdv_id}
+#
+# REGRAS:
+# - ÚNICO endpoint que altera lat/lon
+# - Sempre marca status_geolocalizacao = manual_edit
+# - Sempre atualiza enderecos_cache pela chave canônica
+# - NÃO altera endereço textual
 # ============================================================
 
-from pydantic import BaseModel
 
+
+# --------------------------------------------------
+# 📦 Payload
+# --------------------------------------------------
 class EditarLocalPayload(BaseModel):
-    pdv_lat: float | None = None
-    pdv_lon: float | None = None
+    pdv_lat: float
+    pdv_lon: float
 
 
-@router.put("/locais/{pdv_id}", dependencies=[Depends(verify_token)], tags=["Locais"])
+# --------------------------------------------------
+# ✏️ Endpoint
+# --------------------------------------------------
+@router.put(
+    "/locais/{pdv_id}",
+    dependencies=[Depends(verify_token)],
+    tags=["Locais"],
+)
 def editar_local(
     request: Request,
     pdv_id: int,
-    payload: EditarLocalPayload,
+    payload: EditarLocalPayload = Body(...),
 ):
     user = request.state.user
     tenant_id = user["tenant_id"]
 
-    # --------------------------------------------------
-    # 🔐 Permissão
-    # --------------------------------------------------
-    if user.get("role") not in ["sales_router_adm", "tenant_adm", "tenant_operacional"]:
+    if user["role"] not in (
+        "sales_router_adm",
+        "tenant_adm",
+        "tenant_operacional",
+    ):
         raise HTTPException(status_code=403, detail="Sem permissão para editar.")
 
-    # --------------------------------------------------
-    # 📥 Valida payload
-    # --------------------------------------------------
+
     if payload.pdv_lat is None or payload.pdv_lon is None:
-        raise HTTPException(status_code=400, detail="pdv_lat e pdv_lon são obrigatórios.")
+        raise HTTPException(
+            status_code=400,
+            detail="pdv_lat e pdv_lon são obrigatórios."
+        )
 
     if coordenada_generica(payload.pdv_lat, payload.pdv_lon):
         raise HTTPException(status_code=400, detail="Coordenadas inválidas.")
 
-    conn = get_connection()
-    cur = conn.cursor()
+    writer = DatabaseWriter()
 
-    # --------------------------------------------------
-    # 1️⃣ Busca CHAVE CANÔNICA EXISTENTE
-    # --------------------------------------------------
-    cur.execute(
-        """
-        SELECT endereco_cache_key
-        FROM pdvs
-        WHERE id = %s
-          AND tenant_id = %s
-        """,
-        (pdv_id, tenant_id),
+    cache_key = writer.buscar_cache_key_pdv(
+        pdv_id=pdv_id,
+        tenant_id=tenant_id,
     )
-    row = cur.fetchone()
 
-    if not row or not row[0]:
-        conn.close()
+    if not cache_key:
         raise HTTPException(
             status_code=500,
             detail="PDV sem endereco_cache_key. Reprocessar input."
         )
 
-    cache_key = row[0]
-
-    # --------------------------------------------------
-    # 2️⃣ Atualiza PDV
-    # --------------------------------------------------
-    cur.execute(
-        """
-        UPDATE pdvs
-        SET
-            pdv_lat = %s,
-            pdv_lon = %s,
-            status_geolocalizacao = 'manual_edit',
-            atualizado_em = NOW()
-        WHERE id = %s
-          AND tenant_id = %s
-        RETURNING
-            id, tenant_id, input_id, descricao, cnpj,
-            logradouro, numero, bairro, cidade, uf, cep,
-            pdv_endereco_completo, pdv_lat, pdv_lon,
-            status_geolocalizacao, pdv_vendas,
-            criado_em, atualizado_em;
-        """,
-        (
-            payload.pdv_lat,
-            payload.pdv_lon,
-            pdv_id,
-            tenant_id,
-        ),
+    ok_pdv = writer.atualizar_lat_lon_pdv(
+        pdv_id=pdv_id,
+        lat=payload.pdv_lat,
+        lon=payload.pdv_lon,
+        tenant_id=tenant_id,
     )
 
-    atualizado = cur.fetchone()
-    conn.commit()
-    conn.close()
+    if not ok_pdv:
+        raise HTTPException(status_code=404, detail="PDV não encontrado.")
 
-    colunas = [
-        "id", "tenant_id", "input_id", "descricao", "cnpj",
-        "logradouro", "numero", "bairro", "cidade", "uf", "cep",
-        "pdv_endereco_completo", "pdv_lat", "pdv_lon",
-        "status_geolocalizacao", "pdv_vendas",
-        "criado_em", "atualizado_em",
-    ]
-    pdv_dict = dict(zip(colunas, atualizado))
-
-    # --------------------------------------------------
-    # 3️⃣ Atualiza CACHE — ÚNICO MÉTODO PERMITIDO
-    # --------------------------------------------------
-    writer = DatabaseWriter()
-    writer.atualizar_cache_por_chave(
+    ok_cache = writer.atualizar_cache_por_chave(
         cache_key=cache_key,
         nova_lat=payload.pdv_lat,
         nova_lon=payload.pdv_lon,
     )
 
-    return {
-        "status": "success",
-        "pdv": pdv_dict,
-    }
+    if not ok_cache:
+        logger.warning(
+            f"⚠️ Cache não atualizado para PDV {pdv_id} (cache_key={cache_key})"
+        )
+
+    return {"status": "success"}
+
+
 
 
 # ============================================================
@@ -1008,9 +1000,7 @@ def detalhar_job(request: Request, job_id: str):
     # 2️⃣ FALLBACK: REDIS (job ainda em execução)
     # --------------------------------------------------
     try:
-        from redis import Redis
-        from rq.job import Job
-
+        
         job = Job.fetch(job_id, connection=Redis(host="redis", port=6379))
 
         return {
@@ -1030,8 +1020,7 @@ def detalhar_job(request: Request, job_id: str):
 # ==========================================================
 # 📊 Consultar progresso em tempo real de um job
 # ==========================================================
-from redis import Redis
-from rq.job import Job
+
 
 @router.get("/jobs/{job_id}/progress", dependencies=[Depends(verify_token)], tags=["Jobs"])
 def progresso_job(request: Request, job_id: str):
@@ -1082,8 +1071,7 @@ def progresso_job(request: Request, job_id: str):
 # ==========================================================
 # 📥 Download CSV de registros inválidos
 # ==========================================================
-from fastapi.responses import FileResponse
-import os
+
 
 @router.get(
     "/jobs/{job_id}/download-invalidos",

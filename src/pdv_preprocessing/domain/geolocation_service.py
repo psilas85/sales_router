@@ -267,14 +267,17 @@ class GeolocationService:
             cache_db = self.reader.buscar_localizacao(cache_key)
             if cache_db:
                 lat, lon = cache_db
+                logger.info(f"[{trace}][CACHE_DB][HIT] lat={lat} lon={lon}")
+
 
                 # 🔒 PROTEÇÃO: capital do CSV sempre valida polígono
                 if self.is_capital(cidade_input, uf_input):
                     if not ponto_dentro_capital(lat, lon, cidade_input, uf_input):
-                        logger.error(
-                            f"[{trace}][CACHE_DB][REJEITADO_FORA_CAPITAL] "
+                        logger.warning(
+                            f"[{trace}][CACHE_DB][HIT_REJEITADO_FORA_CAPITAL] "
                             f"{cidade_input}-{uf_input} lat={lat} lon={lon}"
                         )
+
                     else:
                         with self.stats_lock:
                             self.stats["cache_db"] += 1

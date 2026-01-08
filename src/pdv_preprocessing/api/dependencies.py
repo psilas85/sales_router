@@ -1,7 +1,5 @@
 #sales_router/src/pdv_preprocessing/api/dependencies.py
 
-# pdv_preprocessing/api/dependencies.py
-
 import os
 import jwt
 from fastapi import Request, HTTPException, status
