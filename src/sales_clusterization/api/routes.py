@@ -149,6 +149,16 @@ async def clusterizar(request: Request):
     except:
         raise HTTPException(400, "JSON inválido no body.")
 
+    algo = body.get("algo", "kmeans")
+    cidade = body.get("cidade")
+
+    if algo == "capacitated_sweep":
+        if not cidade or not str(cidade).strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Para o algoritmo capacitated_sweep (DIVISOR), o parâmetro 'cidade' é obrigatório."
+            )
+
     params = {
         "tenant_id": tenant_id,
         "uf": body["uf"],

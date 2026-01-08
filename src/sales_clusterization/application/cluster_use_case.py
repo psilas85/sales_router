@@ -87,6 +87,16 @@ def executar_clusterizacao(
     logger.info(f"🏁 Iniciando clusterização | tenant={tenant_id} | algo={algo}")
 
     # ============================================================
+    # ❗ Regra de negócio (defensiva)
+    # ============================================================
+    if algo == "capacitated_sweep":
+        if not cidade or not str(cidade).strip():
+            raise ValueError(
+                "Cidade obrigatória para execução do algoritmo capacitated_sweep."
+            )
+
+
+    # ============================================================
     # 1) Carregar PDVs
     # ============================================================
     pdvs = carregar_pdvs(tenant_id, input_id, uf, cidade)
