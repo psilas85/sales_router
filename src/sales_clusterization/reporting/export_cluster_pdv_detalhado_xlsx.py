@@ -46,12 +46,22 @@ def exportar_cluster_pdv_detalhado(tenant_id: int, clusterization_id: str):
     if df.empty:
         raise ValueError(f"❌ Nenhum dado encontrado em v_cluster_pdv_detalhado para run_id={run_id}")
 
+    # =========================================
+    # 🔧 Correção: evitar notação científica
+    # =========================================
+    if "pdv_vendas" in df.columns:
+        df["pdv_vendas"] = pd.to_numeric(df["pdv_vendas"], errors="coerce").round(2)
+
+
     output_dir = f"output/reports/{tenant_id}"
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, f"cluster_pdv_detalhado_{clusterization_id}.xlsx")
+    output_path = os.path.join(
+        output_dir, f"cluster_pdv_detalhado_{clusterization_id}.xlsx"
+    )
 
     df.to_excel(output_path, index=False)
     logger.success(f"✅ Arquivo salvo em: {output_path}")
+
 
 
 if __name__ == "__main__":

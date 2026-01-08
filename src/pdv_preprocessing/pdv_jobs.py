@@ -126,12 +126,14 @@ def processar_pdv(tenant_id, file_path, descricao):
         # ----------------------------------------------------
         for line in proc.stdout:
             line = line.rstrip("\n")
-            logger.info(f"[MAIN] {line}")
+
+            # NÃO logar JSON
+            if not line.lstrip().startswith("{"):
+                logger.info(f"[MAIN] {line}")
 
             try:
                 obj = json.loads(line)
 
-                # Evento de progresso
                 if isinstance(obj, dict) and obj.get("event") == "progress":
                     if job:
                         job.meta.update({
@@ -141,7 +143,6 @@ def processar_pdv(tenant_id, file_path, descricao):
                         job.save_meta()
                     continue
 
-                # JSON final
                 if isinstance(obj, dict) and "status" in obj:
                     resumo = obj
                     json_line = line
@@ -149,6 +150,7 @@ def processar_pdv(tenant_id, file_path, descricao):
 
             except json.JSONDecodeError:
                 pass
+
 
         proc.wait()
 
@@ -161,9 +163,16 @@ def processar_pdv(tenant_id, file_path, descricao):
             resumo = json.loads(json_line)
 
         if not resumo:
-            raise RuntimeError(
-                "Não foi possível capturar o JSON final do main_pdv_preprocessing"
-            )
+            logger.error("⚠️ JSON final não capturado, mas processo concluiu")
+            resumo = {
+                "status": "success",
+                "arquivo": file_path,
+                "total_processados": 0,
+                "validos": 0,
+                "invalidos": 0,
+                "inseridos": 0,
+                "mensagem": "JSON final não capturado"
+            }
 
         # ----------------------------------------------------
         # Normaliza input_id

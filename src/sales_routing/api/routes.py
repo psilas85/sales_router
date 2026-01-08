@@ -522,3 +522,32 @@ def listar_relatorios_roteirizacao(
         "roteirizacoes": df.to_dict(orient="records"),
         "total": int(total),
     }
+
+@router.post("/mapa_async", dependencies=[Depends(verify_token)])
+def gerar_mapa_async(request: Request, routing_id: str = Query(...)):
+    user = request.state.user
+    tenant_id = user["tenant_id"]
+
+    job_id = f"routing-map-{routing_id}"
+
+    registrar_job_status(
+        job_id=job_id,
+        tenant_id=tenant_id,
+        etapa="routing_map",
+        status="queued",
+        mensagem="Geração de mapa enfileirada",
+        metadata={"routing_id": routing_id},
+    )
+
+    queue.enqueue(
+        gerar_mapa_rotas_job,   # função que hoje está inline
+        tenant_id,
+        routing_id,
+        job_id=job_id,
+        job_timeout=1800,
+    )
+
+    return {
+        "status": "queued",
+        "job_id": job_id,
+    }

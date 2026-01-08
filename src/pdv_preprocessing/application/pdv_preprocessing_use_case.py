@@ -186,19 +186,35 @@ class PDVPreprocessingUseCase:
             def normalizar_vendas(valor):
                 if pd.isna(valor):
                     return None
-                v = fix_encoding(str(valor).strip())
+
+                v = fix_encoding(str(valor)).strip()
+
+                # remove moeda
                 v = v.replace("R$", "").replace("r$", "").strip()
-                v = v.replace(".", "").replace(",", ".")
+
+                # CASO 1: formato brasileiro explícito
+                if "," in v:
+                    v = v.replace(".", "").replace(",", ".")
+                else:
+                    # CASO 2: lixo numérico do Excel
+                    try:
+                        num = float(v)
+                        if num > 1_000_000_000:
+                            return None
+                        return num
+                    except:
+                        return None
+
                 v = re.sub(r"[^0-9.]", "", v)
-                if v == "":
-                    return None
+
                 try:
                     num = float(v)
-                    if math.isnan(num) or math.isinf(num):
+                    if num > 1_000_000_000:
                         return None
                     return num
                 except:
                     return None
+
 
             df["pdv_vendas"] = df["pdv_vendas"].apply(normalizar_vendas)
 
@@ -427,9 +443,15 @@ class PDVPreprocessingUseCase:
             df_validos["input_id"] = self.input_id
             df_validos["descricao"] = self.descricao
 
+            # BLINDAGEM FINAL pdv_vendas (TEM QUE SER ANTES)
+            if "pdv_vendas" in df_validos.columns:
+                df_validos["pdv_vendas"] = pd.to_numeric(
+                    df_validos["pdv_vendas"],
+                    errors="coerce"
+                )
+
             campos_validos = PDV.__init__.__code__.co_varnames[1:]
             df_insert = df_validos[[c for c in df_validos.columns if c in campos_validos]]
-
             pdvs = [PDV(**row) for row in df_insert.to_dict(orient="records")]
             inseridos = self.writer.inserir_pdvs(pdvs)
 

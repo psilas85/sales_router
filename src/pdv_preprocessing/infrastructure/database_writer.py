@@ -72,7 +72,7 @@ class DatabaseWriter:
                 p.pdv_lat,
                 p.pdv_lon,
                 p.status_geolocalizacao,
-                p.pdv_vendas,
+                float(p.pdv_vendas) if p.pdv_vendas is not None else None,
             )
             for p in lista_pdvs
         ]
