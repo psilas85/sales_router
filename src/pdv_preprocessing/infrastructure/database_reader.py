@@ -530,6 +530,7 @@ class DatabaseReader:
                     """
                     SELECT
                         id,
+                        mkp_id,                -- 👈 ESSENCIAL
                         tenant_id,
                         input_id,
                         cidade,
@@ -544,6 +545,7 @@ class DatabaseReader:
                         criado_em,
                         atualizado_em
                     FROM marketplace_cep
+
                     WHERE tenant_id = %s
                     AND input_id = %s
                     ORDER BY id ASC;

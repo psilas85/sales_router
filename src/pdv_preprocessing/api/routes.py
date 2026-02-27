@@ -507,6 +507,44 @@ def ver_mapa_pdv(
 
     return RedirectResponse(url=url_relativa, status_code=302)
 
+# ==========================================================
+# ❌ Excluir processamento completo (por input_id)
+# ==========================================================
+@router.delete(
+    "/processamentos/{input_id}",
+    dependencies=[Depends(verify_token)],
+    tags=["Jobs"],
+)
+def excluir_processamento(request: Request, input_id: str):
+    user = request.state.user
+    tenant_id = user["tenant_id"]
+
+    # 🔒 Permissão
+    if user.get("role") not in [
+        "sales_router_adm",
+        "tenant_adm",
+    ]:
+        raise HTTPException(status_code=403, detail="Sem permissão.")
+
+    writer = DatabaseWriter()
+
+    sucesso = writer.excluir_processamento_por_input(
+        tenant_id=tenant_id,
+        input_id=input_id,
+    )
+
+    if not sucesso:
+        raise HTTPException(
+            status_code=400,
+            detail="Processamento já vinculado a clusterização ou erro na exclusão.",
+        )
+
+    return {
+        "status": "success",
+        "tenant_id": tenant_id,
+        "input_id": input_id,
+        "message": "Processamento excluído com sucesso.",
+    }
 
 # ==========================================================
 # 📜 Listar últimos jobs de PDV (com paginação)

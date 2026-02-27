@@ -42,7 +42,6 @@ def retry_on_failure(max_retries=3, delay=1.0, backoff=2.0):
     return decorator
 
 
-
 class DatabaseWriter:
     def __init__(self):
         pass
@@ -116,6 +115,104 @@ class DatabaseWriter:
         finally:
             POOL.putconn(conn)
 
+    # ============================================================
+    # ❌ Excluir processamento completo (por input_id)
+    # ============================================================
+    @retry_on_failure()
+    def excluir_processamento_por_input(
+        self,
+        tenant_id: int,
+        input_id: str
+    ) -> bool:
+        """
+        Exclui todos os PDVs e histórico vinculados a um input_id,
+        desde que NÃO exista clusterização associada.
+        """
+
+        input_id = str(input_id)
+
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+
+                # ----------------------------------------------------
+                # 🔒 1. Verifica se já foi clusterizado
+                # ----------------------------------------------------
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM cluster_run
+                    WHERE tenant_id = %s
+                    AND input_id = %s
+                    LIMIT 1;
+                    """,
+                    (tenant_id, input_id)
+                )
+
+                if cur.fetchone():
+                    logging.warning(
+                        f"🚫 Exclusão bloqueada: input_id={input_id} "
+                        f"já vinculado a clusterização (tenant={tenant_id})"
+                    )
+                    return False
+
+                # ----------------------------------------------------
+                # 🗑 2. Exclui PDVs
+                # ----------------------------------------------------
+                cur.execute(
+                    """
+                    DELETE FROM pdvs
+                    WHERE tenant_id = %s
+                    AND input_id = %s;
+                    """,
+                    (tenant_id, input_id)
+                )
+                pdvs_excluidos = cur.rowcount
+
+                # ----------------------------------------------------
+                # 🗑 3. Exclui histórico
+                # ----------------------------------------------------
+                cur.execute(
+                    """
+                    DELETE FROM historico_pdv_jobs
+                    WHERE tenant_id = %s
+                    AND input_id = %s;
+                    """,
+                    (tenant_id, input_id)
+                )
+                historico_excluido = cur.rowcount
+
+            conn.commit()
+
+            # ----------------------------------------------------
+            # 📊 Logs
+            # ----------------------------------------------------
+            if pdvs_excluidos == 0 and historico_excluido == 0:
+                logging.warning(
+                    f"⚠️ Nenhum registro encontrado para exclusão "
+                    f"(tenant={tenant_id}, input_id={input_id})"
+                )
+            else:
+                logging.info(
+                    f"🗑 Processamento excluído com sucesso "
+                    f"(tenant={tenant_id}, input_id={input_id}) | "
+                    f"PDVs removidos={pdvs_excluidos} | "
+                    f"Histórico removido={historico_excluido}"
+                )
+
+            return True
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(
+                f"❌ Erro ao excluir processamento "
+                f"(tenant={tenant_id}, input_id={input_id}): {e}",
+                exc_info=True
+            )
+            return False
+
+        finally:
+            POOL.putconn(conn)
 
     # ============================================================
     # 🗺️ Inserção no cache de endereços (PDV e MKP unificado)
@@ -377,189 +474,11 @@ class DatabaseWriter:
         finally:
             POOL.putconn(conn)
 
-
-    # ============================================================
-    # 💾 Inserção de dados MKP agregados (versão final)
-    # ============================================================
-    @retry_on_failure()
-    def inserir_mkp(self, lista_mkp) -> int:
-        if not lista_mkp:
-            return 0
-
-        valores = []
-        vistos = set()
-
-        for m in lista_mkp:
-            cep = str(m.cep).zfill(8)
-            chave = (m.tenant_id, m.input_id, cep)
-
-            # evita repetir inserções
-            if chave in vistos:
-                continue
-            vistos.add(chave)
-
-            lat = getattr(m, "lat", None)
-            lon = getattr(m, "lon", None)
-
-            # -----------------------------------------------------------------
-            # ❌ BLOQUEIO TOTAL
-            # NÃO INSERIR NO DB se lat/lon forem nulos ou suspeitos
-            #  (pipeline já faz isso, mas aqui reforça o bloqueio)
-            # -----------------------------------------------------------------
-            if (
-                lat is None or lon is None or
-                coordenada_generica(lat, lon)
-            ):
-                continue  # <-- NÃO SALVA NO DB
-
-            valores.append((
-                m.tenant_id,
-                m.input_id,
-                m.descricao,
-                m.cidade,
-                m.uf,
-                m.bairro,
-                cep,
-                m.clientes_total,
-                m.clientes_target,
-                lat,
-                lon,
-                m.status_geolocalizacao,   # <-- CORREÇÃO
-            ))
-
-
-        if not valores:
-            logging.warning("⚠️ Nenhum MKP válido para inserir no marketplace_cep.")
-            return 0
-
-        sql = """
-            INSERT INTO marketplace_cep (
-                tenant_id, input_id, descricao, cidade, uf, bairro, cep,
-                clientes_total, clientes_target, lat, lon, status_geolocalizacao
-            )
-            VALUES %s
-
-            ON CONFLICT (tenant_id, input_id, cep)
-            DO UPDATE SET
-                clientes_total = EXCLUDED.clientes_total,
-                clientes_target = EXCLUDED.clientes_target,
-                -- só atualiza lat/lon se EXCLUDED tiver coordenadas boas
-                lat = COALESCE(EXCLUDED.lat, marketplace_cep.lat),
-                lon = COALESCE(EXCLUDED.lon, marketplace_cep.lon),
-                status_geolocalizacao = COALESCE(EXCLUDED.status_geolocalizacao, marketplace_cep.status_geolocalizacao),
-                atualizado_em = NOW()
-                ;
-        """
-
-        conn = POOL.getconn()
-        try:
-            with conn.cursor() as cur:
-                execute_values(cur, sql, valores)
-            conn.commit()
-            return len(valores)
-        except Exception as e:
-            conn.rollback()
-            logging.error(f"❌ Erro ao inserir marketplace_cep: {e}", exc_info=True)
-            return 0
-        finally:
-            POOL.putconn(conn)
-
-
-
-    # ============================================================
-    # 💾 Inserção individual no cache MKP
-    # ============================================================
-    # ============================================================
-    # 💾 Inserção individual no cache MKP
-    # ============================================================
-    @retry_on_failure()
-    def inserir_localizacao_mkp(self, cep: str, lat: float, lon: float) -> None:
-
-        if not cep or lat is None or lon is None:
-            return
-
-        # CEP corrigido e padronizado
-        cep = str(cep).replace("-", "").zfill(8)
-
-        # Não salvar coordenadas suspeitas
-        if coordenada_generica(lat, lon):
-            logging.warning(f"⚠️ Coordenada suspeita ignorada para CEP {cep}: {lat}, {lon}")
-            return
-
-        conn = POOL.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO mkp_enderecos_cache (cep, lat, lon)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (cep)
-                    DO UPDATE SET
-                        lat = EXCLUDED.lat,
-                        lon = EXCLUDED.lon,
-                        atualizado_em = NOW();
-                    """,
-                    (cep, lat, lon),
-                )
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            logging.error(f"❌ Erro ao inserir CEP no cache MKP: {e}", exc_info=True)
-        finally:
-            POOL.putconn(conn)
-
-
-
-    # ============================================================
-    # 🔄 Atualização de lat/lon de MKP via cache
-    # ============================================================
-    @retry_on_failure()
-    def atualizar_lat_lon_por_cache(
-        self,
-        tenant_id: Optional[int] = None,
-        uf: Optional[str] = None,
-        input_id: Optional[str] = None,
-    ) -> int:
-
-        conn = POOL.getconn()
-        try:
-            sql = """
-                UPDATE marketplace_cep AS m
-                SET lat = c.lat, lon = c.lon, atualizado_em = NOW()
-                FROM mkp_enderecos_cache AS c
-                WHERE m.cep = c.cep
-                AND (m.lat IS NULL OR m.lon IS NULL)
-                AND c.lat IS NOT NULL
-                AND c.lon IS NOT NULL
-            """
-
-            params = []
-            if tenant_id:
-                sql += " AND m.tenant_id = %s"; params.append(tenant_id)
-            if uf:
-                sql += " AND m.uf = %s"; params.append(uf)
-            if input_id:
-                sql += " AND m.input_id = %s"; params.append(input_id)
-
-            with conn.cursor() as cur:
-                cur.execute(sql, tuple(params))
-                afetados = cur.rowcount
-
-            conn.commit()
-            return afetados
-
-        except Exception as e:
-            conn.rollback()
-            logging.error(f"❌ Erro ao atualizar lat/lon a partir do cache: {e}", exc_info=True)
-            return 0
-        finally:
-            POOL.putconn(conn)
-
     @retry_on_failure()
     def salvar_historico_mkp_job(
         self,
         tenant_id: int,
-        job_id: str,
+        job_id: str | None,
         arquivo: str,
         status: str,
         total_processados: int,
@@ -573,6 +492,10 @@ class DatabaseWriter:
         descricao: str,
         input_id: str,
     ):
+        # 🔒 GARANTIA ABSOLUTA
+        if not job_id:
+            job_id = str(uuid.uuid4())
+
         query = """
             INSERT INTO historico_mkp_jobs (
                 tenant_id, job_id, arquivo, status,
@@ -608,34 +531,9 @@ class DatabaseWriter:
             POOL.putconn(conn)
 
 
-    def aplicar_cache_mkp_para_marketplace(self, tenant_id: int, input_id: str):
-        with get_connection_context() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE marketplace_cep mc
-                    SET lat = c.lat,
-                        lon = c.lon,
-                        status_geolocalizacao = 'geo_ok',
-                        atualizado_em = NOW()
-                    FROM mkp_enderecos_cache c
-                    WHERE mc.tenant_id = %s
-                    AND mc.input_id = %s
-                    AND mc.cep = c.cep
-                    AND c.lat IS NOT NULL
-                    AND c.lon IS NOT NULL;
-                    """,
-                    (tenant_id, input_id)
-                )
-                return cur.rowcount
-
-
+    
     @retry_on_failure()
     def marcar_falhas_mkp(self, tenant_id: int, input_id: str) -> int:
-        """
-        Marca CEPs como geo_fail em marketplace_cep onde lat/lon seguem NULL
-        mesmo após todas as tentativas assíncronas.
-        """
         with get_connection_context() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -645,26 +543,34 @@ class DatabaseWriter:
                         atualizado_em = NOW()
                     WHERE tenant_id = %s
                     AND input_id = %s
+                    AND status_geolocalizacao = 'pending'
                     AND (lat IS NULL OR lon IS NULL);
                     """,
                     (tenant_id, input_id)
                 )
-
                 return cur.rowcount
 
-    # ============================================================
-    # 💾 Atualizar marketplace_cep após geocodificação (workers)
-    # ============================================================
-    def atualizar_marketplace_coord(self, cep, lat, lon, status, tenant_id=None, input_id=None):
-        cep = str(cep).replace("-", "").zfill(8)
+
+    @retry_on_failure()
+    def atualizar_marketplace_coord(
+        self,
+        mkp_id: str,
+        lat: float,
+        lon: float,
+        status: str,
+        tenant_id: int,
+        input_id: str,
+    ):
+        if not mkp_id:
+            logging.warning("⚠️ atualizar_marketplace_coord chamado sem mkp_id")
+            return
 
         # proteção → nunca sobrescrever lat/lon inválidos (exceto geo_fail)
         if status != "geo_fail":
-            if (
-                lat is None or lon is None or
-                coordenada_generica(lat, lon)
-            ):
-                logging.warning(f"⚠️ Ignorando update inválido para CEP {cep} — lat/lon inválidos")
+            if lat is None or lon is None or coordenada_generica(lat, lon):
+                logging.warning(
+                    f"⚠️ Ignorando update inválido para MKP_ID {mkp_id} — lat/lon inválidos"
+                )
                 return
 
         sql = """
@@ -673,43 +579,70 @@ class DatabaseWriter:
                 lon = %s,
                 status_geolocalizacao = %s,
                 atualizado_em = NOW()
-            WHERE cep = %s
-            AND tenant_id = %s
+            WHERE tenant_id = %s
             AND input_id = %s
+            AND mkp_id = %s
         """
 
-        params = (lat, lon, status, cep, tenant_id, input_id)
+        params = (
+            lat,
+            lon,
+            status,
+            tenant_id,
+            str(input_id),
+            str(mkp_id),
+        )
 
         conn = POOL.getconn()
         try:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
+
+                if cur.rowcount == 0:
+                    logging.warning(
+                        f"⚠️ Nenhuma linha atualizada em marketplace_cep "
+                        f"(mkp_id={mkp_id}, tenant={tenant_id}, input_id={input_id})"
+                    )
+
             conn.commit()
+
         except Exception as e:
             conn.rollback()
-            logging.error(f"❌ Erro ao atualizar marketplace_cep: {e}")
+            logging.error(
+                f"❌ Erro ao atualizar marketplace_cep (mkp_id={mkp_id}): {e}",
+                exc_info=True,
+            )
+
         finally:
             POOL.putconn(conn)
 
-
-
-    # ============================================================
-    # 💾 Inserção de MKP sem geocodificação (corrigida)
-    # ============================================================
     @retry_on_failure()
-    def inserir_mkp_sem_geo(self, df_validos, tenant_id: int, input_id: str, descricao: str) -> int:
+    def inserir_mkp_sem_geo(
+        self,
+        df_validos,
+        tenant_id: int,
+        input_id: str,
+        descricao: str
+    ) -> int:
+
         if df_validos is None or df_validos.empty:
             return 0
 
         registros = {}
 
         for _, row in df_validos.iterrows():
+            mkp_id = row.get("mkp_id")
+            if not mkp_id:
+                continue  # blindagem
+
             cep = str(row.get("cep", "")).replace("-", "").zfill(8)
-            chave = (tenant_id, input_id, cep)
+
+            chave = (tenant_id, input_id, mkp_id)
 
             registros[chave] = (
                 tenant_id,
-                input_id,
+                str(input_id),
+                str(mkp_id),  # ← CONVERTE AQUI
                 descricao.strip()[:60],
                 row.get("cidade", "").strip().upper(),
                 row.get("uf", "").strip().upper(),
@@ -717,22 +650,34 @@ class DatabaseWriter:
                 cep,
                 int(row.get("clientes_total", 0)),
                 int(row.get("clientes_target", 0)),
-                None,     # RESET LAT
-                None,     # RESET LON
-                "pending" # RESET STATUS
+                None,
+                None,
+                "pending"
             )
 
+
         valores = list(registros.values())
+        if not valores:
+            return 0
 
         sql = """
             INSERT INTO marketplace_cep (
-                tenant_id, input_id, descricao,
-                cidade, uf, bairro, cep,
-                clientes_total, clientes_target,
-                lat, lon, status_geolocalizacao
+                tenant_id,
+                input_id,
+                mkp_id,
+                descricao,
+                cidade,
+                uf,
+                bairro,
+                cep,
+                clientes_total,
+                clientes_target,
+                lat,
+                lon,
+                status_geolocalizacao
             )
             VALUES %s
-            ON CONFLICT (tenant_id, input_id, cep)
+            ON CONFLICT (tenant_id, input_id, mkp_id)
             DO UPDATE SET
                 descricao = EXCLUDED.descricao,
                 cidade = EXCLUDED.cidade,
@@ -744,7 +689,8 @@ class DatabaseWriter:
                 lon = NULL,
                 status_geolocalizacao = 'pending',
                 atualizado_em = NOW();
-        """
+
+                    """
 
         conn = POOL.getconn()
         try:
@@ -755,7 +701,7 @@ class DatabaseWriter:
 
         except Exception as e:
             conn.rollback()
-            logging.error(f"❌ Erro ao inserir MKP sem geo: {e}", exc_info=True)
+            logging.error("❌ Erro ao inserir MKP sem geo", exc_info=True)
             return 0
 
         finally:
@@ -767,34 +713,45 @@ class DatabaseWriter:
     # 🗺️ Salvar resultado da geocodificação (padronizado)
     # ============================================================
     @retry_on_failure()
-    def salvar_geocode(self, cep: str, lat: float, lon: float, origem: str,
-                    tenant_id: int, input_id: str):
+    def salvar_geocode(
+        self,
+        mkp_id: str,
+        lat: float,
+        lon: float,
+        origem: str,
+        tenant_id: int,
+        input_id: str,
+    ):
+        status = "geo_fail" if origem == "geo_fail" else "ok"
 
-        cep = str(cep).replace("-", "").zfill(8)
+        if status != "geo_fail":
+            if lat is None or lon is None or coordenada_generica(lat, lon):
+                logging.warning(
+                    f"⚠️ salvar_geocode ignorado (lat/lon inválidos) mkp_id={mkp_id}"
+                )
+                return
 
-        # marketplace_cep
-        try:
-            with get_connection_context() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE marketplace_cep
-                        SET lat = %s,
-                            lon = %s,
-                            status_geolocalizacao = %s,
-                            atualizado_em = NOW()
-                        WHERE cep = %s
-                        AND tenant_id = %s
-                        AND input_id = %s;
-                        """,
-                        (lat, lon, origem, cep, tenant_id, input_id)
+        with get_connection_context() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE marketplace_cep
+                    SET lat = %s,
+                        lon = %s,
+                        status_geolocalizacao = %s,
+                        atualizado_em = NOW()
+                    WHERE tenant_id = %s
+                    AND input_id = %s
+                    AND mkp_id = %s;
+                    """,
+                    (lat, lon, status, tenant_id, input_id, mkp_id),
+                )
+
+                if cur.rowcount == 0:
+                    logging.warning(
+                        f"⚠️ salvar_geocode não atualizou nenhuma linha "
+                        f"(mkp_id={mkp_id}, tenant={tenant_id}, input={input_id})"
                     )
-        except Exception as e:
-            logging.error(f"❌ Erro ao salvar marketplace_cep: {e}")
-
-        # cache MKP
-        self.inserir_localizacao_mkp(cep, lat, lon)
-
 
     # ============================================================
     # 🔄 Buscar endereço no cache com base em lat/lon
@@ -1222,3 +1179,5 @@ class DatabaseWriter:
                 return row[0] if row else None
         finally:
             POOL.putconn(conn)
+
+    

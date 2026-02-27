@@ -62,10 +62,13 @@ class GeolocationService:
         }
         self.stats_lock = threading.Lock()
 
-        self.nominatim_url = os.getenv(
-            "NOMINATIM_LOCAL_URL", "http://172.31.45.41:8080"
-        )
-    
+        self.nominatim_url = os.getenv("NOMINATIM_LOCAL_URL")
+
+        if not self.nominatim_url:
+            raise RuntimeError(
+                "NOMINATIM_LOCAL_URL não configurado no ambiente"
+            )
+   
     
     # ============================================================
     # 🧭 NOMINATIM — ESTRUTURADO (street / city / state)

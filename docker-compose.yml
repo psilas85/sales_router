@@ -91,6 +91,7 @@ services:
     environment:
       - PYTHONPATH=/app/src
       - REDIS_URL=redis://redis:6379/0
+      - NOMINATIM_LOCAL_URL=${NOMINATIM_LOCAL_URL}
     depends_on:
       - redis
       - sales_router_db
@@ -330,15 +331,19 @@ services:
       sh -c "rq worker -u redis://redis:6379/0 routing_subjobs"
     restart: always
 
-  worker_mkp_base: &worker_mkp_base
+  
+  worker_mkp_master:
     build:
       context: .
       dockerfile: ./src/pdv_preprocessing/Dockerfile.mkp_worker
+    container_name: worker_mkp_master
     env_file:
       - .env
     environment:
       REDIS_URL: redis://redis:6379/0
       GMAPS_API_KEY: ${GMAPS_API_KEY}
+      NOMINATIM_LOCAL_URL: ${NOMINATIM_LOCAL_URL}
+      PYTHONPATH: /app/src
     depends_on:
       - redis
       - sales_router_db
@@ -348,32 +353,59 @@ services:
       - ./output:/app/output
     networks:
       - sales_router_net
+    command: >
+      rq worker -u redis://redis:6379/0 mkp_master
     restart: always
 
-  worker_mkp_1:
-    <<: *worker_mkp_base
-   
-    command: ["mkp_geocode"]
 
-  worker_mkp_2:
-    <<: *worker_mkp_base
-    
-    command: ["mkp_geocode"]
+  worker_mkp_geocode_1:
+    build:
+      context: .
+      dockerfile: ./src/pdv_preprocessing/Dockerfile.mkp_worker
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      GMAPS_API_KEY: ${GMAPS_API_KEY}
+      NOMINATIM_LOCAL_URL: ${NOMINATIM_LOCAL_URL}
+      PYTHONPATH: /app/src
+    depends_on:
+      - redis
+      - sales_router_db
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./output:/app/output
+    networks:
+      - sales_router_net
+    command: >
+      rq worker -u redis://redis:6379/0 mkp_geocode
+    restart: always
 
-  worker_mkp_3:
-    <<: *worker_mkp_base
-    
-    command: ["mkp_geocode"]
 
-  worker_mkp_master_finalize:
-    <<: *worker_mkp_base
-    container_name: worker_mkp_master_finalize
-    command: ["mkp_master_finalize"]
-
-  worker_mkp_master:
-    <<: *worker_mkp_base
-    container_name: worker_mkp_master
-    command: ["mkp_master"]
+  worker_mkp_geocode_2:
+    build:
+      context: .
+      dockerfile: ./src/pdv_preprocessing/Dockerfile.mkp_worker
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      GMAPS_API_KEY: ${GMAPS_API_KEY}
+      NOMINATIM_LOCAL_URL: ${NOMINATIM_LOCAL_URL}
+      PYTHONPATH: /app/src
+    depends_on:
+      - redis
+      - sales_router_db
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./output:/app/output
+    networks:
+      - sales_router_net
+    command: >
+      rq worker -u redis://redis:6379/0 mkp_geocode
+    restart: always
 
   sales_router_frontend:
     build:

@@ -1,7 +1,5 @@
-#sales_router/src/pdv_preprocessing/main_mkp_preprocessing.py
-
 # ============================================================
-# 📦 src/pdv_preprocessing/main_mkp_preprocessing.py (ASSÍNCRONO FINAL)
+# 📦 sales_router/src/pdv_preprocessing/main_mkp_preprocessing.py
 # ============================================================
 
 import os
@@ -9,7 +7,6 @@ import argparse
 import logging
 import uuid
 import json
-import time
 import pandas as pd
 from dotenv import load_dotenv
 from redis import Redis
@@ -19,10 +16,6 @@ from pdv_preprocessing.application.mkp_preprocessing_use_case import MKPPreproce
 from pdv_preprocessing.infrastructure.database_reader import DatabaseReader
 from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
 from pdv_preprocessing.logs.logging_config import setup_logging
-
-# novo master que orquestra job_geocode
-from pdv_preprocessing.jobs.job_master_mkp import job_master_mkp
-
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -52,13 +45,21 @@ def carregar_dataframe_inteligente(path: str, sep: str = ";"):
 # ------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Pré-processamento assíncrono de CEPs (Marketplace MKP)."
+        description="Pré-processamento de CEPs (Marketplace MKP)."
     )
     parser.add_argument("--tenant", required=True, help="Tenant ID (inteiro)")
     parser.add_argument("--arquivo", required=True, help="Caminho do arquivo (CSV/XLSX)")
     parser.add_argument("--descricao", required=True, help="Descrição do processamento")
+    parser.add_argument(
+        "--sync",
+        action="store_true",
+        help="Executa o job_master_mkp de forma síncrona (sem RQ)",
+    )
     args = parser.parse_args()
 
+    # ------------------------------------------------------------
+    # Validação tenant
+    # ------------------------------------------------------------
     try:
         tenant_id = int(args.tenant)
     except ValueError:
@@ -68,9 +69,15 @@ def main():
     descricao = args.descricao.strip()[:60]
     input_id = str(uuid.uuid4())
 
+    # 🔑 REGRA: modo sync → job_id = input_id
+    job_id = input_id
+
     setup_logging(tenant_id)
-    logging.info(f"🚀 Iniciando pré-processamento MKP (ASSÍNCRONO) | tenant={tenant_id}")
+
+    modo = "SÍNCRONO" if args.sync else "ASSÍNCRONO"
+    logging.info(f"🚀 Iniciando pré-processamento MKP ({modo}) | tenant={tenant_id}")
     logging.info(f"🆔 input_id={input_id}")
+    logging.info(f"🧾 job_id={job_id}")
     logging.info(f"📝 Descrição: {descricao}")
 
     input_path = args.arquivo
@@ -84,7 +91,7 @@ def main():
     sep = detectar_separador(input_path) if ext == ".csv" else None
 
     # ------------------------------------------------------------
-    #  Conexão com banco
+    # Conexão com banco
     # ------------------------------------------------------------
     try:
         db_reader = DatabaseReader()
@@ -104,7 +111,7 @@ def main():
             writer=None,
             tenant_id=tenant_id,
             input_id=input_id,
-            descricao=descricao
+            descricao=descricao,
         )
 
         df_validos, df_invalidos, _ = use_case.execute_df(df)
@@ -116,31 +123,34 @@ def main():
         logging.info(f"📌 {total_validos} válidos | {total_invalidos} inválidos")
 
         # ============================================================
-        # 2) Exportar inválidos se existirem
+        # 2) Exportar inválidos
         # ============================================================
         arquivo_invalidos = None
         if total_invalidos > 0:
             os.makedirs("output/invalidos", exist_ok=True)
             arquivo_invalidos = f"output/invalidos/invalidos_mkp_{tenant_id}_{input_id}.csv"
-            df_invalidos.to_csv(arquivo_invalidos, sep=";", index=False, encoding="utf-8-sig")
+            df_invalidos.to_csv(
+                arquivo_invalidos, sep=";", index=False, encoding="utf-8-sig"
+            )
 
         # ============================================================
-        # 3) Inserir apenas VÁLIDOS no marketplace_cep (lat/lon NULL)
+        # 3) Inserir VÁLIDOS no marketplace_cep (lat/lon NULL)
         # ============================================================
         inseridos = db_writer.inserir_mkp_sem_geo(
             df_validos,
             tenant_id,
             input_id,
-            descricao
+            descricao,
         )
-        logging.info(f"💾 {inseridos} registros inseridos no marketplace_cep (lat/lon NULL)")
+
+        logging.info(f"💾 {inseridos} registros inseridos no marketplace_cep")
 
         # ============================================================
-        # 4) Registrar histórico inicial
+        # 4) Histórico inicial (job_id NUNCA NULL)
         # ============================================================
         db_writer.salvar_historico_mkp_job(
             tenant_id=tenant_id,
-            job_id=input_id,
+            job_id=job_id,
             arquivo=arquivo_nome,
             status="processing",
             total_processados=total_processados,
@@ -148,7 +158,7 @@ def main():
             invalidos=total_invalidos,
             arquivo_invalidos=arquivo_invalidos,
             arquivo_validos=None,
-            mensagem="Processamento iniciado. Novo job master acionado.",
+            mensagem="Processamento iniciado. Job master será executado.",
             inseridos=inseridos,
             sobrescritos=0,
             descricao=descricao,
@@ -156,28 +166,50 @@ def main():
         )
 
         # ============================================================
-        # 5) Disparar job_master_mkp
+        # 5) Executar / enfileirar job_master_mkp
         # ============================================================
-        queue_master = Queue("mkp_master", connection=Redis(host="redis", port=6379))
-        queue_master.enqueue(job_master_mkp, tenant_id, input_id, descricao)
+        from pdv_preprocessing.jobs.job_master_mkp import job_master_mkp
 
-        logging.info("🧠 Novo job_master_mkp enfileirado com sucesso!")
+        if args.sync:
+            logging.info("⚠️ Executando job_master_mkp em modo SÍNCRONO")
+            job_master_mkp(
+                tenant_id=tenant_id,
+                input_id=input_id,
+                descricao=descricao,
+            )
+        else:
+            redis_conn = Redis(host="redis", port=6379)
+            queue = Queue("mkp_master", connection=redis_conn)
+
+            queue.enqueue(
+                job_master_mkp,
+                tenant_id,
+                input_id,
+                descricao,
+                job_timeout=36000,
+            )
+
+            logging.info("🚀 job_master_mkp enfileirado com sucesso")
 
         # ============================================================
-        # 6) Retorno JSON para CLI
+        # 6) Retorno CLI
         # ============================================================
-        print(json.dumps({
-            "status": "processing",
-            "tenant_id": tenant_id,
-            "input_id": input_id,
-            "descricao": descricao,
-            "arquivo": arquivo_nome,
-            "total_processados": total_processados,
-            "validos": total_validos,
-            "invalidos": total_invalidos,
-            "arquivo_invalidos": arquivo_invalidos,
-            "msg": "Novo job master MKP enfileirado"
-        }))
+        print(
+            json.dumps(
+                {
+                    "status": "processing",
+                    "tenant_id": tenant_id,
+                    "job_id": job_id,
+                    "input_id": input_id,
+                    "descricao": descricao,
+                    "arquivo": arquivo_nome,
+                    "total_processados": total_processados,
+                    "validos": total_validos,
+                    "invalidos": total_invalidos,
+                    "arquivo_invalidos": arquivo_invalidos,
+                }
+            )
+        )
 
     except Exception as e:
         logging.error(f"❌ Erro inesperado no main MKP: {e}", exc_info=True)
@@ -185,7 +217,7 @@ def main():
         try:
             db_writer.salvar_historico_mkp_job(
                 tenant_id=tenant_id,
-                job_id=input_id,
+                job_id=job_id,
                 arquivo=arquivo_nome,
                 status="error",
                 total_processados=0,
@@ -197,18 +229,23 @@ def main():
                 inseridos=0,
                 sobrescritos=0,
                 descricao=descricao,
-                input_id=input_id
+                input_id=input_id,
             )
-        except:
+        except Exception:
             pass
 
-        print(json.dumps({
-            "status": "error",
-            "erro": str(e),
-            "tenant_id": tenant_id,
-            "input_id": input_id,
-            "descricao": descricao
-        }))
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "erro": str(e),
+                    "tenant_id": tenant_id,
+                    "job_id": job_id,
+                    "input_id": input_id,
+                    "descricao": descricao,
+                }
+            )
+        )
 
 
 if __name__ == "__main__":

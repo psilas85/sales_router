@@ -1,681 +1,348 @@
 # ============================================================
-# 📦 src/pdv_preprocessing/domain/geolocation_service.py
+# 📦 src/pdv_preprocessing/domain/mkp_geolocation_service.py
 # ============================================================
 
 import os
+import re
 import time
 import requests
+import threading
+import unicodedata
 from loguru import logger
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from random import uniform
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple
+
 from pdv_preprocessing.infrastructure.database_reader import DatabaseReader
 from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
+from pdv_preprocessing.domain.address_normalizer import (
+    normalize_base,
+    normalize_for_cache,
+    normalize_for_geocoding,
+)
+from pdv_preprocessing.domain.capital_polygon_validator import ponto_dentro_capital
+from pdv_preprocessing.config.uf_bounds import UF_BOUNDS
 
 
-class GeolocationService:
+class MKPGeolocationService:
     """
-    Serviço de georreferenciamento unificado:
-      - Cache em memória e banco
-      - Fallback: Cache → Nominatim público → Google
-      - Execução paralela com retries e backoff
-      - Compatível com PDV e MKP
+    Serviço de geolocalização MKP — espelhado do PDV
+
+    Ordem:
+      1) Cache DB
+      2) Nominatim local estruturado
+      3) Nominatim local query livre
+      4) Google (opcional)
+      5) Falha
+
+    Regras:
+      • UF bounds SEMPRE
+      • Polígono SOMENTE se capital
+      • Capital definida pelo INPUT
     """
 
-    def __init__(self, reader: DatabaseReader, writer: DatabaseWriter, max_workers: int = 20):
+    def __init__(
+        self,
+        reader: DatabaseReader,
+        writer: DatabaseWriter,
+        max_workers: int = 20,
+        usar_google: bool = True,
+    ):
         self.reader = reader
         self.writer = writer
-        self.GOOGLE_KEY = os.getenv("GMAPS_API_KEY")
-        self.NOMINATIM_PUBLIC = "https://nominatim.openstreetmap.org/search"
-        self.timeout = 5
         self.max_workers = max_workers
+        self.usar_google = usar_google
 
-        # Cache e estatísticas de execução
-        self.cache_mem: Dict[str, Tuple[float, float]] = {}
+        self.GOOGLE_KEY = os.getenv("GMAPS_API_KEY") if usar_google else None
+        self.nominatim_url = os.getenv("NOMINATIM_LOCAL_URL")
+
+        if not self.nominatim_url:
+            raise RuntimeError("NOMINATIM_LOCAL_URL não configurado")
+
+        self.timeout = 5
+        self.headers = {"User-Agent": "SalesRouter/MKP-LocalGeocoder"}
+
         self.stats = {
-            "cache_mem": 0,
             "cache_db": 0,
-            "nominatim_public": 0,
+            "nominatim_local": 0,
             "google": 0,
             "falha": 0,
             "total": 0,
         }
+        self.stats_lock = threading.Lock()
 
     # ============================================================
-    # 🧭 Coordenadas genéricas conhecidas (para descartar)
+    # 🧼 Utils
     # ============================================================
+
+    @staticmethod
+    def _to_ascii_upper(txt: Optional[str]) -> Optional[str]:
+        if not txt:
+            return None
+        txt = unicodedata.normalize("NFKD", txt)
+        txt = "".join(c for c in txt if not unicodedata.combining(c))
+        return txt.upper().strip()
+
+    def _dentro_uf_bounds(self, lat: float, lon: float, uf: Optional[str]) -> bool:
+        if lat is None or lon is None or not uf:
+            return False
+        uf = uf.strip().upper()
+        bounds = UF_BOUNDS.get(uf)
+        if not bounds:
+            return False
+        return (
+            bounds["lat_min"] <= lat <= bounds["lat_max"]
+            and bounds["lon_min"] <= lon <= bounds["lon_max"]
+        )
+
     @staticmethod
     def _is_generic_location(lat: float, lon: float) -> bool:
-        if lat is None or lon is None:
-            return True
         pontos_genericos = [
-            (-23.5506507, -46.6333824),  # São Paulo
-            (-22.908333, -43.196388),    # Rio de Janeiro
-            (-15.7801, -47.9292),        # Brasília
-            (-19.9167, -43.9345),        # Belo Horizonte
+            (-23.5506507, -46.6333824),
+            (-22.908333, -43.196388),
+            (-15.7801, -47.9292),
+            (-19.9167, -43.9345),
         ]
-        for ref_lat, ref_lon in pontos_genericos:
-            if abs(lat - ref_lat) < 0.0005 and abs(lon - ref_lon) < 0.0005:
-                return True
-        return False
-
-    # ============================================================
-    # 🌍 Busca coordenadas com fallback inteligente
-    # ============================================================
-    def buscar_coordenadas(self, endereco: Optional[str], cep: Optional[str] = None) -> Tuple[Optional[float], Optional[float], str]:
-        if not endereco and not cep:
-            logger.warning("⚠️ Chamada de geocodificação com parâmetros vazios.")
-            return None, None, "parametro_vazio"
-
-        query = (cep or endereco).strip().lower()
-        self.stats["total"] += 1
-
-        # ============================================================
-        # 1️⃣ Cache em memória
-        # ============================================================
-        if query in self.cache_mem:
-            lat, lon = self.cache_mem[query]
-            self.stats["cache_mem"] += 1
-            logger.debug(f"📦 [CACHE_MEM] {query} → ({lat}, {lon})")
-            return lat, lon, "cache_mem"
-
-        # ============================================================
-        # 2️⃣ Cache no banco
-        # ============================================================
-        try:
-            cache_db = self.reader.buscar_localizacao(endereco) if endereco else self.reader.buscar_localizacao_mkp(cep)
-            if cache_db:
-                lat, lon = cache_db
-                self.stats["cache_db"] += 1
-                self.cache_mem[query] = (lat, lon)
-                logger.debug(f"🗄️ [CACHE_DB] {query} → ({lat}, {lon})")
-                return lat, lon, "cache_db"
-        except Exception as e:
-            logger.warning(f"⚠️ Erro ao consultar cache DB: {e}")
-
-        # ============================================================
-        # 🚦 Modo Google temporário (se limite Nominatim excedido)
-        # ============================================================
-        now = time.time()
-        modo_google_ativo = getattr(self, "_modo_google_ativo_ate", 0) > now
-
-        # ============================================================
-        # 3️⃣ Nominatim público (modo normal)
-        # ============================================================
-        if not modo_google_ativo:
-            headers = {"User-Agent": "SalesRouter-Geocoder/1.0"}
-            url_pub = f"{self.NOMINATIM_PUBLIC}?q={query}+Brasil&countrycodes=br&format=json"
-
-            for tent in range(3):
-                try:
-                    r = requests.get(url_pub, headers=headers, timeout=self.timeout)
-                    if r.status_code == 200:
-                        dados = r.json()
-                        if isinstance(dados, list) and len(dados) > 0:
-                            lat, lon = float(dados[0]["lat"]), float(dados[0]["lon"])
-                            if not self._is_generic_location(lat, lon):
-                                self.stats["nominatim_public"] += 1
-                                self.cache_mem[query] = (lat, lon)
-                                self.writer.salvar_cache(endereco or cep, lat, lon, tipo="mkp" if cep else "pdv")
-                                logger.debug(f"🌍 [NOMINATIM] {query} → ({lat}, {lon})")
-                                return lat, lon, "nominatim_public"
-                            else:
-                                logger.warning(f"⚠️ Coordenada genérica descartada: {query} → ({lat}, {lon})")
-
-                    elif r.status_code == 429:
-                        logger.warning("🚦 Nominatim atingiu limite → mudando para modo Google (2 min).")
-                        self._modo_google_ativo_ate = now + 120
-                        modo_google_ativo = True
-                        break
-                except Exception as e:
-                    logger.warning(f"⚠️ Tentativa {tent+1}/3 falhou no Nominatim → {e}")
-                    if "Network is unreachable" in str(e) or "Max retries" in str(e):
-                        self._modo_google_ativo_ate = now + 120
-                        modo_google_ativo = True
-                        break
-                time.sleep(0.8 * (2 ** tent) + uniform(0, 0.3))
-
-        # ============================================================
-        # 4️⃣ Google Maps fallback
-        # ============================================================
-        if modo_google_ativo and self.GOOGLE_KEY:
-            from urllib.parse import quote
-            url_google = (
-                f"https://maps.googleapis.com/maps/api/geocode/json?"
-                f"address={quote(query+', Brasil')}&key={self.GOOGLE_KEY}"
-            )
-            try:
-                r = requests.get(url_google, timeout=self.timeout)
-                if r.status_code == 200:
-                    dados = r.json()
-                    if dados.get("status") == "OK" and dados.get("results"):
-                        loc = dados["results"][0]["geometry"]["location"]
-                        lat, lon = loc["lat"], loc["lng"]
-                        if not self._is_generic_location(lat, lon):
-                            self.stats["google"] += 1
-                            self.cache_mem[query] = (lat, lon)
-                            self.writer.salvar_cache(endereco or cep, lat, lon, tipo="mkp" if cep else "pdv")
-                            logger.debug(f"🗺️ [GOOGLE] {query} → ({lat}, {lon})")
-                            return lat, lon, "google"
-            except Exception as e:
-                logger.warning(f"⚠️ Falha no Google Maps → {e}")
-
-        # ============================================================
-        # ❌ Nenhum resultado
-        # ============================================================
-        self.stats["falha"] += 1
-        logger.warning(f"💀 Nenhuma coordenada encontrada para '{query}' após 3 tentativas.")
-        return None, None, "falha"
-
-    # ============================================================
-    # ⚡ Geocodificação em lote (multithread + adaptativa)
-    # ============================================================
-    def geocodificar_em_lote(self, entradas: List[str], tipo: str = "PDV") -> Dict[str, Tuple[float, float, str]]:
-        if not entradas:
-            return {}
-
-        total = len(entradas)
-        max_workers = min(self.max_workers, 10 if total < 1000 else 25 if total < 3000 else 40)
-        inicio_total = time.time()
-        resultados = {}
-
-        logger.info(f"🚀 Geocodificação em lote ({tipo}) iniciada: {total} registros | {max_workers} threads")
-
-        def _worker(e):
-            time.sleep(uniform(0.05, 0.2))  # Distribui carga
-            return self.buscar_coordenadas(e if tipo == "PDV" else None, e if tipo == "MKP" else None)
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futuros = {executor.submit(_worker, e): e for e in entradas}
-
-            for i, futuro in enumerate(as_completed(futuros), 1):
-                chave = futuros[futuro]
-                try:
-                    coords = futuro.result()
-                    if coords:
-                        resultados[chave] = coords
-                except Exception as e:
-                    logger.warning(f"⚠️ Erro geocodificando {chave}: {e}")
-
-                if i % 200 == 0 or i == total:
-                    resolvidos = len(resultados)
-                    falhas = self.stats["falha"]
-                    logger.info(
-                        f"🧩 Progresso: {i}/{total} ({100 * i / total:.1f}%) "
-                        f"→ {resolvidos} resolvidos | {falhas} falhas"
-                    )
-                    if falhas / max(1, i) > 0.1:
-                        logger.warning("⚠️ Muitas falhas recentes — aplicando pausa preventiva (3s)...")
-                        time.sleep(3)
-
-        dur = time.time() - inicio_total
-        taxa_ok = (len(resultados) / total * 100) if total else 0
-        logger.info(
-            f"✅ Concluído: {len(resultados)}/{total} resolvidos ({taxa_ok:.1f}%) em {dur:.1f}s "
-            f"→ média {dur / total:.2f}s/reg"
+        return any(
+            abs(lat - rlat) < 0.0005 and abs(lon - rlon) < 0.0005
+            for rlat, rlon in pontos_genericos
         )
-        return resultados
 
     # ============================================================
-    # 📊 Resumo de logs
+    # 🏛️ Capitais
     # ============================================================
-    def exibir_resumo_logs(self):
-        total = self.stats["total"]
-        logger.info("📊 Resumo de Geolocalização:")
-        for origem, count in self.stats.items():
-            if origem != "total":
-                pct = (count / total * 100) if total else 0
-                logger.info(f"   {origem:<18}: {count:>6} ({pct:5.1f}%)")
-        logger.info(f"   total               : {total:>6}")
 
-        sucesso = total - self.stats["falha"]
-        taxa = (sucesso / total * 100) if total else 0
-        logger.info(f"✅ Taxa de sucesso: {sucesso}/{total} ({taxa:.1f}%)")
+    _CAPITAIS = {
+        ("RIO BRANCO","AC"),("MACEIO","AL"),("MANAUS","AM"),("MACAPA","AP"),
+        ("SALVADOR","BA"),("FORTALEZA","CE"),("BRASILIA","DF"),("VITORIA","ES"),
+        ("GOIANIA","GO"),("SAO LUIS","MA"),("BELO HORIZONTE","MG"),
+        ("CAMPO GRANDE","MS"),("CUIABA","MT"),("BELEM","PA"),
+        ("JOAO PESSOA","PB"),("RECIFE","PE"),("TERESINA","PI"),
+        ("CURITIBA","PR"),("RIO DE JANEIRO","RJ"),("NATAL","RN"),
+        ("PORTO VELHO","RO"),("BOA VISTA","RR"),("PORTO ALEGRE","RS"),
+        ("FLORIANOPOLIS","SC"),("ARACAJU","SE"),("SAO PAULO","SP"),
+        ("PALMAS","TO"),
+    }
 
-
-
-
-
-
-
-
-#sales_router/src/pdv_preprocessing/domain/geolocation_service.py
-
-# ============================================================
-# 📦 src/pdv_preprocessing/domain/geolocation_service.py
-# ============================================================
-
-import os
-import time
-import requests
-from loguru import logger
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from random import uniform
-from typing import Optional, Tuple, Dict, List
-from pdv_preprocessing.infrastructure.database_reader import DatabaseReader
-from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
-from pdv_preprocessing.domain.utils_geo import coordenada_generica, cep_invalido
-from geopy.distance import geodesic
-
-# ============================================================
-# 🆕 ViaCEP – fallback para CEP sem logradouro
-# ============================================================
-def tentar_inferir_endereco_via_cep(cep: str) -> Optional[str]:
-    try:
-        url = f"https://viacep.com.br/ws/{cep}/json/"
-        r = requests.get(url, timeout=5)
-
-        if r.status_code != 200:
-            return None
-
-        data = r.json()
-        if data.get("erro"):
-            return None
-
-        cidade = data.get("localidade")
-        uf = data.get("uf")
-        bairro = data.get("bairro")
-
-        if not cidade or not uf:
-            return None
-
-        if bairro:
-            return f"{bairro}, {cidade} - {uf}, Brasil"
-        return f"{cidade} - {uf}, Brasil"
-
-    except Exception:
-        return None
-
-
-# ============================================================
-# 🔍 Detecta coordenadas suspeitas (fallback Nominatim / Google)
-# ============================================================
-def coordenada_suspeita(lat, lon):
-    fallback_nominatim = (-21.993173, -47.3333435)
-    if geodesic((lat, lon), fallback_nominatim).km < 5:
-        return True
-
-    fallback_google = (-14.235004, -51.92528)
-    if geodesic((lat, lon), fallback_google).km < 50:
-        return True
-
-    return False
-
-
-# ============================================================
-# 🌎 GeolocationService
-# ============================================================
-class GeolocationService:
-
-    def __init__(self, reader: DatabaseReader, writer: DatabaseWriter, max_workers: int = 20):
-        self.reader = reader
-        self.writer = writer
-        self.GOOGLE_KEY = os.getenv("GMAPS_API_KEY")
-        self.NOMINATIM_PUBLIC = "https://nominatim.openstreetmap.org/search"
-        self.timeout = 5
-        self.max_workers = max_workers
-
-        # Cache em memória
-        self.cache_mem: Dict[str, Tuple[float, float]] = {}
-
-        # Stats
-        self.stats = {
-            "cache_mem": 0,
-            "cache_db": 0,
-            "nominatim_public": 0,
-            "google": 0,
-            "falha": 0,
-            "total": 0,
-        }
+    def is_capital(self, city: Optional[str], state: Optional[str]) -> bool:
+        city = self._to_ascii_upper(city)
+        state = self._to_ascii_upper(state)
+        return (city, state) in self._CAPITAIS if city and state else False
 
     # ============================================================
-    # 🔍 Buscar coordenadas (PDV ou MKP)
+    # 🔎 Extrai cidade / UF do endereço
     # ============================================================
+
+    @staticmethod
+    def _extrair_cidade_uf(endereco: str) -> Tuple[Optional[str], Optional[str]]:
+        m = re.search(r",\s*([^,]+?)\s*-\s*([A-Za-z]{2})\s*(?:,|$)", endereco)
+        if not m:
+            return None, None
+        return m.group(1).strip().upper(), m.group(2).strip().upper()
+
+    # ============================================================
+    # 🧭 NOMINATIM estruturado
+    # ============================================================
+
+    def _buscar_nominatim_estruturado(
+        self, endereco_normalizado: str
+    ) -> Tuple[Optional[float], Optional[float]]:
+
+        try:
+            city, state = self._extrair_cidade_uf(endereco_normalizado)
+            if not city or not state:
+                return None, None
+
+            street_part = endereco_normalizado.split(f", {city} - {state}")[0]
+            street_first = street_part.split(",")[0].strip()
+
+            streets = [
+                street_first,
+                re.sub(r"\b\d+\b", "", street_first).strip(),
+            ]
+
+            for street in streets:
+                if not street:
+                    continue
+
+                r = requests.get(
+                    f"{self.nominatim_url}/search",
+                    params={
+                        "street": street,
+                        "city": city,
+                        "state": state,
+                        "country": "Brazil",
+                        "format": "json",
+                        "limit": 1,
+                    },
+                    headers=self.headers,
+                    timeout=self.timeout,
+                )
+
+                if r.status_code != 200:
+                    continue
+
+                data = r.json()
+                if data:
+                    lat = float(data[0]["lat"])
+                    lon = float(data[0]["lon"])
+                    if not self._is_generic_location(lat, lon):
+                        return lat, lon
+
+        except Exception as e:
+            logger.warning(f"[MKP][NOMINATIM_STRUCT][ERRO] {e}", exc_info=True)
+
+        return None, None
+
+    # ============================================================
+    # 🔍 NOMINATIM query livre
+    # ============================================================
+
+    def _buscar_nominatim_query(
+        self, endereco_normalizado: str
+    ) -> Tuple[Optional[float], Optional[float]]:
+
+        try:
+            r = requests.get(
+                f"{self.nominatim_url}/search",
+                params={"q": endereco_normalizado, "format": "json", "limit": 1},
+                headers=self.headers,
+                timeout=self.timeout,
+            )
+
+            if r.status_code != 200:
+                return None, None
+
+            data = r.json()
+            if not data:
+                return None, None
+
+            lat = float(data[0]["lat"])
+            lon = float(data[0]["lon"])
+
+            if self._is_generic_location(lat, lon):
+                return None, None
+
+            return lat, lon
+
+        except Exception as e:
+            logger.warning(f"[MKP][NOMINATIM_Q][ERRO] {e}", exc_info=True)
+            return None, None
+
+    # ============================================================
+    # 🌍 Busca principal
+    # ============================================================
+
     def buscar_coordenadas(
         self,
         endereco: Optional[str],
-        cep: Optional[str] = None
+        cep: Optional[str] = None,
     ) -> Tuple[Optional[float], Optional[float], str]:
 
-        if not endereco and not cep:
+        if not endereco or not endereco.strip():
+            self.stats["falha"] += 1
             return None, None, "parametro_vazio"
 
-        query_original = cep or endereco
-        query = query_original.strip().lower()
-        self.stats["total"] += 1
+        raw = endereco.strip()
+        base = normalize_base(raw)
+        normalizado = normalize_for_geocoding(base)
+        cache_key = normalize_for_cache(base)
 
-        logger.info(f"🔎 [GEO] Iniciando busca p/ '{query_original}'")
+        cidade, uf = self._extrair_cidade_uf(normalizado)
 
-        # ------------------------------------------------------------
-        # 0️⃣ CEP inválido por regra interna
-        # ------------------------------------------------------------
-        cep_clean = None
-        if cep:
-            cep_clean = cep.replace("-", "").strip().zfill(8)
-            if cep_invalido(cep_clean):
-                logger.warning(f"🚫 CEP inválido: {cep_clean}")
-                return None, None, "cep_invalido"
+        with self.stats_lock:
+            self.stats["total"] += 1
 
-        # ------------------------------------------------------------
-        # 1️⃣ CACHE EM MEMÓRIA
-        # ------------------------------------------------------------
-        if query in self.cache_mem:
-            lat, lon = self.cache_mem[query]
-            return lat, lon, "cache_mem"
-
-        # ------------------------------------------------------------
-        # 2️⃣ CACHE NO BANCO
-        # ------------------------------------------------------------
-        try:
-            if endereco:
-                cache_db = self.reader.buscar_localizacao(endereco)
-            else:
-                cache_db = self.reader.buscar_localizacao_mkp(cep_clean)
-
-            if cache_db:
-                lat, lon = cache_db
-                if not (coordenada_generica(lat, lon) or coordenada_suspeita(lat, lon)):
-                    self.cache_mem[query] = (lat, lon)
+        # ========================================================
+        # 1) CACHE
+        # ========================================================
+        cache = self.reader.buscar_localizacao(cache_key)
+        if cache:
+            lat, lon = cache
+            if self._dentro_uf_bounds(lat, lon, uf):
+                if self.is_capital(cidade, uf):
+                    if ponto_dentro_capital(lat, lon, cidade, uf):
+                        self.stats["cache_db"] += 1
+                        return lat, lon, "cache_db"
+                else:
+                    self.stats["cache_db"] += 1
                     return lat, lon, "cache_db"
-        except:
-            pass
 
-        # ------------------------------------------------------------
-        # 3️⃣ GOOGLE
-        # ------------------------------------------------------------
-        if cep_clean:
-            url_google = (
-                "https://maps.googleapis.com/maps/api/geocode/json?"
-                f"components=postal_code:{cep_clean}|country:BR&key={self.GOOGLE_KEY}"
-            )
+        # ========================================================
+        # 2) NOMINATIM estruturado
+        # ========================================================
+        lat, lon = self._buscar_nominatim_estruturado(normalizado)
+        if lat is not None and lon is not None:
+            if self._dentro_uf_bounds(lat, lon, uf):
+                if self.is_capital(cidade, uf):
+                    if ponto_dentro_capital(lat, lon, cidade, uf):
+                        self.writer.salvar_cache(cache_key, lat, lon, "nominatim_struct")
+                        self.stats["nominatim_local"] += 1
+                        return lat, lon, "nominatim_struct"
+                else:
+                    self.writer.salvar_cache(cache_key, lat, lon, "nominatim_struct")
+                    self.stats["nominatim_local"] += 1
+                    return lat, lon, "nominatim_struct"
 
-            try:
-                r = requests.get(url_google, timeout=self.timeout)
-                dados = r.json()
-                status = dados.get("status", "")
-
-                # ✔ encontrou coordenada
-                if status == "OK":
-                    loc = dados["results"][0]["geometry"]["location"]
-                    lat, lon = loc["lat"], loc["lng"]
-
-                    if not (coordenada_generica(lat, lon) or coordenada_suspeita(lat, lon)):
-                        self.writer.salvar_cache(cep_clean, lat, lon, tipo="mkp", fonte="google")
-                        self.cache_mem[query] = (lat, lon)
-                        return lat, lon, "google"
-
-                # 🚨 ZERO_RESULTS → handled no pipeline de lote
-                if status == "ZERO_RESULTS":
-                    logger.warning(f"🗺️ [GOOGLE] ZERO_RESULTS p/ {cep_clean}")
-                    return None, None, "google_zero"
-
-            except:
-                pass
-
-        return None, None, "falha"
-
-
-    
-    # ============================================================
-    # ⚡ Geocodificação em lote (MKP + PDV)
-    # ============================================================
-    def geocodificar_em_lote(self, entradas: List[str], tipo: str = "PDV") \
-            -> Dict[str, Tuple[float, float, str]]:
-
-        if not entradas:
-            return {}
-
-        total = len(entradas)
-        max_workers = min(self.max_workers, 40)
-        inicio_total = time.time()
-        resultados = {}
-
-        logger.info(
-            f"🚀 Geocodificação em lote ({tipo}) iniciada — "
-            f"{total} registros | {max_workers} threads"
-        )
-
-        headers = {"User-Agent": "SalesRouter-Geocoder/1.0"}
-
-
-        # ============================================================
-        # THREAD WORKER
-        # ============================================================
-        def _worker(e):
-            time.sleep(uniform(0.01, 0.03))
-            cep_clean = e.replace("-", "").strip().zfill(8)
-
-            # ========================================================
-            # 1️⃣ PRIMEIRA TENTATIVA — buscar_coordenadas()
-            #    (cache → banco → Google)
-            # ========================================================
-            try:
-                lat, lon, origem = self.buscar_coordenadas(
-                    e if tipo == "PDV" else None,
-                    e if tipo == "MKP" else None
-                )
-
-                # ✔ sucesso direto
-                if lat is not None and lon is not None:
-                    return lat, lon, origem
-
-                # 🚨 ZERO_RESULTS → parte 2/4 termina aqui
-                # ViaCEP será executado na PARTE 3/4
-                if origem == "google_zero":
-                    # devolve sinal especial para parte 3
-                    return None, None, "google_zero"
-
-            except Exception:
-                pass
-
-            # ========================================================
-            # 2️⃣ NOMINATIM POSTAL (somente MKP)
-            # ========================================================
-            if tipo == "MKP":
-                try:
-                    url_postal = (
-                        f"{self.NOMINATIM_PUBLIC}"
-                        f"?postalcode={cep_clean}&country=br"
-                        f"&format=json&addressdetails=1"
-                    )
-
-                    r = requests.get(url_postal, headers=headers, timeout=self.timeout)
-
-                    if r.status_code == 200 and r.json():
-                        lat = float(r.json()[0]["lat"])
-                        lon = float(r.json()[0]["lon"])
-
-                        if not (coordenada_generica(lat, lon) or coordenada_suspeita(lat, lon)):
-                            self.writer.salvar_cache(
-                                cep_clean, lat, lon,
-                                tipo="mkp",
-                                fonte="nominatim_postal"
-                            )
-                            return lat, lon, "nominatim_postal"
-                except:
-                    pass
-
-            # ========================================================
-            # 3️⃣ NOMINATIM FULL
-            # ========================================================
-            try:
-                url_q = (
-                    f"{self.NOMINATIM_PUBLIC}?"
-                    f"q={e} Brasil&countrycodes=br"
-                    f"&format=json&addressdetails=1"
-                )
-
-                r = requests.get(url_q, headers=headers, timeout=self.timeout)
-
-                if r.status_code == 200 and r.json():
-                    lat = float(r.json()[0]["lat"])
-                    lon = float(r.json()[0]["lon"])
-
-                    if not (coordenada_generica(lat, lon) or coordenada_suspeita(lat, lon)):
-                        self.writer.salvar_cache(
-                            cep_clean, lat, lon,
-                            tipo="mkp",
-                            fonte="nominatim_q"
-                        )
+        # ========================================================
+        # 3) NOMINATIM query
+        # ========================================================
+        lat, lon = self._buscar_nominatim_query(normalizado)
+        if lat is not None and lon is not None:
+            if self._dentro_uf_bounds(lat, lon, uf):
+                if self.is_capital(cidade, uf):
+                    if ponto_dentro_capital(lat, lon, cidade, uf):
+                        self.writer.salvar_cache(cache_key, lat, lon, "nominatim_q")
+                        self.stats["nominatim_local"] += 1
                         return lat, lon, "nominatim_q"
-            except:
-                pass
-            # ========================================================
-            # 4️⃣ GOOGLE FINAL (antes de tentar ViaCEP)
-            #    Só prepara a estrutura, mas o ViaCEP verdadeiro
-            #    será executado abaixo, caso google_zero
-            # ========================================================
-            # (nada aqui — continuamos abaixo)
+                else:
+                    self.writer.salvar_cache(cache_key, lat, lon, "nominatim_q")
+                    self.stats["nominatim_local"] += 1
+                    return lat, lon, "nominatim_q"
 
-
-            # ========================================================
-            # 🟡 5️⃣ VIA_CEP — Fallback após ZERO_RESULTS no Google
-            # ========================================================
-            # Só executamos ViaCEP se a PARTE 2 retornou "google_zero"
-            if True:  # executa sempre que chegar aqui
-                # Se a parte 2 NÃO retornou google_zero, seguimos.
-                # Mas se retornou "google_zero", lat/lon/resultado foram:
-                # (None, None, "google_zero")
-                try:
-                    # Verifica explicitamente se a primeira parte sinalizou google_zero
-                    lat0, lon0, status0 = self.buscar_coordenadas(
-                        None if tipo == "MKP" else e,
-                        e if tipo == "MKP" else None
-                    )
-                    is_zero = (status0 == "google_zero")
-                except:
-                    is_zero = False
-
-                if is_zero:
-                    endereco_inf = tentar_inferir_endereco_via_cep(cep_clean)
-
-                    if endereco_inf:
-                        logger.info(f"🟡 [VIA_CEP] Endereço inferido para {cep_clean}: {endereco_inf}")
-
-                        try:
-                            url_inf = (
-                                f"{self.NOMINATIM_PUBLIC}?q={endereco_inf}"
-                                f"&format=json&addressdetails=1&countrycodes=br"
-                            )
-
-                            r_inf = requests.get(url_inf, timeout=self.timeout)
-
-                            if r_inf.status_code == 200 and r_inf.json():
-                                dados_inf = r_inf.json()[0]
-
-                                lat = float(dados_inf["lat"])
-                                lon = float(dados_inf["lon"])
-
-                                # pequena aleatorização para quebrar pontos sobrepostos
-                                lat += uniform(-0.00025, 0.00025)
-                                lon += uniform(-0.00025, 0.00025)
-
-                                if not (
-                                    coordenada_generica(lat, lon)
-                                    or coordenada_suspeita(lat, lon)
-                                ):
-                                    # grava no cache
-                                    self.writer.salvar_cache(
-                                        cep_clean, lat, lon,
-                                        tipo="mkp",
-                                        fonte="via_cep_inferido"
-                                    )
-                                    return lat, lon, "via_cep_inferido"
-
-                        except Exception as ex_vc:
-                            logger.warning(f"⚠️ Erro no ViaCEP fallback ({cep_clean}): {ex_vc}")
-
-
-            # ========================================================
-            # 6️⃣ GOOGLE — fallback FINAL
-            # ========================================================
-            if self.GOOGLE_KEY:
-                try:
-                    url_google = (
-                        "https://maps.googleapis.com/maps/api/geocode/json?"
-                        f"components=postal_code:{cep_clean}|country:BR&key={self.GOOGLE_KEY}"
-                    )
-
-                    r = requests.get(url_google, timeout=self.timeout)
-                    dados = r.json()
-
-                    if dados.get("status") == "OK":
-                        loc = dados["results"][0]["geometry"]["location"]
+        # ========================================================
+        # 4) GOOGLE
+        # ========================================================
+        if self.usar_google and self.GOOGLE_KEY:
+            logger.info("[MKP][GOOGLE][CALLED]")
+            try:
+                from urllib.parse import quote
+                url = (
+                    "https://maps.googleapis.com/maps/api/geocode/json?"
+                    f"address={quote(normalizado)}&key={self.GOOGLE_KEY}"
+                )
+                r = requests.get(url, timeout=self.timeout)
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("status") == "OK":
+                        loc = data["results"][0]["geometry"]["location"]
                         lat, lon = loc["lat"], loc["lng"]
 
-                        if not (coordenada_generica(lat, lon) or coordenada_suspeita(lat, lon)):
-                            self.writer.salvar_cache(
-                                cep_clean, lat, lon,
-                                tipo="mkp",
-                                fonte="google_fallback"
-                            )
-                            return lat, lon, "google"
+                        if self._dentro_uf_bounds(lat, lon, uf):
+                            if self.is_capital(cidade, uf):
+                                if ponto_dentro_capital(lat, lon, cidade, uf):
+                                    self.writer.salvar_cache(cache_key, lat, lon, "google")
+                                    self.stats["google"] += 1
+                                    return lat, lon, "google"
+                            else:
+                                self.writer.salvar_cache(cache_key, lat, lon, "google")
+                                self.stats["google"] += 1
+                                return lat, lon, "google"
+            except Exception as e:
+                logger.error(f"[MKP][GOOGLE][ERRO] {e}", exc_info=True)
 
-                except Exception as ex_g:
-                    logger.warning(f"⚠️ Erro fallback Google final ({cep_clean}): {ex_g}")
-
-            # ========================================================
-            # 7️⃣ FALHA TOTAL
-            # ========================================================
-            return None, None, "falha"
-
-
-            # ============================================================
-        # EXECUÇÃO PARALELA
-        # ============================================================
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futuros = {executor.submit(_worker, e): e for e in entradas}
-
-            for i, futuro in enumerate(as_completed(futuros), 1):
-                chave = futuros[futuro]
-
-                try:
-                    lat, lon, origem = futuro.result()
-
-                    if origem == "cep_invalido":
-                        resultados[chave] = (None, None, "cep_invalido")
-                        continue
-
-                    if lat is not None and lon is not None:
-                        resultados[chave] = (lat, lon, origem)
-                    else:
-                        self.stats["falha"] += 1
-
-                except Exception as e:
-                    logger.warning(f"⚠️ Erro geocodificando {chave}: {e}")
-                    self.stats["falha"] += 1
-
-                if i % 200 == 0 or i == total:
-                    logger.info(
-                        f"🧩 Progresso: {i}/{total} "
-                        f"({100 * i/total:.1f}%) | "
-                        f"{len(resultados)} OK | "
-                        f"{self.stats['falha']} falhas"
-                    )
-
-        dur = time.time() - inicio_total
-        logger.info(
-            f"✅ Concluído: {len(resultados)}/{total} resolvidos "
-            f"({100 * len(resultados)/total:.1f}%) em {dur:.1f}s"
-        )
-
-        return resultados
-
+        # ========================================================
+        # FALHA
+        # ========================================================
+        self.stats["falha"] += 1
+        return None, None, "falha"
 
     # ============================================================
-    # 📊 Resumo final da geolocalização
+    # 📊 Resumo
     # ============================================================
+
     def exibir_resumo_logs(self):
         total = self.stats["total"]
-        logger.info("📊 Resumo de Geolocalização:")
-
-        for origem, count in self.stats.items():
-            if origem != "total":
-                pct = (count / total * 100) if total else 0
-                logger.info(f"   {origem:<18}: {count:>6} ({pct:5.1f}%)")
-
-        logger.info(f"   total               : {total:>6}")
-
-        sucesso = total - self.stats["falha"]
-        taxa = (sucesso / total * 100) if total else 0
-        logger.info(f"✅ Taxa de sucesso: {sucesso}/{total} ({taxa:.1f}%)")
+        logger.info("📊 Resumo MKP Geolocalização:")
+        for k, v in self.stats.items():
+            if k != "total":
+                pct = (v / total * 100) if total else 0
+                logger.info(f"   {k:<18}: {v:>6} ({pct:5.1f}%)")
