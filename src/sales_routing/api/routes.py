@@ -22,6 +22,7 @@ router = APIRouter()
 # 📌 Dados enviados pelo frontend
 # ============================================================
 class RoteirizacaoRequest(BaseModel):
+
     clusterization_id: str
     descricao: str
 
@@ -31,13 +32,10 @@ class RoteirizacaoRequest(BaseModel):
     dias_uteis: int
     frequencia_visita: int
 
-    service_min: float
-    vel_kmh: float
+    min_pdvs_rota: int
+    max_pdvs_rota: int
 
-    # opcionais — defaults aplicados pelo backend
-    alpha_path: float | None = None
-    twoopt: bool | None = None
-    modo_calculo: str | None = None
+    service_min: float
 
 
 # ============================================================
@@ -350,18 +348,25 @@ async def iniciar_roteirizacao(request: Request, body: RoteirizacaoRequest):
     logger.info(f"tenant={tenant_id}, clusterization_id={body.clusterization_id}")
     logger.info(f"uf={body.uf}, cidade={body.cidade}")
 
-    # ============================================================
-    # ✔ Defaults oficiais
-    # ============================================================
-    alpha = body.alpha_path if body.alpha_path is not None else 1.3
-    twoopt = body.twoopt if body.twoopt is not None else False
-    modo_calculo = body.modo_calculo if body.modo_calculo is not None else "fixo"
-
     logger.info(
-        f"Parâmetros: v_kmh={body.vel_kmh}, α={alpha}, "
-        f"service_min={body.service_min}, modo_calculo={modo_calculo}, twoopt={twoopt}"
+        f"Parâmetros: dias_uteis={body.dias_uteis}, "
+        f"freq={body.frequencia_visita}, "
+        f"min_pdvs={body.min_pdvs_rota}, "
+        f"max_pdvs={body.max_pdvs_rota}, "
+        f"service_min={body.service_min}"
     )
 
+    if body.min_pdvs_rota > body.max_pdvs_rota:
+        raise HTTPException(
+            status_code=400,
+            detail="min_pdvs_rota não pode ser maior que max_pdvs_rota"
+        )
+
+    if body.frequencia_visita <= 0:
+        raise HTTPException(status_code=400, detail="frequencia_visita deve ser > 0")
+
+    if body.dias_uteis <= 0:
+        raise HTTPException(status_code=400, detail="dias_uteis deve ser > 0")
     # ============================================================
     # 🔧 Redis
     # ============================================================
@@ -376,6 +381,7 @@ async def iniciar_roteirizacao(request: Request, body: RoteirizacaoRequest):
     # 📦 Parâmetros padronizados do job
     # ============================================================
     job_params = {
+
         "tenant_id": tenant_id,
         "routing_id": routing_id,
         "clusterization_id": body.clusterization_id,
@@ -387,14 +393,18 @@ async def iniciar_roteirizacao(request: Request, body: RoteirizacaoRequest):
         "dias_uteis": body.dias_uteis,
         "frequencia_visita": body.frequencia_visita,
 
-        "v_kmh": body.vel_kmh,
+        "min_pdvs_rota": body.min_pdvs_rota,
+        "max_pdvs_rota": body.max_pdvs_rota,
+
         "service_min": body.service_min,
-        "alpha_path": alpha,
 
-        "twoopt": twoopt,
+        "v_kmh": 35,
+        "alpha_path": 1.3,
 
-        "modo": "fixo",
-        "modo_calculo": modo_calculo,
+        "modo": "balanceado",
+        "modo_calculo": "frequencia",
+
+        "twoopt": False,
 
         "usuario": user["email"],
     }

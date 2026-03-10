@@ -103,11 +103,15 @@ def dividir_cluster_em_subclusters(
     for p in pdvs_cluster:
         p.freq_visita = getattr(p, "freq_visita", freq_padrao)
 
-    visitas_totais = sum(p.freq_visita for p in pdvs_cluster)
-    n_subclusters = max(1, math.ceil(visitas_totais / dias_uteis))
+    # roteiros = floor(dias_uteis / frequencia)
+    # ex: 21/2 -> 10; 21/3 -> 7
+    freq = max(1, int(freq_padrao or 1))
+    n_subclusters = max(1, dias_uteis // freq)
+    n_subclusters = min(n_subclusters, len(pdvs_cluster))
+
     logger.info(
         f"📅 Cluster {cluster.cluster_id}: {len(pdvs_cluster)} PDVs | "
-        f"{visitas_totais:.1f} visitas/mês → {n_subclusters} rotas (dias úteis={dias_uteis})"
+        f"freq={freq}x/mês | dias_uteis={dias_uteis} → {n_subclusters} roteiros base"
     )
 
     # ======================================================
@@ -161,11 +165,13 @@ def dividir_cluster_em_subclusters(
 
     return {
         "cluster_id": cluster.cluster_id,
-        "n_subclusters": n_subclusters,
+        "k_final": n_subclusters,        # <-- adiciona isso
+        "total_pdvs": len(pdvs_cluster), # <-- opcional, mas bom
+        "subclusters": subclusters,
+        # pode manter os campos extras se quiser
         "tempo_total_mes": tempo_total_mes,
         "dist_total_mes": dist_total_mes,
         "mean_pdvs": round(pdvs_medio, 1),
-        "subclusters": subclusters,
     }
 
 

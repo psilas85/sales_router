@@ -14,6 +14,7 @@ from src.sales_routing.infrastructure.database_reader import SalesRoutingDatabas
 from src.sales_routing.infrastructure.database_writer import SalesRoutingDatabaseWriter
 from src.sales_routing.application.adaptive_subcluster_splitter import gerar_subclusters_adaptativo
 from src.sales_routing.application.fixed_subcluster_splitter import gerar_subclusters_fixos
+from src.sales_routing.application.balanced_subcluster_splitter import gerar_subclusters_balanceados
 
 
 def aplicar_default(valor, default):
@@ -50,18 +51,20 @@ def main():
     # ======================================================
     parser.add_argument("--dias_uteis", type=int, default=None)
     parser.add_argument("--frequencia_visita", type=int, default=None)
+    parser.add_argument("--min_pdvs_rota", type=int, default=None)
+    parser.add_argument("--max_pdvs_rota", type=int, default=None)
 
     # ======================================================
     # MODO DE SUBCLUSTERIZAÇÃO
     # ======================================================
-    parser.add_argument("--modo", choices=["adaptativo", "fixo"], default=None)
+    parser.add_argument("--modo", choices=["adaptativo", "fixo", "balanceado"], default=None)
 
     # ======================================================
     # MODO DE CÁLCULO DE ROTAS
     # ======================================================
     parser.add_argument(
         "--modo_calculo",
-        choices=["proporcional", "fixo"],
+        choices=["frequencia", "proporcional", "capacidade"],
         default=None
     )
 
@@ -91,9 +94,15 @@ def main():
 
     dias_uteis = aplicar_default(args.dias_uteis, 21)
     frequencia_visita = aplicar_default(args.frequencia_visita, 1)
+    min_pdvs_rota = aplicar_default(args.min_pdvs_rota, 8)
+    max_pdvs_rota = aplicar_default(args.max_pdvs_rota, 12)
 
-    modo = aplicar_default(args.modo, "fixo")
-    modo_calculo = aplicar_default(args.modo_calculo, "proporcional")
+    modo = aplicar_default(args.modo, "balanceado")
+    modo_calculo = aplicar_default(args.modo_calculo, "frequencia")
+
+    if min_pdvs_rota > max_pdvs_rota:
+        print("❌ min_pdvs_rota não pode ser maior que max_pdvs_rota.")
+        return
 
     # ======================================================
     # CRIAR routing_id
@@ -102,7 +111,11 @@ def main():
     clusterization_id = args.clusterization_id.strip()
 
     logger.info(f"🆕 Roteirização (modo={modo}) | routing_id={routing_id}")
-    logger.info(f"Parâmetros: vel={v_kmh} km/h | α={alpha_path} | service={service_min} min")
+    logger.info(
+        f"Parâmetros: vel={v_kmh} km/h | α={alpha_path} | service={service_min} min | "
+        f"dias_uteis={dias_uteis} | freq={frequencia_visita} | "
+        f"min_pdvs={min_pdvs_rota} | max_pdvs={max_pdvs_rota}"
+    )
 
     # ======================================================
     # DB services
@@ -164,6 +177,20 @@ def main():
             aplicar_two_opt=args.twoopt,
             modo_calculo=modo_calculo,
         )
+    elif modo == "balanceado":
+        resultados = gerar_subclusters_balanceados(
+            clusters=clusters,
+            pdvs=pdvs,
+            dias_uteis=dias_uteis,
+            freq_padrao=frequencia_visita,
+            v_kmh=v_kmh,
+            service_min=service_min,
+            alpha_path=alpha_path,
+            aplicar_two_opt=args.twoopt,
+            min_pdvs_rota=min_pdvs_rota,
+            max_pdvs_rota=max_pdvs_rota,
+            modo_calculo=modo_calculo,
+        )
     else:
         resultados = gerar_subclusters_adaptativo(
             clusters=clusters,
@@ -175,7 +202,6 @@ def main():
             alpha_path=alpha_path,
             aplicar_two_opt=args.twoopt,
         )
-
     # ======================================================
     # SALVAR RESULTADOS
     # ======================================================

@@ -31,7 +31,7 @@ def dividir_cluster_em_subclusters_fixos(
     Divide um cluster macro em subclusters (rotas diárias) via KMeans,
     com base em dias úteis e frequência de visitas.
     🔸 modo_calculo='proporcional':  n = ceil(visitas_totais / dias_uteis)
-    🔸 modo_calculo='fixo':          n = dias_uteis
+    🔸 modo_calculo='fixo': n = floor(dias_uteis / freq_padrao)
     """
 
     for p in pdvs_cluster:
@@ -43,11 +43,14 @@ def dividir_cluster_em_subclusters_fixos(
     # 1️⃣ Determinar número de subclusters conforme modo
     # ======================================================
     if modo_calculo == "fixo":
-        # ✅ Fixamos o número exato de subclusters = dias_uteis × freq_padrao
-        n_subclusters = max(1, int(dias_uteis * freq_padrao))
+        freq = max(1, int(freq_padrao or 1))
+
+        # ✅ modelo correto: roteiros base
+        n_subclusters = max(1, dias_uteis // freq)
+
         logger.info(
-            f"📦 Cluster {cluster.cluster_id}: modo_calculo=fixo → {n_subclusters} rotas "
-            f"(dias_uteis={dias_uteis}, freq_padrao={freq_padrao})"
+            f"📦 Cluster {cluster.cluster_id}: modo_calculo=fixo → {n_subclusters} roteiros base "
+            f"(dias_uteis={dias_uteis}, freq_padrao={freq})"
         )
     else:
         # ✅ Modo proporcional mantém a lógica atual (número ajustado conforme total de visitas)

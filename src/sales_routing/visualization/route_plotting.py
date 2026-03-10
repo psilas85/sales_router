@@ -120,8 +120,8 @@ def gerar_mapa_rotas(dados, output_path: Path, modo_debug: bool = False, zoom: i
         location=[lat_centro, lon_centro],
         zoom_start=zoom,
         prefer_canvas=False,
-        tiles="https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png",
-        attr="© OpenStreetMap contributors"
+        tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+        attr="© OpenStreetMap contributors © CARTO"
     )
 
     # ============================================================

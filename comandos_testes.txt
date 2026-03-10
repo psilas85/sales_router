@@ -105,3 +105,17 @@ The key's randomart image is:
 |          oEB.O==|
 |           o+*.==|
 +----[SHA256]-----+
+
+
+from src.jobs.routing_jobs import executar_routing_master_job
+
+res = executar_routing_master_job({
+    "tenant_id": 1,
+    "clusterization_id": "2cf888c5-b6c2-4d86-bbc0-998228186cf8",
+    "descricao": "teste routing paralelo",
+    "modo": "balanceado",
+    "min_pdvs_rota": 8,
+    "max_pdvs_rota": 12,
+    "dias_uteis": 21,
+    "frequencia_visita": 3
+})
