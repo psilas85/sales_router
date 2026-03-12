@@ -1,0 +1,9 @@
+FROM psilas85/sales_router-base:latest
+
+WORKDIR /app
+
+COPY ./src /app/src
+
+ENV PYTHONPATH=/app/src
+
+CMD ["uvicorn", "cadastros.api.cadastros_api:app", "--host", "0.0.0.0", "--port", "8006"]

@@ -48,6 +48,37 @@ services:
 
 
   # ======================
+  # Cadastros (Consultores etc)
+  # ======================
+  sales_cadastros:
+    build:
+      context: .
+      dockerfile: ./src/cadastros/Dockerfile.cadastros
+    container_name: sales_cadastros
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=sales_router_db
+      - DB_PORT=5432
+      - AUTH_SERVICE_URL=http://authentication_service:8000
+      - PYTHONPATH=/app/src
+    depends_on:
+      - sales_router_db
+      - authentication_service
+    volumes:
+      - ./src/cadastros:/app/src/sales_cadastros
+      - ./src/database:/app/src/database
+      - ./output:/app/output
+      - ./data:/app/data
+    expose:
+      - "8006"
+    ports:
+      - "8013:8006"
+    networks:
+      - sales_router_net
+    restart: always
+
+  # ======================
   # Pré-processamento de PDVs (FastAPI)
   # ======================
   pdv_preprocessing:
