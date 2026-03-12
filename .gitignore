@@ -169,3 +169,7 @@ notebooks/
 # OUTPUT GERADO (MAPAS, RELATÓRIOS, HTMLs)
 # ========================================
 output/
+
+
+*.sql
+sales_router_full.sql
