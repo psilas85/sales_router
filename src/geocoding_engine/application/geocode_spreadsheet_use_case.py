@@ -3,7 +3,7 @@
 import pandas as pd
 
 from geocoding_engine.application.geocode_addresses_use_case import GeocodeAddressesUseCase
-from geocoding_engine.domain.address_normalizer import normalize_base
+from geocoding_engine.utils.excel_exporter import ExcelExporter
 
 
 class GeocodeSpreadsheetUseCase:
@@ -27,6 +27,7 @@ class GeocodeSpreadsheetUseCase:
         "consultor",
         "setor"
     ]
+
 
     def _validar(self, df):
 
@@ -87,10 +88,26 @@ class GeocodeSpreadsheetUseCase:
         df["lon"] = lon
         df["geocode_source"] = source
 
+        # ---------------------------------------------------------
+        # SEPARAÇÃO VALIDO / INVALIDO
+        # ---------------------------------------------------------
+
+        df_validos = df[df["lat"].notnull()].copy()
+        df_invalidos = df[df["lat"].isnull()].copy()
+
         stats = {
             "total": len(df),
-            "sucesso": df["lat"].notnull().sum(),
-            "falhas": df["lat"].isnull().sum()
+            "sucesso": len(df_validos),
+            "falhas": len(df_invalidos)
         }
 
-        return df, stats
+        # ---------------------------------------------------------
+        # GERAR EXCEL
+        # ---------------------------------------------------------
+
+        excel_buffer = ExcelExporter.gerar_excel(
+            df_validos,
+            df_invalidos
+        )
+
+        return excel_buffer, stats

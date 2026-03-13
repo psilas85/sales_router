@@ -1,21 +1,27 @@
 #sales_router/src/geocoding_engine/api/routes.py
 
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
 from .dependencies import verify_token
 from .schemas import GeocodeRequest
-from geocoding_engine.application.geocode_addresses_use_case import GeocodeAddressesUseCase
-from geocoding_engine.application.geocode_spreadsheet_use_case import GeocodeSpreadsheetUseCase
+from fastapi.responses import FileResponse
 
+from geocoding_engine.application.geocode_addresses_use_case import GeocodeAddressesUseCase
+from geocoding_engine.infrastructure.queue_factory import fila_geocode, redis_conn
+from geocoding_engine.workers.geocode_jobs import processar_geocode
+
+
+from rq.job import Job
 from loguru import logger
-import tempfile
-import uuid
 import os
-import pandas as pd
-import time
+import uuid
+from redis import Redis
+
+import tempfile
 
 
 router = APIRouter()
+
+MAX_UPLOAD_MB = 50
 
 
 # ============================================================
@@ -64,7 +70,7 @@ def geocode_json(body: GeocodeRequest):
 
 
 # ============================================================
-# GEOCODE PLANILHA
+# GEOCODE PLANILHA (ASSÍNCRONO)
 # ============================================================
 
 @router.post(
@@ -73,47 +79,106 @@ def geocode_json(body: GeocodeRequest):
 )
 async def geocode_upload(file: UploadFile = File(...)):
 
-    start = time.time()
-
     logger.info(f"[UPLOAD] arquivo recebido: {file.filename}")
 
     if not file.filename.endswith(".xlsx"):
-        logger.warning(f"[UPLOAD] formato inválido: {file.filename}")
         raise HTTPException(status_code=400, detail="Arquivo deve ser XLSX")
 
-    temp_input = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-    temp_input.write(await file.read())
-    temp_input.close()
+    file_bytes = await file.read()
 
-    logger.info(f"[UPLOAD] salvo temporário: {temp_input.name}")
+    if len(file_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Arquivo muito grande (máx {MAX_UPLOAD_MB}MB)"
+        )
 
-    df = pd.read_excel(temp_input.name)
+    # diretório compartilhado entre containers
+    UPLOAD_DIR = "/app/data/uploads"
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-    logger.info(f"[UPLOAD] linhas carregadas: {len(df)}")
+    file_id = str(uuid.uuid4())
+    file_path = f"{UPLOAD_DIR}/{file_id}.xlsx"
 
-    uc = GeocodeSpreadsheetUseCase()
+    with open(file_path, "wb") as f:
+        f.write(file_bytes)
 
-    df_out, stats = uc.execute(df)
+    logger.info(f"[UPLOAD] salvo: {file_path}")
 
-    OUTPUT_DIR = "/app/output/geocoding_engine"
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    queue = fila_geocode()
 
-    output_path = f"{OUTPUT_DIR}/geocode_{uuid.uuid4()}.xlsx"
-
-    df_out.to_excel(output_path, index=False)
-
-    elapsed = round(time.time() - start, 2)
-
-    logger.info(
-        f"[RESULT] total={stats['total']} sucesso={stats['sucesso']} "
-        f"falhas={stats['falhas']} tempo={elapsed}s arquivo={output_path}"
+    job = queue.enqueue(
+        processar_geocode,
+        file_path,
+        job_timeout=36000
     )
 
+    logger.info(
+        f"[UPLOAD] job criado: {job.id} | file={file.filename}"
+    )
+
+    return {
+        "status": "queued",
+        "job_id": job.id
+    }
+
+# ============================================================
+# JOB STATUS
+# ============================================================
+
+@router.get(
+    "/job/{job_id}",
+    dependencies=[Depends(verify_token)]
+)
+def job_status(job_id: str):
+
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+
+    except Exception:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+
+    response = {
+        "job_id": job.id,
+        "status": job.get_status(),
+        "progress": job.meta.get("progress"),
+        "step": job.meta.get("step"),
+    }
+
+    if job.is_finished:
+        response["result"] = job.result
+
+    if job.is_failed:
+        response["error"] = str(job.exc_info)
+
+    return response
+
+@router.get(
+    "/job/{job_id}/download",
+    dependencies=[Depends(verify_token)]
+)
+def download_result(job_id: str):
+
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+    except:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+
+    if job.get_status() != "finished":
+        raise HTTPException(
+            status_code=400,
+            detail="Job ainda não finalizado"
+        )
+
+    output_file = job.meta.get("output_file")
+
+    if not output_file or not os.path.exists(output_file):
+        raise HTTPException(
+            status_code=404,
+            detail="Arquivo de resultado não encontrado"
+        )
+
     return FileResponse(
-        path=output_path,
-        filename="resultado_geocode.xlsx",
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": "attachment; filename=resultado_geocode.xlsx"
-        }
+        output_file,
+        filename=f"geocode_{job_id}.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
