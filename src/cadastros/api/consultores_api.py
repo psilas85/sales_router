@@ -58,6 +58,7 @@ class ConsultorResponseSchema(BaseModel):
     tenant_id: int
     setor: Optional[str]
     consultor: str
+    cpf: Optional[str]
     logradouro: Optional[str]
     numero: Optional[str]
     complemento: Optional[str]

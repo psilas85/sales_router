@@ -1,0 +1,68 @@
+#requirements
+
+
+# ===== Core =====
+python-dotenv==1.0.1
+requests==2.32.3
+tqdm==4.66.4
+
+# ===== Banco de Dados =====
+sqlalchemy==2.0.32
+psycopg2-binary==2.9.9
+redis==5.0.7
+
+# ===== Web / APIs =====
+fastapi==0.109.2
+uvicorn[standard]==0.30.1
+pydantic[email]==1.10.13
+python-multipart
+
+
+# ===== Segurança e Autenticação =====
+PyJWT==2.9.0
+bcrypt==3.2.2
+passlib[bcrypt]==1.7.4
+
+
+
+# ===== Ciência de Dados e ML (Clusterization / Simulation) =====
+pandas==2.2.3
+numpy==1.26.4
+scikit-learn==1.5.2
+
+# ===== Geoprocessamento e Mapas (Routing / Clusterization / PDV) =====
+geopy==2.4.1
+folium==0.17.0
+plotly==5.23.0
+
+# ===== Logging e Observabilidade =====
+loguru==0.7.2
+
+# ===== Utilidades adicionais =====
+pytz==2024.1
+loguru
+
+# Sales Clusterization - Requisitos específicos
+psycopg2-binary
+scikit-learn
+numpy
+pandas
+geopy
+
+# ===== Routing e Distância (Sales Routing) =====
+matplotlib==3.9.2
+networkx==3.3
+ortools==9.10.4067
+shapely==2.0.4
+folium==0.17.0
+rq==1.16.2
+
+psutil 
+
+polyline==2.0.0
+
+openpyxl
+
+scikit-learn-extra==0.3.0
+
+python-multipart

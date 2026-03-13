@@ -1,0 +1,53 @@
+#sales_router/src/geocoding_engine/docker-compose.yml
+
+version: "3.9"
+
+services:
+
+  geocoding_engine:
+
+    build:
+      context: ../..
+      dockerfile: ./src/geocoding_engine/Dockerfile.geocoding
+
+    container_name: geocoding_engine
+
+    env_file:
+      - ../../.env
+
+    environment:
+      - PYTHONPATH=/app/src
+      - DB_HOST=sales_router_db
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - NOMINATIM_LOCAL_URL=${NOMINATIM_LOCAL_URL}
+      - GMAPS_API_KEY=${GMAPS_API_KEY}
+      - ENABLE_GOOGLE_GEOCODING=true
+
+    volumes:
+      - ../../src/geocoding_engine:/app/src/geocoding_engine
+      - ../../src/database:/app/src/database
+      - ../../data:/app/data
+      - ../../output:/app/output
+
+    ports:
+      - "8014:8007"
+
+    networks:
+      - sales_router_net
+
+    restart: always
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8007/docs"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+
+networks:
+
+  sales_router_net:
+    external: true
