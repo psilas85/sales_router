@@ -36,3 +36,26 @@ class DatabaseWriter:
 
             self.conn.rollback()
             raise
+
+    def atualizar_cache(self, id, lat, lon):
+
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE enderecos_cache
+                    SET 
+                        lat = %s,
+                        lon = %s,
+                        origem = 'manual_edit',
+                        atualizado_em = NOW()
+                    WHERE id = %s
+                    """,
+                    (lat, lon, id)
+                )
+
+            self.conn.commit()
+
+        except Exception:
+            self.conn.rollback()
+            raise

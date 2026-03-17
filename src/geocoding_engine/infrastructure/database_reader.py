@@ -3,6 +3,10 @@
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import unicodedata
+
+def normalize(text):
+    return unicodedata.normalize("NFKD", text).encode("ASCII", "ignore").decode("utf-8").upper()
 
 
 class DatabaseReader:
@@ -63,3 +67,32 @@ class DatabaseReader:
             r["endereco"]: (r["lat"], r["lon"])
             for r in rows
         }
+   
+
+    def buscar_cache_filtrado(self, cidade, uf, endereco=None, limit=50):
+
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+
+            termos = normalize(f"{cidade} {uf} {endereco or ''}").split()
+
+            where_clauses = []
+            params = []
+
+            for termo in termos:
+                where_clauses.append("endereco_normalizado ILIKE %s")
+                params.append(f"%{termo}%")
+
+            where_sql = " AND ".join(where_clauses)
+
+            query = f"""
+            SELECT id, endereco, lat, lon, origem, atualizado_em
+            FROM enderecos_cache
+            WHERE {where_sql}
+            ORDER BY atualizado_em DESC
+            LIMIT %s
+            """
+
+            params.append(limit)
+
+            cur.execute(query, tuple(params))
+            return cur.fetchall()

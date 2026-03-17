@@ -3,18 +3,25 @@
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from .dependencies import verify_token
 from .schemas import GeocodeRequest
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.encoders import jsonable_encoder
 
 from geocoding_engine.application.geocode_addresses_use_case import GeocodeAddressesUseCase
 from geocoding_engine.infrastructure.queue_factory import fila_geocode, redis_conn
 from geocoding_engine.workers.geocode_jobs import processar_geocode
-
+from geocoding_engine.visualization.map_use_case import GenerateMapUseCase
+from geocoding_engine.infrastructure.database_reader import DatabaseReader
+from geocoding_engine.infrastructure.database_writer import DatabaseWriter
+import psycopg2
+import os
 
 from rq.job import Job
 from loguru import logger
-import os
+
 import uuid
 from redis import Redis
+import json
+
 
 import tempfile
 
@@ -129,6 +136,10 @@ async def geocode_upload(file: UploadFile = File(...)):
     "/job/{job_id}",
     dependencies=[Depends(verify_token)]
 )
+@router.get(
+    "/job/{job_id}",
+    dependencies=[Depends(verify_token)]
+)
 def job_status(job_id: str):
 
     try:
@@ -144,8 +155,18 @@ def job_status(job_id: str):
         "step": job.meta.get("step"),
     }
 
+    # quando terminar, retornar resumo
     if job.is_finished:
-        response["result"] = job.result
+
+        result = job.result
+
+        response["result"] = result
+
+        if isinstance(result, dict):
+
+            response["total"] = result.get("total")
+            response["sucesso"] = result.get("sucesso")
+            response["falhas"] = result.get("falhas")
 
     if job.is_failed:
         response["error"] = str(job.exc_info)
@@ -182,3 +203,111 @@ def download_result(job_id: str):
         filename=f"geocode_{job_id}.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+# ============================================================
+# JOB RESULT (JSON PARA MAPA)
+# ============================================================
+
+@router.get(
+    "/job/{job_id}/result",
+    dependencies=[Depends(verify_token)]
+)
+def job_result(job_id: str):
+
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+
+    if job.get_status() != "finished":
+        raise HTTPException(
+            status_code=400,
+            detail="Job ainda não finalizado"
+        )
+
+    output_json = job.meta.get("output_json")
+
+    if not output_json or not os.path.exists(output_json):
+        raise HTTPException(
+            status_code=404,
+            detail="Arquivo JSON de resultado não encontrado"
+        )
+
+    with open(output_json, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    return data
+
+@router.get(
+    "/job/{job_id}/map",
+    dependencies=[Depends(verify_token)]
+)
+def job_map(job_id: str):
+
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+
+    if job.get_status() != "finished":
+        raise HTTPException(
+            status_code=400,
+            detail="Job ainda não finalizado"
+        )
+
+    json_path = job.meta.get("output_json")
+
+    if not json_path:
+        raise HTTPException(
+            status_code=404,
+            detail="JSON não encontrado"
+        )
+
+    uc = GenerateMapUseCase()
+
+    geojson = uc.execute(json_path)
+
+    return JSONResponse(content=geojson)
+
+@router.get("/cache/search")
+def buscar_cache(
+    cidade: str,
+    uf: str,
+    endereco: str = None,
+    limit: int = 50,
+):
+    reader = DatabaseReader()
+
+    results = reader.buscar_cache_filtrado(
+        cidade=cidade,
+        uf=uf,
+        endereco=endereco,
+        limit=limit
+    )
+
+    return results
+
+@router.put("/cache/{id}")
+def atualizar_cache(id: int, payload: dict):
+
+    lat = payload.get("lat")
+    lon = payload.get("lon")
+
+    if lat is None or lon is None:
+        raise HTTPException(400, "lat/lon obrigatórios")
+
+    conn = psycopg2.connect(
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        host=os.getenv("DB_HOST"),
+        port=os.getenv("DB_PORT"),
+    )
+
+    try:
+        writer = DatabaseWriter(conn)
+        writer.atualizar_cache(id, lat, lon)
+    finally:
+        conn.close()
+
+    return {"status": "ok"}
