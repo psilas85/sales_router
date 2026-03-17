@@ -29,12 +29,7 @@ def _limpeza_basica(s: str) -> str:
 
 
 # ============================================================
-# 🧱 NORMALIZAÇÃO BASE (OBRIGATÓRIA)
-# ============================================================
-# - NÃO remove acentos
-# - NÃO muda caixa
-# - NÃO “fica esperta”
-# - apenas padroniza forma
+# 🧱 NORMALIZAÇÃO BASE
 # ============================================================
 
 def normalize_base(endereco: str) -> str:
@@ -43,35 +38,30 @@ def normalize_base(endereco: str) -> str:
 
     s = endereco.strip()
 
-    # normaliza espaços e vírgulas
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"\s*,\s*", ", ", s)
 
-    # remove "Brasil" no final
     s = re.sub(r",?\s*Brasil$", "", s, flags=re.I)
 
     return s.strip()
 
 
 # ============================================================
-# 🧭 1) PARA GEOCODIFICAÇÃO (Nominatim Local + Google)
-# ============================================================
-# REGRAS:
-# - conservador
-# - NÃO expandir AL / AV / R
-# - remover lixo que quebra o geocoder
+# 🧭 PARA GEOCODIFICAÇÃO (FIXADO)
 # ============================================================
 
 def normalize_for_geocoding(endereco: str) -> str:
     if not endereco:
         return ""
 
+    original = endereco
+
     s = normalize_base(endereco)
 
-    # correções humanas leves (podem alterar caixa)
+    # correções leves
     s = corrigir_truncados(s)
 
-    # mantém legível para geocoder
+    # padroniza casing
     s = s.title()
 
     # expansões SEGURAS
@@ -79,67 +69,62 @@ def normalize_for_geocoding(endereco: str) -> str:
     s = re.sub(r"\bSto\b", "Santo", s)
     s = re.sub(r"\bS\b", "São", s)
 
-    # ✅ REMOVE PREFIXO DE LOGRADOURO APENAS SE ISOLADO NO INÍCIO
-    # Exemplos válidos:
-    # "Alameda Paulista" → "Paulista"
-    # "Al Alfredo Albuquerque" → "Alfredo Albuquerque" ❌ (NÃO remove)
+    # ❌ NÃO remover logradouro (isso só piora resultado)
+    # REMOVIDO
+
+    # ============================================================
+    # ✅ FIX PRINCIPAL: NÃO destruir cidade
+    # ============================================================
+
+    # remove apenas o trecho do complemento, NÃO o resto da string
     s = re.sub(
-        r"^(?:Alameda|Avenida|Rua|Travessa|Rodovia|Estrada|Av\.?|R\.?)\s+",
+        r"\b(Bloco|Bl|Loja|Lj|Sala|Sl|Apto|Apt|Cj|Conj)\b[^,]*",
         "",
         s,
         flags=re.IGNORECASE
     )
 
-    # remove complementos finais que confundem geocoders
-    s = re.sub(
-        r"\b(Bloco|Bl|Loja|Lj|Sala|Sl|Apto|Apt|Cj|Conj)\b.*$",
-        "",
-        s,
-        flags=re.IGNORECASE
-    )
+    s = _limpeza_basica(s)
 
-    return _limpeza_basica(s)
+    # ============================================================
+    # 🔒 GARANTIA: cidade/UF nunca somem
+    # ============================================================
 
+    # tenta extrair cidade/UF do original se sumiram
+    match = re.search(r",\s*([^,]+)\s*-\s*([A-Z]{2})$", original, re.IGNORECASE)
+
+    if match:
+        cidade = match.group(1).strip().title()
+        uf = match.group(2).upper()
+
+        if cidade.lower() not in s.lower():
+            s = f"{s}, {cidade} - {uf}"
+
+    return s
 
 
 # ============================================================
-# 🧠 2) PARA CACHE (CHAVE CANÔNICA)
-# ============================================================
-# REGRAS:
-# - agressivo
-# - determinístico
-# - sempre gera a mesma chave
+# 🧠 CACHE
 # ============================================================
 
 def normalize_for_cache(endereco: str) -> str:
     if not endereco:
         return ""
 
-    # base limpa, sem "Brasil"
     s = normalize_base(endereco)
 
-    # cache precisa ser determinístico, NÃO esperto
     s = _remover_acentos(s)
     s = s.upper()
 
-    # NÃO aplicar:
-    # - corrigir_truncados
-    # - expandir_abreviacoes
-    # isso é só para geocoding, nunca para cache
-
-    # remove lixo, mantém estrutura
     s = re.sub(r"[^A-Z0-9 ,\-]", "", s)
 
-    # normaliza espaços e vírgulas
     s = _limpeza_basica(s)
 
     return s
 
 
-
-
 # ============================================================
-# 👁️ 3) DISPLAY / LOG
+# 👁️ DISPLAY
 # ============================================================
 
 def normalize_for_display(endereco: str) -> str:
