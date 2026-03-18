@@ -1,0 +1,84 @@
+#sales_router/src/routing_engine/docker-compose.yml
+
+version: "3.9"
+
+services:
+
+  routing_engine:
+
+    build:
+      context: ../..
+      dockerfile: ./src/routing_engine/Dockerfile.routing
+
+    container_name: routing_engine
+
+    env_file:
+      - ../../.env
+
+    environment:
+      - PYTHONPATH=/app/src
+      - DB_HOST=sales_router_db
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - OSRM_URL=${OSRM_URL}
+      - GMAPS_API_KEY=${GMAPS_API_KEY}
+
+    volumes:
+      - ../../src:/app/src
+      - ../../data:/app/data
+      - ../../output:/app/output
+
+    ports:
+      - "8015:8008"
+
+    networks:
+      - sales_router_net
+
+    restart: always
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8008/docs"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+
+  routing_batch_worker:
+
+    build:
+      context: ../..
+      dockerfile: ./src/routing_engine/Dockerfile.routing
+
+    container_name: routing_batch_worker
+
+    env_file:
+      - ../../.env
+
+    environment:
+      - PYTHONPATH=/app/src
+      - REDIS_URL=redis://redis:6379/0
+      - OSRM_URL=${OSRM_URL}
+      - GMAPS_API_KEY=${GMAPS_API_KEY}
+
+    depends_on:
+      - routing_engine
+
+    volumes:
+      - ../../src:/app/src
+      - ../../data:/app/data
+      - ../../output:/app/output
+
+    networks:
+      - sales_router_net
+
+    command: >
+      rq worker -v -u redis://redis:6379/0 routing_batch
+
+    restart: always
+
+
+networks:
+  sales_router_net:
+    external: true

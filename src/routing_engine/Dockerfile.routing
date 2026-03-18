@@ -1,0 +1,26 @@
+#sales_router/src/routing_engine/Dockerfile.routing
+
+FROM psilas85/sales_router-base:latest
+
+WORKDIR /app
+
+ENV PYTHONPATH=/app/src
+
+# ----------------------------------------------------
+# dependências
+# ----------------------------------------------------
+
+COPY ./requirements.txt /tmp/requirements.txt
+
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# ----------------------------------------------------
+# código
+# ----------------------------------------------------
+
+COPY ./src/routing_engine /app/src/routing_engine
+COPY ./src/database /app/src/database
+
+EXPOSE 8008
+
+CMD ["uvicorn","routing_engine.api.main:app","--host","0.0.0.0","--port","8008"]

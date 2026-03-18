@@ -13,6 +13,7 @@ curl -X POST http://34.227.175.23/auth/login \
 
 docker build -t psilas85/sales_router-base:latest -f Dockerfile.base .
 tree -a -I 'node_modules|.next|dist' -L 20
+python -m routing_engine.tests.test_routing
 
 
 docker exec -it pdv_preprocessing   python3 -m src.pdv_preprocessing.main_pdv_preprocessing   --tenant 1   --arquivo data/pdvs_enderecos.csv   --descricao "SC_10K_251028"
