@@ -1,4 +1,4 @@
-#sales_router/src/routing_engine/application/route_distance_service.py
+# sales_router/src/routing_engine/application/route_distance_service.py
 
 from __future__ import annotations
 
@@ -42,6 +42,9 @@ class RouteDistanceService:
             f"⚙️ RouteDistanceService inicializado | v_kmh={self.v_kmh} | alpha={self.alpha_path} | osrm={self.osrm_url}"
         )
 
+    # =========================================================
+    # 📏 Distância/tempo entre dois pontos
+    # =========================================================
     def get_distance_time(
         self,
         a: tuple[float, float],
@@ -61,6 +64,7 @@ class RouteDistanceService:
                 {"lat": a[0], "lon": a[1]},
                 {"lat": b[0], "lon": b[1]},
             ]
+            rota_coord = self._clean_coords(rota_coord)
             self.req_cache += 1
         else:
             try:
@@ -88,6 +92,8 @@ class RouteDistanceService:
                     fonte = "haversine"
                     self.req_haversine += 1
 
+            rota_coord = self._clean_coords(rota_coord)
+
             self.writer.gravar_route_cache(
                 origem_lat=a[0],
                 origem_lon=a[1],
@@ -110,6 +116,203 @@ class RouteDistanceService:
             "fonte": fonte,
         }
 
+    # =========================================================
+    # 🧭 Rota completa híbrida
+    # =========================================================
+    def get_full_route(self, coords: list[tuple[float, float]]) -> dict:
+        coords = self._normalize_input_coords(coords)
+
+        if len(coords) < 2:
+            return {
+                "distancia_km": 0.0,
+                "tempo_min": 0.0,
+                "rota_coord": [],
+                "fonte": "empty",
+            }
+
+        # 1) tenta trip otimizado
+        try:
+            result = self._from_osrm_trip(coords)
+            if self._is_valid_full_route(result):
+                self.req_count += 1
+                self.req_osrm += 1
+                if self.req_count % 50 == 0:
+                    self._log_progresso()
+
+                return {
+                    "distancia_km": round(float(result["distancia_km"]), 3),
+                    "tempo_min": round(float(result["tempo_min"]), 1),
+                    "rota_coord": self._clean_coords(result["rota_coord"]),
+                    "fonte": "osrm_trip",
+                }
+            raise Exception("Trip inválido")
+        except Exception as e:
+            logger.warning(f"⚠️ OSRM trip falhou ({e}) — fallback segmentado")
+
+        # 2) fallback segmentado inteiro
+        try:
+            result = self._full_route_segmented(coords)
+            if self._is_valid_full_route(result):
+                self.req_count += 1
+                if self.req_count % 50 == 0:
+                    self._log_progresso()
+
+                return {
+                    "distancia_km": round(float(result["distancia_km"]), 3),
+                    "tempo_min": round(float(result["tempo_min"]), 1),
+                    "rota_coord": self._clean_coords(result["rota_coord"]),
+                    "fonte": "segmentado",
+                }
+            raise Exception("Segmentado inválido")
+        except Exception as e:
+            logger.warning(f"⚠️ Fallback segmentado falhou ({e}) — usando haversine")
+
+        # 3) fallback haversine inteiro
+        result = self._full_route_haversine(coords)
+        self.req_count += 1
+        if self.req_count % 50 == 0:
+            self._log_progresso()
+
+        return {
+            "distancia_km": round(float(result["distancia_km"]), 3),
+            "tempo_min": round(float(result["tempo_min"]), 1),
+            "rota_coord": self._clean_coords(result["rota_coord"]),
+            "fonte": "haversine_full",
+        }
+
+    # =========================================================
+    # 🚀 OSRM trip multi-stop
+    # =========================================================
+    def _from_osrm_trip(
+        self,
+        coords: list[tuple[float, float]],
+    ) -> dict:
+        # OSRM /trip reordena waypoints; ótimo para geometria estável
+        coords_str = ";".join([f"{lon},{lat}" for lat, lon in coords])
+
+        url = (
+            f"{self.osrm_url}/trip/v1/driving/"
+            f"{coords_str}?overview=full&geometries=geojson&roundtrip=true&source=first"
+        )
+
+        resp = requests.get(url, timeout=12)
+        if resp.status_code != 200:
+            raise Exception(f"HTTP {resp.status_code}")
+
+        data = resp.json()
+
+        if data.get("code") != "Ok" or not data.get("trips"):
+            raise Exception("OSRM trip sem rota válida")
+
+        trip = data["trips"][0]
+        dist_km = trip["distance"] / 1000
+        tempo_min = trip["duration"] / 60
+
+        if dist_km < 0.05 or tempo_min < 0.05:
+            raise Exception(
+                f"Trip nulo OSRM ({dist_km:.2f} km / {tempo_min:.2f} min)"
+            )
+
+        rota_coord = [
+            {"lat": lat, "lon": lon}
+            for lon, lat in trip["geometry"]["coordinates"]
+        ]
+
+        return {
+            "distancia_km": dist_km,
+            "tempo_min": tempo_min,
+            "rota_coord": rota_coord,
+        }
+
+    # =========================================================
+    # 🔁 Fallback segmentado consistente
+    # =========================================================
+    def _full_route_segmented(
+        self,
+        coords: list[tuple[float, float]],
+    ) -> dict:
+        total_km = 0.0
+        total_min = 0.0
+        rota_coords: list[dict] = []
+
+        for i in range(len(coords) - 1):
+            a = coords[i]
+            b = coords[i + 1]
+
+            res = self.get_distance_time(a, b)
+
+            total_km += float(res["distancia_km"])
+            total_min += float(res["tempo_min"])
+
+            seg = res.get("rota_coord") or [
+                {"lat": a[0], "lon": a[1]},
+                {"lat": b[0], "lon": b[1]},
+            ]
+
+            seg = self._clean_coords(seg)
+
+            if rota_coords and seg:
+                # evita duplicar ponto de emenda
+                if (
+                    rota_coords[-1]["lat"] == seg[0]["lat"]
+                    and rota_coords[-1]["lon"] == seg[0]["lon"]
+                ):
+                    seg = seg[1:]
+
+            rota_coords.extend(seg)
+
+        return {
+            "distancia_km": total_km,
+            "tempo_min": total_min,
+            "rota_coord": rota_coords,
+        }
+
+    # =========================================================
+    # 📐 Fallback haversine consistente
+    # =========================================================
+    def _full_route_haversine(
+        self,
+        coords: list[tuple[float, float]],
+    ) -> dict:
+        total_km = 0.0
+        total_min = 0.0
+        rota_coords: list[dict] = []
+
+        for i in range(len(coords) - 1):
+            a = coords[i]
+            b = coords[i + 1]
+
+            dist_km = self._haversine_km(a, b) * self.alpha_path
+            tempo_min = (dist_km / self.v_kmh) * 60
+
+            total_km += dist_km
+            total_min += tempo_min
+
+            seg = [
+                {"lat": a[0], "lon": a[1]},
+                {"lat": b[0], "lon": b[1]},
+            ]
+
+            if rota_coords and seg:
+                if (
+                    rota_coords[-1]["lat"] == seg[0]["lat"]
+                    and rota_coords[-1]["lon"] == seg[0]["lon"]
+                ):
+                    seg = seg[1:]
+
+            rota_coords.extend(seg)
+
+        self.req_haversine += 1
+
+        return {
+            "distancia_km": total_km,
+            "tempo_min": total_min,
+            "rota_coord": rota_coords,
+        }
+
+    # =========================================================
+    # 📍 OSRM single
+    # =========================================================
     def _from_osrm(
         self,
         a: tuple[float, float],
@@ -142,6 +345,9 @@ class RouteDistanceService:
 
         return dist_km, tempo_min, coords
 
+    # =========================================================
+    # 🌐 Google
+    # =========================================================
     def _from_google(
         self,
         a: tuple[float, float],
@@ -185,6 +391,66 @@ class RouteDistanceService:
 
         return dist_km, tempo_min, coords
 
+    # =========================================================
+    # 🧹 Helpers
+    # =========================================================
+    def _normalize_input_coords(
+        self,
+        coords: list[tuple[float, float]],
+    ) -> list[tuple[float, float]]:
+        normalized = []
+        for lat, lon in coords:
+            if lat is None or lon is None:
+                continue
+            try:
+                normalized.append((float(lat), float(lon)))
+            except (TypeError, ValueError):
+                continue
+        return normalized
+
+    def _clean_coords(self, coords: list[dict]) -> list[dict]:
+        cleaned = []
+        last = None
+
+        for c in coords or []:
+            lat = c.get("lat")
+            lon = c.get("lon")
+
+            if lat is None or lon is None:
+                continue
+
+            try:
+                lat = float(lat)
+                lon = float(lon)
+            except (TypeError, ValueError):
+                continue
+
+            current = {"lat": lat, "lon": lon}
+
+            if last is None or (
+                current["lat"] != last["lat"] or current["lon"] != last["lon"]
+            ):
+                cleaned.append(current)
+                last = current
+
+        return cleaned
+
+    def _is_valid_full_route(self, result: dict) -> bool:
+        if not result:
+            return False
+
+        try:
+            dist = float(result.get("distancia_km", 0.0))
+            tempo = float(result.get("tempo_min", 0.0))
+        except (TypeError, ValueError):
+            return False
+
+        coords = result.get("rota_coord") or []
+        return dist > 0 and tempo > 0 and len(coords) >= 2
+
+    # =========================================================
+    # 📐 Haversine
+    # =========================================================
     def _haversine_km(
         self,
         a: tuple[float, float],
@@ -202,6 +468,9 @@ class RouteDistanceService:
         )
         return 2 * r * math.asin(math.sqrt(h))
 
+    # =========================================================
+    # 📊 Stats / logs
+    # =========================================================
     def get_stats(self) -> dict:
         return {
             "req_count": int(self.req_count),

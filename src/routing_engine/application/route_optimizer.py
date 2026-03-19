@@ -1,4 +1,4 @@
-#sales_router/src/routing_engine/application/route_optimizer.py
+# sales_router/src/routing_engine/application/route_optimizer.py
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from routing_engine.application.route_distance_service import RouteDistanceServi
 
 
 class RouteOptimizer:
+
     def __init__(
         self,
         v_kmh: float,
@@ -19,24 +20,41 @@ class RouteOptimizer:
         self.v_kmh = float(v_kmh)
         self.service_min = float(service_min)
         self.alpha_path = float(alpha_path)
+
         self.distance_service = distance_service or RouteDistanceService(
             v_kmh=v_kmh,
             alpha_path=alpha_path,
         )
 
+    # =========================================================
+    # 🔧 Normalização coordenadas
+    # =========================================================
     def _normalizar_coord(self, lat, lon):
         if lat is None or lon is None:
             return None, None
 
-        lat = float(lat)
-        lon = float(lon)
+        try:
+            lat = float(lat)
+            lon = float(lon)
+        except (TypeError, ValueError):
+            return None, None
 
+        # correção simples de inversão lat/lon
         if abs(lat) > abs(lon):
             return lon, lat
 
         return lat, lon
 
-    def calcular_rota(self, centro: dict, pdvs: list[dict], aplicar_two_opt: bool = False) -> dict:
+    # =========================================================
+    # 🚀 Cálculo principal
+    # =========================================================
+    def calcular_rota(
+        self,
+        centro: dict,
+        pdvs: list[dict],
+        aplicar_two_opt: bool = False,
+    ) -> dict:
+
         if not pdvs:
             return {
                 "sequencia": [],
@@ -45,98 +63,92 @@ class RouteOptimizer:
                 "rota_coord": [],
             }
 
-        logger.info(
-            f"🚦 Calculando rota | PDVs={len(pdvs)} | centro=({centro['lat']}, {centro['lon']})"
+        centro_lat, centro_lon = self._normalizar_coord(
+            centro.get("lat"),
+            centro.get("lon"),
         )
 
-        rota = self.nearest_neighbor(centro, pdvs)
+        if centro_lat is None or centro_lon is None:
+            logger.warning("⚠️ Centro inválido. Retornando rota vazia.")
+            return {
+                "sequencia": [],
+                "distancia_total_km": 0.0,
+                "tempo_total_min": 0.0,
+                "rota_coord": [],
+            }
 
-        if aplicar_two_opt:
-            rota = self.two_opt(rota)
+        logger.info(
+            f"🚦 Calculando rota | PDVs={len(pdvs)} | centro=({centro_lat}, {centro_lon})"
+        )
 
-        pontos = [centro] + rota + [centro]
-        rota_coords = []
-        total_km = 0.0
-        total_min = 0.0
-        fallback_usado = False
-        warnings = 0
+        # 1) filtra PDVs válidos
+        pdvs_validos = []
 
-        for i in range(len(pontos) - 1):
-            a = pontos[i]
-            b = pontos[i + 1]
-
-            lat_a, lon_a = self._normalizar_coord(a["lat"], a["lon"])
-            lat_b, lon_b = self._normalizar_coord(b["lat"], b["lon"])
-
-            if lat_a is None or lat_b is None:
+        for pdv in pdvs:
+            lat, lon = self._normalizar_coord(pdv.get("lat"), pdv.get("lon"))
+            if lat is None or lon is None:
                 continue
 
-            if abs(lat_a - lat_b) < 1e-5 and abs(lon_a - lon_b) < 1e-5:
-                warnings += 1
-                total_min += self.service_min
+            pdv_corrigido = pdv.copy()
+            pdv_corrigido["lat"] = lat
+            pdv_corrigido["lon"] = lon
+            pdvs_validos.append(pdv_corrigido)
+
+        if not pdvs_validos:
+            logger.warning("⚠️ Nenhum PDV válido encontrado.")
+            return {
+                "sequencia": [],
+                "distancia_total_km": 0.0,
+                "tempo_total_min": 0.0,
+                "rota_coord": [],
+            }
+
+        centro_corrigido = centro.copy()
+        centro_corrigido["lat"] = centro_lat
+        centro_corrigido["lon"] = centro_lon
+
+        # 2) define sequência
+        rota = self.nearest_neighbor(centro_corrigido, pdvs_validos)
+
+        if aplicar_two_opt and len(rota) >= 4:
+            rota = self.two_opt(centro_corrigido, rota)
+
+        # 3) monta caminho centro -> rota -> centro
+        pontos = [centro_corrigido] + rota + [centro_corrigido]
+
+        coords_list = []
+        for p in pontos:
+            lat, lon = self._normalizar_coord(p.get("lat"), p.get("lon"))
+            if lat is None or lon is None:
                 continue
+            coords_list.append((lat, lon))
 
-            try:
-                result = self.distance_service.get_distance_time(
-                    (lat_a, lon_a),
-                    (lat_b, lon_b),
-                )
+        # 4) calcula geometria final de forma consistente
+        try:
+            result = self.distance_service.get_full_route(coords_list)
 
-                total_km += result["distancia_km"]
-                total_min += result["tempo_min"]
+            rota_coords = result.get("rota_coord", [])
+            total_km = float(result.get("distancia_km", 0.0))
+            total_min = float(result.get("tempo_min", 0.0))
+            fonte = result.get("fonte", "unknown")
 
-                coords_segmento = result.get("rota_coord", [])
-                if coords_segmento:
-                    rota_coords.extend(
-                        [{"lat": c["lat"], "lon": c["lon"]} for c in coords_segmento]
-                    )
-                else:
-                    rota_coords.append({"lat": lat_a, "lon": lon_a})
-                    rota_coords.append({"lat": lat_b, "lon": lon_b})
-                    fallback_usado = True
+        except AttributeError as e:
+            logger.error(f"💥 Método inexistente em RouteDistanceService: {e}")
+            raise
 
-            except Exception as e:
-                logger.warning(
-                    f"⚠️ Fallback geodesic entre ({lat_a},{lon_a}) e ({lat_b},{lon_b}) | {e}"
-                )
-                total_km += geodesic((lat_a, lon_a), (lat_b, lon_b)).km * self.alpha_path
-                rota_coords.append({"lat": lat_a, "lon": lon_a})
-                rota_coords.append({"lat": lat_b, "lon": lon_b})
-                fallback_usado = True
+        except Exception as e:
+            logger.warning(f"⚠️ Falha na rota completa ({e}) — fallback simples")
 
-        if not rota_coords:
-            rota_coords = (
-                [{"lat": centro["lat"], "lon": centro["lon"]}]
-                + [{"lat": p["lat"], "lon": p["lon"]} for p in rota]
-                + [{"lat": centro["lat"], "lon": centro["lon"]}]
-            )
-            fallback_usado = True
-        else:
-            first = rota_coords[0]
-            last = rota_coords[-1]
+            rota_coords = [{"lat": lat, "lon": lon} for lat, lon in coords_list]
+            total_km = self._total_dist_km(centro_corrigido, rota)
+            total_min = (total_km / self.v_kmh) * 60 if self.v_kmh > 0 else 0.0
+            fonte = "fallback_local"
 
-            if (
-                abs(first["lat"] - centro["lat"]) > 1e-4
-                or abs(first["lon"] - centro["lon"]) > 1e-4
-            ):
-                rota_coords.insert(0, {"lat": centro["lat"], "lon": centro["lon"]})
-
-            if (
-                abs(last["lat"] - centro["lat"]) > 1e-4
-                or abs(last["lon"] - centro["lon"]) > 1e-4
-            ):
-                rota_coords.append({"lat": centro["lat"], "lon": centro["lon"]})
-
-        total_min += len(pdvs) * self.service_min
-
-        if warnings > 0:
-            logger.warning(f"⚠️ {warnings} pares consecutivos com coordenadas idênticas tratados.")
-
-        if fallback_usado:
-            logger.warning("⚠️ Rota gerada parcialmente via fallback.")
+        # 5) tempo de serviço
+        total_min += len(rota) * self.service_min
 
         logger.success(
-            f"✅ Rota concluída | PDVs={len(pdvs)} | dist={round(total_km,2)} km | tempo={round(total_min,1)} min"
+            f"✅ Rota concluída | PDVs={len(rota)} | dist={round(total_km, 2)} km | tempo={round(total_min, 1)} min | fonte={fonte}"
         )
 
         return {
@@ -146,23 +158,32 @@ class RouteOptimizer:
             "rota_coord": rota_coords,
         }
 
+    # =========================================================
+    # 📏 Distância entre pontos
+    # =========================================================
     def _dist_km(self, p1, p2):
-        lat1, lon1 = self._normalizar_coord(p1["lat"], p1["lon"])
-        lat2, lon2 = self._normalizar_coord(p2["lat"], p2["lon"])
 
-        if lat1 is None or lat2 is None:
-            return 0.0
+        lat1, lon1 = self._normalizar_coord(p1.get("lat"), p1.get("lon"))
+        lat2, lon2 = self._normalizar_coord(p2.get("lat"), p2.get("lon"))
 
-        if abs(lat1 - lat2) < 1e-5 and abs(lon1 - lon2) < 1e-5:
+        if lat1 is None or lon1 is None or lat2 is None or lon2 is None:
             return 0.0
 
         try:
-            result = self.distance_service.get_distance_time((lat1, lon1), (lat2, lon2))
+            result = self.distance_service.get_distance_time(
+                (lat1, lon1),
+                (lat2, lon2),
+            )
             return float(result["distancia_km"])
+
         except Exception:
             return geodesic((lat1, lon1), (lat2, lon2)).km * self.alpha_path
 
+    # =========================================================
+    # 🔁 Nearest Neighbor
+    # =========================================================
     def nearest_neighbor(self, centro: dict, pdvs: list[dict]) -> list[dict]:
+
         if not pdvs:
             return []
 
@@ -178,35 +199,45 @@ class RouteOptimizer:
 
         return rota
 
-    def two_opt(self, rota: list[dict]) -> list[dict]:
-        melhor = rota
-        melhor_dist = self._total_dist_km(rota)
+    # =========================================================
+    # 🔁 2-opt
+    # =========================================================
+    def two_opt(self, centro: dict, rota: list[dict]) -> list[dict]:
+
+        if len(rota) < 4:
+            return rota
+
+        melhor = rota[:]
+        melhor_dist = self._total_dist_km(centro, melhor)
         melhorou = True
 
         while melhorou:
             melhorou = False
-            for i in range(1, len(rota) - 2):
-                for j in range(i + 1, len(rota)):
-                    if j - i == 1:
-                        continue
 
-                    nova_rota = rota[:i] + rota[i:j][::-1] + rota[j:]
-                    nova_dist = self._total_dist_km(nova_rota)
+            for i in range(len(melhor) - 1):
+                for j in range(i + 2, len(melhor) + 1):
+                    nova_rota = melhor[:i] + melhor[i:j][::-1] + melhor[j:]
+                    nova_dist = self._total_dist_km(centro, nova_rota)
 
                     if nova_dist < melhor_dist:
                         melhor = nova_rota
                         melhor_dist = nova_dist
                         melhorou = True
 
-            rota = melhor
-
         return melhor
 
-    def _total_dist_km(self, rota: list[dict]) -> float:
-        if len(rota) < 2:
+    # =========================================================
+    # 📊 Distância total com ida e volta
+    # =========================================================
+    def _total_dist_km(self, centro: dict, rota: list[dict]) -> float:
+
+        if not rota:
             return 0.0
 
-        return sum(
-            self._dist_km(rota[i], rota[i + 1])
-            for i in range(len(rota) - 1)
-        )
+        pontos = [centro] + rota + [centro]
+
+        total = 0.0
+        for i in range(len(pontos) - 1):
+            total += self._dist_km(pontos[i], pontos[i + 1])
+
+        return total

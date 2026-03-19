@@ -1,4 +1,4 @@
-#sales_router/src/routing_engine/application/route_spreadsheet_use_case.py
+# sales_router/src/routing_engine/application/route_spreadsheet_use_case.py
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import time
 import uuid
 import os
 from typing import List, Dict
+import math
 
 import pandas as pd
 from loguru import logger
@@ -13,7 +14,6 @@ from loguru import logger
 from routing_engine.services.spreadsheet_loader_service import SpreadsheetLoaderService
 from routing_engine.domain.spreadsheet_validator import SpreadsheetValidator
 from routing_engine.domain.entities import PDVData, RouteGroup
-from routing_engine.domain.utils_geo import mean_center
 
 from routing_engine.application.balanced_subcluster_splitter import dividir_grupo_em_rotas_balanceadas
 from routing_engine.application.route_optimizer import RouteOptimizer
@@ -30,8 +30,6 @@ class RouteSpreadsheetUseCase:
 
         self.loader = SpreadsheetLoaderService()
         self.validator = SpreadsheetValidator()
-
-        self.consultor_service = None
 
         self.distance_service = RouteDistanceService()
 
@@ -57,13 +55,12 @@ class RouteSpreadsheetUseCase:
         max_pdvs_rota: int = 12,
         aplicar_two_opt: bool = False,
         output_dir: str = "/app/data/outputs"
-    ) -> str:
+    ) -> dict:
 
         start = time.time()
         request_id = str(uuid.uuid4())
 
         logger.info(f"[ROUTING_START] request_id={request_id}")
-       
 
         df_raw = self.loader.load(file_bytes, filename)
         validation = self.validator.validate(df_raw)
@@ -73,6 +70,9 @@ class RouteSpreadsheetUseCase:
 
         logger.info(f"📥 Linhas válidas: {len(df)}")
 
+        # =========================================================
+        # BUILD PDVS
+        # =========================================================
         pdvs: List[PDVData] = []
 
         for idx, row in df.iterrows():
@@ -95,6 +95,9 @@ class RouteSpreadsheetUseCase:
                 )
             )
 
+        # =========================================================
+        # AGRUPAMENTO
+        # =========================================================
         grupos_dict: Dict[str, List[PDVData]] = {}
 
         for p in pdvs:
@@ -113,14 +116,11 @@ class RouteSpreadsheetUseCase:
 
             consultor = str(grupo_id).strip().upper()
 
-            try:
-                base_lat, base_lon = consultor_service.get_base(consultor)
-            except Exception:
-                raise ValueError(f"Consultor sem cadastro: {consultor}")
+            base_lat, base_lon = consultor_service.get_base(consultor)
 
             route_group = RouteGroup(
                 group_id=grupo_id,
-                group_type=lista_pdvs[0].fonte_grupo,
+                group_type=fonte,
                 centro_lat=base_lat,
                 centro_lon=base_lon,
                 n_pdvs=len(lista_pdvs),
@@ -139,6 +139,9 @@ class RouteSpreadsheetUseCase:
 
             resultados.append(result)
 
+        # =========================================================
+        # DATAFRAMES (mantido igual)
+        # =========================================================
         df_detalhe = []
         df_resumo = []
 
@@ -165,15 +168,9 @@ class RouteSpreadsheetUseCase:
                     df_detalhe.append({
                         "cnpj": p["cnpj"],
                         "nome_fantasia": p.get("nome_fantasia"),
-                        "endereco_completo": p.get("endereco_completo"),
-                        "logradouro": p.get("logradouro"),
-                        "numero": p.get("numero"),
-                        "bairro": p.get("bairro"),
                         "cidade": p.get("cidade"),
                         "uf": p.get("uf"),
-                        "cep": p.get("cep"),
                         "grupo_utilizado": p.get("grupo_utilizado"),
-                        "fonte_grupo": p.get("fonte_grupo"),
                         "rota_id": rota_id,
                         "sequencia": seq,
                         "lat": p.get("lat"),
@@ -186,6 +183,9 @@ class RouteSpreadsheetUseCase:
         df_detalhe = pd.DataFrame(df_detalhe)
         df_resumo = pd.DataFrame(df_resumo)
 
+        # =========================================================
+        # EXPORT
+        # =========================================================
         stats = self.distance_service.get_stats()
 
         df_metricas = pd.DataFrame([{
@@ -225,4 +225,38 @@ class RouteSpreadsheetUseCase:
 
         logger.success(f"[ROUTING_DONE] request_id={request_id} file={file_path}")
 
-        return file_path
+        # =========================================================
+        # 🔥 BUILD ROTAS (CORRETO COM GEOMETRIA REAL)
+        # =========================================================
+        rotas = []
+
+        rota_global_id = 1
+
+        for grupo in resultados:
+
+            for sub in grupo["subclusters"]:
+
+                rota_id = f"R{rota_global_id}"
+
+                rota_coord = sub.get("rota_coord", [])
+
+                if not rota_coord:
+                    rota_global_id += 1
+                    continue
+
+                rotas.append({
+                    "rota_id": rota_id,
+                    "cluster": sub.get("grupo_utilizado"),
+                    "veiculo": None,
+                    "rota_coord": rota_coord
+                })
+
+                rota_global_id += 1
+
+        # =========================================================
+        # RETURN FINAL
+        # =========================================================
+        return {
+            "output": file_path,
+            "rotas": rotas
+        }

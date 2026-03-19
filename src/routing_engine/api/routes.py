@@ -1,23 +1,30 @@
 #sales_router/src/routing_engine/api/routes.py
 
-# routing_engine/api/routes.py
-
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from routing_engine.api.dependencies import verify_token
 
 from routing_engine.infrastructure.queue_factory import get_queue
 from routing_engine.workers.routing_jobs import processar_routing
+from routing_engine.visualization.map_use_case import GenerateMapUseCase
 
 from rq.job import Job
 from redis import Redis
-
 import os
 import uuid
 
 router = APIRouter()
 
 MAX_UPLOAD_MB = 50
+
+
+# ============================================================
+# REDIS HELPER
+# ============================================================
+
+def get_redis_conn():
+    redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+    return Redis.from_url(redis_url)
 
 
 # ============================================================
@@ -30,7 +37,7 @@ def health():
 
 
 # ============================================================
-# UPLOAD (ASSÍNCRONO)
+# UPLOAD
 # ============================================================
 
 @router.post(
@@ -59,7 +66,8 @@ async def routing_upload(file: UploadFile = File(...)):
     with open(file_path, "wb") as f:
         f.write(file_bytes)
 
-    queue = get_queue("routing_jobs")
+    # 🔥 CORREÇÃO AQUI
+    queue = get_queue("routing_batch")
 
     job = queue.enqueue(
         processar_routing,
@@ -83,8 +91,7 @@ async def routing_upload(file: UploadFile = File(...)):
 )
 def job_status(job_id: str):
 
-    redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
-    conn = Redis.from_url(redis_url)
+    conn = get_redis_conn()
 
     try:
         job = Job.fetch(job_id, connection=conn)
@@ -117,8 +124,7 @@ def job_status(job_id: str):
 )
 def download_result(job_id: str):
 
-    redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
-    conn = Redis.from_url(redis_url)
+    conn = get_redis_conn()
 
     try:
         job = Job.fetch(job_id, connection=conn)
@@ -144,3 +150,40 @@ def download_result(job_id: str):
         filename=f"routing_{job_id}.xlsx",
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+
+# ============================================================
+# MAP (PADRÃO CORRETO)
+# ============================================================
+
+@router.get(
+    "/job/{job_id}/map",
+    dependencies=[Depends(verify_token)]
+)
+def job_map(job_id: str):
+
+    conn = get_redis_conn()
+
+    try:
+        job = Job.fetch(job_id, connection=conn)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+
+    if job.get_status() != "finished":
+        raise HTTPException(
+            status_code=400,
+            detail="Job ainda não finalizado"
+        )
+
+    json_path = job.meta.get("output_json")
+
+    if not json_path or not os.path.exists(json_path):
+        raise HTTPException(
+            status_code=404,
+            detail="JSON não encontrado"
+        )
+
+    uc = GenerateMapUseCase()
+    geojson = uc.execute(json_path)
+
+    return JSONResponse(content=geojson)

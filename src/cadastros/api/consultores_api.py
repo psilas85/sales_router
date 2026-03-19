@@ -1,4 +1,4 @@
-#sales_router/src/cadastros/api/consultores_api.py
+# sales_router/src/cadastros/api/consultores_api.py
 
 from datetime import datetime
 from typing import List, Optional
@@ -38,10 +38,14 @@ class ConsultorCreateSchema(BaseModel):
     celular: Optional[str] = Field(default=None, max_length=20)
     email: Optional[EmailStr] = None
 
+    # 🔥 OBRIGATÓRIO
+    lat: float
+    lon: float
+
 
 class ConsultorUpdateSchema(BaseModel):
     setor: Optional[str] = Field(default=None, max_length=10)
-    consultor: str = Field(..., min_length=2, max_length=120)
+    consultor: Optional[str] = Field(default=None, min_length=2, max_length=120)
     logradouro: Optional[str] = Field(default=None, max_length=200)
     numero: Optional[str] = Field(default=None, max_length=20)
     complemento: Optional[str] = Field(default=None, max_length=120)
@@ -51,6 +55,10 @@ class ConsultorUpdateSchema(BaseModel):
     cep: Optional[str] = Field(default=None, max_length=10)
     celular: Optional[str] = Field(default=None, max_length=20)
     email: Optional[EmailStr] = None
+
+    # 🔥 OBRIGATÓRIO NO UPDATE TAMBÉM
+    lat: float
+    lon: float
 
 
 class ConsultorResponseSchema(BaseModel):
@@ -68,11 +76,17 @@ class ConsultorResponseSchema(BaseModel):
     cep: Optional[str]
     celular: Optional[str]
     email: Optional[str]
+
+    # 🔥 AGORA RETORNA
+    lat: float
+    lon: float
+
     criado_em: Optional[datetime]
     atualizado_em: Optional[datetime]
 
     class Config:
         orm_mode = True
+
 
 # ============================================================
 # CRIAR CONSULTOR
@@ -89,8 +103,7 @@ def criar_consultor(
     request: Request
 ):
 
-    user = request.state.user
-    tenant_id = user["tenant_id"]
+    tenant_id = request.state.user["tenant_id"]
 
     consultor = Consultor(
         id=None,
@@ -107,6 +120,8 @@ def criar_consultor(
         cep=payload.cep,
         celular=payload.celular,
         email=payload.email,
+        lat=payload.lat,
+        lon=payload.lon,
     )
 
     criado = use_case.criar(consultor)
@@ -115,7 +130,7 @@ def criar_consultor(
 
 
 # ============================================================
-# LISTAR CONSULTORES
+# LISTAR
 # ============================================================
 
 @router.get(
@@ -123,23 +138,17 @@ def criar_consultor(
     response_model=List[ConsultorResponseSchema],
     dependencies=[Depends(verify_token)]
 )
-def listar_consultores(
-    request: Request
-):
+def listar_consultores(request: Request):
 
-    user = request.state.user
-    tenant_id = user["tenant_id"]
+    tenant_id = request.state.user["tenant_id"]
 
     dados = use_case.listar(tenant_id)
 
-    return [
-        ConsultorResponseSchema.from_orm(item)
-        for item in dados
-    ]
+    return [ConsultorResponseSchema.from_orm(item) for item in dados]
 
 
 # ============================================================
-# BUSCAR CONSULTOR POR ID
+# BUSCAR POR ID
 # ============================================================
 
 @router.get(
@@ -154,10 +163,7 @@ def buscar_consultor(
 
     tenant_id = request.state.user["tenant_id"]
 
-    consultor = use_case.buscar_por_id(
-        consultor_id,
-        tenant_id
-    )
+    consultor = use_case.buscar_por_id(consultor_id, tenant_id)
 
     if not consultor:
         raise HTTPException(
@@ -169,7 +175,7 @@ def buscar_consultor(
 
 
 # ============================================================
-# ATUALIZAR CONSULTOR
+# ATUALIZAR
 # ============================================================
 
 @router.put(
@@ -185,10 +191,7 @@ def atualizar_consultor(
 
     tenant_id = request.state.user["tenant_id"]
 
-    existente = use_case.buscar_por_id(
-        consultor_id,
-        tenant_id
-    )
+    existente = use_case.buscar_por_id(consultor_id, tenant_id)
 
     if not existente:
         raise HTTPException(
@@ -211,6 +214,10 @@ def atualizar_consultor(
         cep=payload.cep or existente.cep,
         celular=payload.celular or existente.celular,
         email=payload.email or existente.email,
+
+        # 🔥 obrigatório sempre
+        lat=payload.lat,
+        lon=payload.lon,
     )
 
     atualizado = use_case.atualizar(consultor)
@@ -225,7 +232,7 @@ def atualizar_consultor(
 
 
 # ============================================================
-# EXCLUIR CONSULTOR
+# EXCLUIR
 # ============================================================
 
 @router.delete(
@@ -240,10 +247,7 @@ def excluir_consultor(
 
     tenant_id = request.state.user["tenant_id"]
 
-    excluido = use_case.excluir(
-        consultor_id,
-        tenant_id
-    )
+    excluido = use_case.excluir(consultor_id, tenant_id)
 
     if not excluido:
         raise HTTPException(

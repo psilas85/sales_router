@@ -1,6 +1,5 @@
-#sales_router/src/cadastros/infrastructure/consultor_repository.py
+# sales_router/src/cadastros/infrastructure/consultor_repository.py
 
-from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 import uuid
@@ -10,6 +9,7 @@ from database.db_connection import get_connection
 
 
 class ConsultorRepository:
+
     def criar(self, consultor: Consultor) -> Consultor:
         conn = get_connection()
         cur = conn.cursor()
@@ -32,14 +32,16 @@ class ConsultorRepository:
                 cep,
                 celular,
                 email,
+                lat,
+                lon,
                 criado_em,
                 atualizado_em
             )
             VALUES (
-                %s, %s, %s,%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW()
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW()
             )
             RETURNING id, tenant_id, setor, consultor, cpf, logradouro, numero, complemento,
-                      bairro, cidade, uf, cep, celular, email, criado_em, atualizado_em
+                      bairro, cidade, uf, cep, celular, email, lat, lon, criado_em, atualizado_em
         """
 
         cur.execute(
@@ -59,6 +61,8 @@ class ConsultorRepository:
                 consultor.cep,
                 consultor.celular,
                 consultor.email,
+                consultor.lat,
+                consultor.lon,
             ),
         )
 
@@ -70,18 +74,19 @@ class ConsultorRepository:
 
         return self._row_to_entity(row)
 
-    def listar(self, tenant_id: UUID) -> List[Consultor]:
+    def listar(self, tenant_id: int) -> List[Consultor]:
         conn = get_connection()
         cur = conn.cursor()
 
         query = """
             SELECT id, tenant_id, setor, consultor, cpf, logradouro, numero, complemento,
-                   bairro, cidade, uf, cep, celular, email, criado_em, atualizado_em
+                   bairro, cidade, uf, cep, celular, email, lat, lon, criado_em, atualizado_em
             FROM consultores
             WHERE tenant_id = %s
             ORDER BY consultor
         """
-        cur.execute(query, (str(tenant_id),))
+
+        cur.execute(query, (tenant_id,))
         rows = cur.fetchall()
 
         cur.close()
@@ -89,18 +94,19 @@ class ConsultorRepository:
 
         return [self._row_to_entity(row) for row in rows]
 
-    def buscar_por_id(self, consultor_id: UUID, tenant_id: UUID) -> Optional[Consultor]:
+    def buscar_por_id(self, consultor_id: UUID, tenant_id: int) -> Optional[Consultor]:
         conn = get_connection()
         cur = conn.cursor()
 
         query = """
             SELECT id, tenant_id, setor, consultor, cpf, logradouro, numero, complemento,
-                   bairro, cidade, uf, cep, celular, email, criado_em, atualizado_em
+                   bairro, cidade, uf, cep, celular, email, lat, lon, criado_em, atualizado_em
             FROM consultores
             WHERE id = %s
               AND tenant_id = %s
         """
-        cur.execute(query, (str(consultor_id), str(tenant_id)))
+
+        cur.execute(query, (str(consultor_id), tenant_id))
         row = cur.fetchone()
 
         cur.close()
@@ -126,11 +132,13 @@ class ConsultorRepository:
                    cep = %s,
                    celular = %s,
                    email = %s,
+                   lat = %s,
+                   lon = %s,
                    atualizado_em = NOW()
              WHERE id = %s
                AND tenant_id = %s
          RETURNING id, tenant_id, setor, consultor, cpf, logradouro, numero, complemento,
-                   bairro, cidade, uf, cep, celular, email, criado_em, atualizado_em
+                   bairro, cidade, uf, cep, celular, email, lat, lon, criado_em, atualizado_em
         """
 
         cur.execute(
@@ -148,8 +156,10 @@ class ConsultorRepository:
                 consultor.cep,
                 consultor.celular,
                 consultor.email,
+                consultor.lat,
+                consultor.lon,
                 str(consultor.id),
-                str(consultor.tenant_id),
+                consultor.tenant_id,
             ),
         )
 
@@ -161,7 +171,7 @@ class ConsultorRepository:
 
         return self._row_to_entity(row) if row else None
 
-    def excluir(self, consultor_id: UUID, tenant_id: UUID) -> bool:
+    def excluir(self, consultor_id: UUID, tenant_id: int) -> bool:
         conn = get_connection()
         cur = conn.cursor()
 
@@ -170,8 +180,10 @@ class ConsultorRepository:
             WHERE id = %s
               AND tenant_id = %s
         """
-        cur.execute(query, (str(consultor_id), str(tenant_id)))
+
+        cur.execute(query, (str(consultor_id), tenant_id))
         deleted = cur.rowcount > 0
+
         conn.commit()
 
         cur.close()
@@ -195,6 +207,8 @@ class ConsultorRepository:
             cep=row[11],
             celular=row[12],
             email=row[13],
-            criado_em=row[14],
-            atualizado_em=row[15],
+            lat=row[14],
+            lon=row[15],
+            criado_em=row[16],
+            atualizado_em=row[17],
         )

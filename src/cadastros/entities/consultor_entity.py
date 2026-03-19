@@ -1,4 +1,4 @@
-#sales_router/src/cadastros/entities/consultor_entity.py
+# sales_router/src/cadastros/entities/consultor_entity.py
 
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,8 +19,13 @@ class Consultor:
     bairro: str
     cidade: str
     uf: str
-    cep: str   
+    cep: str
     celular: Optional[str]
     email: Optional[str]
+
+    # 🔥 OBRIGATÓRIOS
+    lat: float
+    lon: float
+
     criado_em: Optional[datetime] = None
     atualizado_em: Optional[datetime] = None

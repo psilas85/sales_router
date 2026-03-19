@@ -1,5 +1,7 @@
 # sales_router/src/routing_engine/main_routing_spreadsheet.py
 
+# sales_router/src/routing_engine/main_routing_spreadsheet.py
+
 import sys
 import json
 import time
@@ -14,6 +16,13 @@ def log_progress(pct, step):
         "event": "progress",
         "pct": pct,
         "step": step
+    }), flush=True)
+
+
+def log_routes(rotas):
+    print(json.dumps({
+        "event": "routes",
+        "data": rotas
     }), flush=True)
 
 
@@ -39,6 +48,27 @@ if __name__ == "__main__":
         file_bytes=file_bytes,
         filename="input.xlsx"
     )
+
+    # =========================================================
+    # 🔥 EXTRAI ROTAS (CRÍTICO)
+    # =========================================================
+    rotas = []
+
+    if isinstance(result, dict):
+
+        # padrão ideal (se já vier estruturado)
+        if "rotas" in result:
+            rotas = result["rotas"]
+
+        # fallback (se você ainda não estruturou o use case)
+        elif "dados" in result:
+            # você pode adaptar depois — aqui só placeholder
+            rotas = result["dados"]
+
+    print(json.dumps(rotas[:1], indent=2), flush=True)
+    
+    # envia para o worker
+    log_routes(rotas)
 
     # =========================================================
     # 🔥 GARANTE OUTPUT NO CAMINHO CERTO
