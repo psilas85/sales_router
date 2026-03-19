@@ -38,7 +38,6 @@ class ConsultorCreateSchema(BaseModel):
     celular: Optional[str] = Field(default=None, max_length=20)
     email: Optional[EmailStr] = None
 
-    # 🔥 OBRIGATÓRIO
     lat: float
     lon: float
 
@@ -56,7 +55,6 @@ class ConsultorUpdateSchema(BaseModel):
     celular: Optional[str] = Field(default=None, max_length=20)
     email: Optional[EmailStr] = None
 
-    # 🔥 OBRIGATÓRIO NO UPDATE TAMBÉM
     lat: float
     lon: float
 
@@ -77,7 +75,6 @@ class ConsultorResponseSchema(BaseModel):
     celular: Optional[str]
     email: Optional[str]
 
-    # 🔥 AGORA RETORNA
     lat: float
     lon: float
 
@@ -89,7 +86,15 @@ class ConsultorResponseSchema(BaseModel):
 
 
 # ============================================================
-# CRIAR CONSULTOR
+# UTILS
+# ============================================================
+
+def to_schema(obj: Consultor) -> ConsultorResponseSchema:
+    return ConsultorResponseSchema(**obj.__dict__)
+
+
+# ============================================================
+# CRIAR
 # ============================================================
 
 @router.post(
@@ -98,10 +103,7 @@ class ConsultorResponseSchema(BaseModel):
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(verify_token)]
 )
-def criar_consultor(
-    payload: ConsultorCreateSchema,
-    request: Request
-):
+def criar_consultor(payload: ConsultorCreateSchema, request: Request):
 
     tenant_id = request.state.user["tenant_id"]
 
@@ -126,7 +128,7 @@ def criar_consultor(
 
     criado = use_case.criar(consultor)
 
-    return ConsultorResponseSchema.from_orm(criado)
+    return to_schema(criado)
 
 
 # ============================================================
@@ -144,7 +146,7 @@ def listar_consultores(request: Request):
 
     dados = use_case.listar(tenant_id)
 
-    return [ConsultorResponseSchema.from_orm(item) for item in dados]
+    return [to_schema(item) for item in dados]
 
 
 # ============================================================
@@ -156,10 +158,7 @@ def listar_consultores(request: Request):
     response_model=ConsultorResponseSchema,
     dependencies=[Depends(verify_token)]
 )
-def buscar_consultor(
-    consultor_id: UUID,
-    request: Request
-):
+def buscar_consultor(consultor_id: UUID, request: Request):
 
     tenant_id = request.state.user["tenant_id"]
 
@@ -171,7 +170,7 @@ def buscar_consultor(
             detail="Consultor não encontrado."
         )
 
-    return ConsultorResponseSchema.from_orm(consultor)
+    return to_schema(consultor)
 
 
 # ============================================================
@@ -214,8 +213,6 @@ def atualizar_consultor(
         cep=payload.cep or existente.cep,
         celular=payload.celular or existente.celular,
         email=payload.email or existente.email,
-
-        # 🔥 obrigatório sempre
         lat=payload.lat,
         lon=payload.lon,
     )
@@ -228,7 +225,7 @@ def atualizar_consultor(
             detail="Consultor não encontrado para atualização."
         )
 
-    return ConsultorResponseSchema.from_orm(atualizado)
+    return to_schema(atualizado)
 
 
 # ============================================================
@@ -240,10 +237,7 @@ def atualizar_consultor(
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(verify_token)]
 )
-def excluir_consultor(
-    consultor_id: UUID,
-    request: Request
-):
+def excluir_consultor(consultor_id: UUID, request: Request):
 
     tenant_id = request.state.user["tenant_id"]
 
