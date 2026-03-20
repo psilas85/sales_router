@@ -1,6 +1,6 @@
 #sales_router/src/routing_engine/api/routes.py
 
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Form
 from fastapi.responses import FileResponse, JSONResponse
 from routing_engine.api.dependencies import verify_token
 
@@ -12,6 +12,7 @@ from rq.job import Job
 from redis import Redis
 import os
 import uuid
+import json
 
 router = APIRouter()
 
@@ -44,42 +45,49 @@ def health():
     "/upload",
     dependencies=[Depends(verify_token)]
 )
-async def routing_upload(file: UploadFile = File(...)):
+async def routing_upload(
+    file: UploadFile = File(...),
+    params: str | None = Form(None)
+):
 
-    if not file.filename.endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Arquivo deve ser XLSX")
+        if not file.filename.endswith(".xlsx"):
+            raise HTTPException(status_code=400, detail="Arquivo deve ser XLSX")
 
-    file_bytes = await file.read()
+        file_bytes = await file.read()
 
-    if len(file_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Arquivo muito grande (máx {MAX_UPLOAD_MB}MB)"
+        if len(file_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Arquivo muito grande (máx {MAX_UPLOAD_MB}MB)"
+            )
+
+        try:
+            parsed_params = json.loads(params) if params else {}
+        except Exception:
+            raise HTTPException(400, "Parâmetros inválidos")
+
+        UPLOAD_DIR = "/app/data/uploads"
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+        file_id = str(uuid.uuid4())
+        file_path = f"{UPLOAD_DIR}/{file_id}.xlsx"
+
+        with open(file_path, "wb") as f:
+            f.write(file_bytes)
+
+        queue = get_queue("routing_batch")
+
+        job = queue.enqueue(
+            processar_routing,
+            file_path,
+            parsed_params,
+            job_timeout=36000
         )
 
-    UPLOAD_DIR = "/app/data/uploads"
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-    file_id = str(uuid.uuid4())
-    file_path = f"{UPLOAD_DIR}/{file_id}.xlsx"
-
-    with open(file_path, "wb") as f:
-        f.write(file_bytes)
-
-    # 🔥 CORREÇÃO AQUI
-    queue = get_queue("routing_batch")
-
-    job = queue.enqueue(
-        processar_routing,
-        file_path,
-        job_timeout=36000
-    )
-
-    return {
-        "status": "queued",
-        "job_id": job.id
-    }
-
+        return {
+            "status": "queued",
+            "job_id": job.id
+        }
 
 # ============================================================
 # JOB STATUS
@@ -103,6 +111,7 @@ def job_status(job_id: str):
         "status": job.get_status(),
         "progress": job.meta.get("progress"),
         "step": job.meta.get("step"),
+        "summary": job.meta.get("summary")
     }
 
     if job.is_finished:
@@ -187,3 +196,4 @@ def job_map(job_id: str):
     geojson = uc.execute(json_path)
 
     return JSONResponse(content=geojson)
+

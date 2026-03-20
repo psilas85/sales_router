@@ -53,10 +53,12 @@ class RouteSpreadsheetUseCase:
         freq_visita: float = 1.0,
         min_pdvs_rota: int = 8,
         max_pdvs_rota: int = 12,
-        aplicar_two_opt: bool = False,
+        aplicar_two_opt: bool = True,
         output_dir: str = "/app/data/outputs"
     ) -> dict:
 
+        aplicar_two_opt = True
+        
         start = time.time()
         request_id = str(uuid.uuid4())
 
@@ -258,5 +260,11 @@ class RouteSpreadsheetUseCase:
         # =========================================================
         return {
             "output": file_path,
-            "rotas": rotas
+            "rotas": rotas,
+            "metricas": {
+                "total_pdvs": len(pdvs),
+                "total_grupos": total_grupos,
+                "total_rotas": rota_global_id - 1,
+                "tempo_execucao_ms": int((time.time() - start) * 1000)
+            }
         }

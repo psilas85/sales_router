@@ -87,7 +87,9 @@ def normalizar_rotas(rotas_raw):
 # =========================================================
 # 🚀 PROCESSAMENTO PRINCIPAL
 # =========================================================
-def processar_routing(file_path):
+def processar_routing(file_path, params=None):
+
+    params = params or {}
 
     job = get_current_job()
     job_id = str(job.id) if job and job.id else str(uuid4())
@@ -99,6 +101,7 @@ def processar_routing(file_path):
     output_json = f"{OUTPUT_DIR}/{job_id}.json"
 
     logger.info(f"🚀 Routing job iniciado | job_id={job_id}")
+    logger.info(f"⚙️ Params recebidos: {params}")
 
     if job:
         job.meta.update({
@@ -109,12 +112,15 @@ def processar_routing(file_path):
         })
         job.save_meta()
 
+    params_str = json.dumps(params)
+
     comando = [
         "python3",
         "-u",
         "/app/src/routing_engine/main_routing_spreadsheet.py",
         file_path,
-        output_file
+        output_file,
+        params_str
     ]
 
     logger.info(f"▶️ Executando: {' '.join(comando)}")
@@ -181,11 +187,24 @@ def processar_routing(file_path):
 
     logger.info(f"🗺️ JSON de rotas salvo: {output_json}")
 
+    metricas = {}
+
+    if resumo and isinstance(resumo.get("output"), dict):
+        metricas = resumo["output"].get("metricas", {})
+
+    summary = {
+        "total_pdvs": metricas.get("total_pdvs"),
+        "total_rotas": metricas.get("total_rotas"),
+        "total_grupos": metricas.get("total_grupos"),
+        "tempo_execucao_ms": metricas.get("tempo_execucao_ms")
+    }
+
     if job:
         job.meta.update({
             "progress": 100,
             "step": "Finalizado",
-            "output_json": output_json
+            "output_json": output_json,
+            "summary": summary   # 🔥 AGORA VAI FUNCIONAR
         })
         job.save_meta()
 

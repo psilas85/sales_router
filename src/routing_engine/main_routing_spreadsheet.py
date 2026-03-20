@@ -31,6 +31,16 @@ if __name__ == "__main__":
     file_path = sys.argv[1]
     output_file = sys.argv[2]
 
+    params = {}
+
+    if len(sys.argv) > 3:
+        try:
+            params = json.loads(sys.argv[3])
+        except Exception:
+            params = {}
+
+    print(f"⚙️ Params recebidos: {params}", flush=True)
+
     start = time.time()
 
     log_progress(5, "Carregando arquivo")
@@ -46,9 +56,9 @@ if __name__ == "__main__":
 
     result = uc.execute(
         file_bytes=file_bytes,
-        filename="input.xlsx"
+        filename="input.xlsx",
+        **params
     )
-
     # =========================================================
     # 🔥 EXTRAI ROTAS (CRÍTICO)
     # =========================================================
