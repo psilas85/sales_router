@@ -23,7 +23,7 @@ def log_routes(rotas):
     print(json.dumps({
         "event": "routes",
         "data": rotas
-    }), flush=True)
+    }, default=str), flush=True)
 
 
 if __name__ == "__main__":
@@ -75,7 +75,7 @@ if __name__ == "__main__":
             # você pode adaptar depois — aqui só placeholder
             rotas = result["dados"]
 
-    print(json.dumps(rotas[:1], indent=2), flush=True)
+    print(json.dumps(rotas[:1], indent=2, default=str), flush=True)
     
     # envia para o worker
     log_routes(rotas)
@@ -101,4 +101,4 @@ if __name__ == "__main__":
         "output": result,
         "output_file": output_file,
         "tempo_execucao_ms": elapsed
-    }), flush=True)
+    }, default=str), flush=True)

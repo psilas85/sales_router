@@ -11,6 +11,8 @@ import math
 import pandas as pd
 from loguru import logger
 
+from routing_engine.routing_task_parallel import executar_routing_job
+
 from routing_engine.services.spreadsheet_loader_service import SpreadsheetLoaderService
 from routing_engine.domain.spreadsheet_validator import SpreadsheetValidator
 from routing_engine.domain.entities import PDVData, RouteGroup
@@ -31,17 +33,48 @@ class RouteSpreadsheetUseCase:
         self.loader = SpreadsheetLoaderService()
         self.validator = SpreadsheetValidator()
 
-        self.distance_service = RouteDistanceService()
-
-        self.route_optimizer = RouteOptimizer(
-            v_kmh=30,
-            service_min=20,
-            alpha_path=1.3,
-            distance_service=self.distance_service
-        )
-
+        
         self.history_repo = RoutingHistoryRepository()
         self.exporter = ExcelExporter()
+
+    def _processar_grupo(
+        self,
+        grupo_id,
+        lista_pdvs,
+        consultor_service,
+        dias_uteis,
+        freq_visita,
+        aplicar_two_opt,
+        min_pdvs_rota,
+        max_pdvs_rota
+    ):
+        fonte = lista_pdvs[0].fonte_grupo
+
+        if fonte != "consultor":
+            raise ValueError("Modo atual exige agrupamento por consultor")
+
+        consultor = str(grupo_id).strip().upper()
+
+        base_lat, base_lon = consultor_service.get_base(consultor)
+
+        route_group = RouteGroup(
+            group_id=grupo_id,
+            group_type=fonte,
+            centro_lat=base_lat,
+            centro_lon=base_lon,
+            n_pdvs=len(lista_pdvs),
+            pdvs=lista_pdvs
+        )
+
+        return dividir_grupo_em_rotas_balanceadas(
+            route_group=route_group,
+            dias_uteis=dias_uteis,
+            freq_padrao=freq_visita,
+            route_optimizer=self.route_optimizer,
+            aplicar_two_opt=aplicar_two_opt,
+            min_pdvs_rota=min_pdvs_rota,
+            max_pdvs_rota=max_pdvs_rota
+        )
 
     def execute(
         self,
@@ -57,8 +90,6 @@ class RouteSpreadsheetUseCase:
         output_dir: str = "/app/data/outputs"
     ) -> dict:
 
-        aplicar_two_opt = True
-        
         start = time.time()
         request_id = str(uuid.uuid4())
 
@@ -106,43 +137,44 @@ class RouteSpreadsheetUseCase:
             grupos_dict.setdefault(p.grupo_utilizado, []).append(p)
 
         total_grupos = len(grupos_dict)
+        
+        # =========================================================
+        # 🚀 EXECUÇÃO PARALELA POR GRUPO (RQ)
+        # =========================================================
+        resultados, stats = executar_routing_job(grupos_dict, {
+            "tenant_id": tenant_id,
+            "dias_uteis": dias_uteis,
+            "freq_visita": freq_visita,
+            "min_pdvs_rota": min_pdvs_rota,
+            "max_pdvs_rota": max_pdvs_rota,
+            "aplicar_two_opt": True,
 
-        resultados = []
+            # 🔥 DEFAULTS (correto aqui)
+            "v_kmh": 60.0,
+            "service_min": 30.0,
+            "alpha_path": 1.3
+        })
 
-        for grupo_id, lista_pdvs in grupos_dict.items():
+        stats = stats or {}
 
-            fonte = lista_pdvs[0].fonte_grupo
-
-            if fonte != "consultor":
-                raise ValueError("Modo atual exige agrupamento por consultor")
-
-            consultor = str(grupo_id).strip().upper()
-
-            base_lat, base_lon = consultor_service.get_base(consultor)
-
-            route_group = RouteGroup(
-                group_id=grupo_id,
-                group_type=fonte,
-                centro_lat=base_lat,
-                centro_lon=base_lon,
-                n_pdvs=len(lista_pdvs),
-                pdvs=lista_pdvs
-            )
-
-            result = dividir_grupo_em_rotas_balanceadas(
-                route_group=route_group,
-                dias_uteis=dias_uteis,
-                freq_padrao=freq_visita,
-                route_optimizer=self.route_optimizer,
-                aplicar_two_opt=aplicar_two_opt,
-                min_pdvs_rota=min_pdvs_rota,
-                max_pdvs_rota=max_pdvs_rota
-            )
-
-            resultados.append(result)
+        cache_hits = stats.get("cache_hits", 0)
+        osrm_hits = stats.get("osrm_hits", 0)
+        google_hits = stats.get("google_hits", 0)
+        haversine_hits = stats.get("haversine_hits", 0)
 
         # =========================================================
-        # DATAFRAMES (mantido igual)
+        # 🔒 VALIDAÇÃO DE INTEGRIDADE
+        # =========================================================
+        logger.error(f"Resultados recebidos: {len(resultados)} / {total_grupos}")
+        if len(resultados) != total_grupos:
+            logger.error(f"❌ Grupos perdidos: esperado={total_grupos} recebido={len(resultados)}")
+            raise RuntimeError("Falha em subjobs de roteirização")
+
+        # garante ordem determinística
+        resultados.sort(key=lambda x: str(x.get("grupo_utilizado", "")))
+
+        # =========================================================
+        # DATAFRAMES
         # =========================================================
         df_detalhe = []
         df_resumo = []
@@ -151,14 +183,17 @@ class RouteSpreadsheetUseCase:
 
         for grupo in resultados:
 
+            if not grupo.get("subclusters"):
+                continue
+
             for sub in grupo["subclusters"]:
 
                 rota_id = f"R{rota_global_id}"
 
                 df_resumo.append({
                     "rota_id": rota_id,
-                    "grupo_utilizado": sub["grupo_utilizado"],
-                    "fonte_grupo": sub["fonte_grupo"],
+                    "grupo_utilizado": grupo.get("grupo_utilizado"),
+                    "fonte_grupo": "consultor",
                     "qtd_pdvs": sub["n_pdvs"],
                     "distancia_km": sub["dist_total_km"],
                     "tempo_min": sub["tempo_total_min"],
@@ -188,16 +223,14 @@ class RouteSpreadsheetUseCase:
         # =========================================================
         # EXPORT
         # =========================================================
-        stats = self.distance_service.get_stats()
-
         df_metricas = pd.DataFrame([{
             "total_pdvs": len(pdvs),
             "total_grupos": total_grupos,
             "total_rotas": rota_global_id - 1,
-            "cache_hits": stats["cache_hits"],
-            "osrm_hits": stats["osrm_hits"],
-            "google_hits": stats["google_hits"],
-            "haversine_hits": stats["haversine_hits"],
+            "cache_hits": cache_hits,
+            "osrm_hits": osrm_hits,
+            "google_hits": google_hits,
+            "haversine_hits": haversine_hits,
             "tempo_execucao_ms": int((time.time() - start) * 1000)
         }])
 
@@ -218,23 +251,26 @@ class RouteSpreadsheetUseCase:
             total_pdvs=len(pdvs),
             total_grupos=total_grupos,
             total_rotas=rota_global_id - 1,
-            cache_hits=stats["cache_hits"],
-            osrm_hits=stats["osrm_hits"],
-            google_hits=stats["google_hits"],
-            haversine_hits=stats["haversine_hits"],
+            cache_hits=cache_hits,
+            osrm_hits=osrm_hits,
+            google_hits=google_hits,
+            haversine_hits=haversine_hits,
             tempo_execucao_ms=int((time.time() - start) * 1000)
         )
 
         logger.success(f"[ROUTING_DONE] request_id={request_id} file={file_path}")
 
         # =========================================================
-        # 🔥 BUILD ROTAS (CORRETO COM GEOMETRIA REAL)
+        # BUILD ROTAS (MAPA)
         # =========================================================
         rotas = []
 
         rota_global_id = 1
 
         for grupo in resultados:
+
+            if not grupo.get("subclusters"):
+                continue
 
             for sub in grupo["subclusters"]:
 
@@ -248,7 +284,7 @@ class RouteSpreadsheetUseCase:
 
                 rotas.append({
                     "rota_id": rota_id,
-                    "cluster": sub.get("grupo_utilizado"),
+                    "cluster": grupo.get("grupo_utilizado"),
                     "veiculo": None,
                     "rota_coord": rota_coord
                 })
@@ -265,6 +301,10 @@ class RouteSpreadsheetUseCase:
                 "total_pdvs": len(pdvs),
                 "total_grupos": total_grupos,
                 "total_rotas": rota_global_id - 1,
+                "cache_hits": cache_hits,
+                "osrm_hits": osrm_hits,
+                "google_hits": google_hits,
+                "haversine_hits": haversine_hits,
                 "tempo_execucao_ms": int((time.time() - start) * 1000)
             }
         }

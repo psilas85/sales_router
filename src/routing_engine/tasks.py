@@ -10,7 +10,7 @@ def enqueue_routing(file_path: str):
     job = queue.enqueue(
         processar_routing,
         file_path,
-        job_timeout=3600
+        job_timeout=7200
     )
 
     return job.id

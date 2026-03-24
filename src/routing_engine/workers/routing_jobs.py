@@ -175,8 +175,7 @@ def processar_routing(file_path, params=None):
     proc.wait()
 
     if proc.returncode != 0:
-        logger.error(f"❌ subprocess retornou código {proc.returncode}")
-        raise RuntimeError("Routing subprocess falhou")
+        raise RuntimeError(f"Routing subprocess falhou (code={proc.returncode})")
 
     logger.info(f"✅ Routing job finalizado | job_id={job_id}")
 
@@ -196,7 +195,11 @@ def processar_routing(file_path, params=None):
         "total_pdvs": metricas.get("total_pdvs"),
         "total_rotas": metricas.get("total_rotas"),
         "total_grupos": metricas.get("total_grupos"),
-        "tempo_execucao_ms": metricas.get("tempo_execucao_ms")
+        "tempo_execucao_ms": metricas.get("tempo_execucao_ms"),
+        "cache_hits": metricas.get("cache_hits"),
+        "osrm_hits": metricas.get("osrm_hits"),
+        "google_hits": metricas.get("google_hits"),
+        "haversine_hits": metricas.get("haversine_hits"),
     }
 
     if job:

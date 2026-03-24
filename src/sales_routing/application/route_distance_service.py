@@ -29,7 +29,7 @@ class RouteDistanceService:
         # ============================================================
         # ⚙️ Parâmetros operacionais configuráveis
         # ============================================================
-        self.v_kmh = v_kmh or float(os.getenv("VEL_KMH", 30.0))
+        self.v_kmh = v_kmh or float(os.getenv("VEL_KMH", 60.0))
         self.alpha_path = alpha_path or float(os.getenv("ALPHA_PATH", 1.3))
 
         # ============================================================
@@ -112,7 +112,7 @@ class RouteDistanceService:
                 # 4️⃣ Haversine (último recurso)
                 # ============================================================
                 if dist_km is None:
-                    v_kmh = self.v_kmh or float(os.getenv("VEL_KMH", 30.0))
+                    v_kmh = self.v_kmh or float(os.getenv("VEL_KMH", 60.0))
                     dist_km = self._haversine_km(a, b) * self.alpha_path
                     tempo_min = (dist_km / v_kmh) * 60
                     rota_coord = [
@@ -342,7 +342,7 @@ class RouteDistanceService:
         # ============================================================
         # 3️⃣ Haversine Fallback (multi-stop incremental)
         # ============================================================
-        v_kmh = self.v_kmh or float(os.getenv("VEL_KMH", 30.0))
+        v_kmh = self.v_kmh or float(os.getenv("VEL_KMH", 60.0))
         total_km, total_min, coords = 0.0, 0.0, []
 
         for i in range(len(coords_list) - 1):

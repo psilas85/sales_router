@@ -88,8 +88,8 @@ def main():
     # ======================================================
     # APLICAR DEFAULTS CONDICIONAIS
     # ======================================================
-    service_min = aplicar_default(args.service_min, 20.0)
-    v_kmh = aplicar_default(args.v_kmh, 30.0)
+    service_min = aplicar_default(args.service_min, 30.0)
+    v_kmh = aplicar_default(args.v_kmh, 60.0)
     alpha_path = aplicar_default(args.alpha_path, 1.3)
 
     dias_uteis = aplicar_default(args.dias_uteis, 21)

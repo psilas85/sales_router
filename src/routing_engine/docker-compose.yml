@@ -51,8 +51,6 @@ services:
       context: ../..
       dockerfile: ./src/routing_engine/Dockerfile.routing
 
-    container_name: routing_batch_worker
-
     env_file:
       - ../../.env
 
@@ -78,6 +76,31 @@ services:
 
     restart: always
 
+  routing_subjobs_worker:
+
+    build:
+      context: ../..
+      dockerfile: ./src/routing_engine/Dockerfile.routing
+
+    env_file:
+      - ../../.env
+
+    environment:
+      - PYTHONPATH=/app/src
+      - REDIS_URL=redis://redis:6379/0
+
+    volumes:
+      - ../../src:/app/src
+      - ../../data:/app/data
+      - ../../output:/app/output
+
+    networks:
+      - sales_router_net
+
+    command: >
+      rq worker -v -u redis://redis:6379/0 routing_subjobs
+
+    restart: always
 
 networks:
   sales_router_net:

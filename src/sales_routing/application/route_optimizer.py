@@ -33,116 +33,129 @@ class RouteOptimizer:
             return lon, lat  # ← CORREÇÃO: inverte aqui
         return lat, lon
 
-    # ============================================================
-    # Cálculo principal de rota com tratamento de coordenadas idênticas
-    # ============================================================
     def calcular_rota(self, centro: dict, pdvs: list[dict], aplicar_two_opt: bool = False) -> dict:
+
         if not pdvs:
-            return {"sequencia": [], "distancia_total_km": 0, "tempo_total_min": 0, "rota_coord": []}
+            return {
+                "sequencia": [],
+                "distancia_total_km": 0.0,
+                "tempo_total_min": 0.0,
+                "rota_coord": []
+            }
 
-        logger.info(f"🚦 Iniciando cálculo de rota | PDVs={len(pdvs)} | Centro=({centro['lat']},{centro['lon']})")
+        logger.info(
+            f"🚦 Iniciando cálculo de rota | PDVs={len(pdvs)} | Centro=({centro['lat']},{centro['lon']})"
+        )
 
+        # ============================================================
+        # 1️⃣ Sequenciamento (NN + opcional 2-opt)
+        # ============================================================
         rota = self.nearest_neighbor(centro, pdvs)
-        if aplicar_two_opt:
+
+        if aplicar_two_opt and len(rota) >= 4:
             rota = self.two_opt(rota)
 
-        pontos = [centro] + rota + [centro]  # ✅ inclui retorno ao centro
-        rota_coords = []
-        total_km, total_min = 0.0, 0.0
-        warnings = 0
-        fallback_usado = False
+        # ============================================================
+        # 2️⃣ Monta lista de pontos (com ida e volta)
+        # ============================================================
+        pontos = [centro] + rota + [centro]
 
-        for i in range(len(pontos) - 1):
-            a, b = pontos[i], pontos[i + 1]
-            lat_a, lon_a = self._normalizar_coord(a["lat"], a["lon"])
-            lat_b, lon_b = self._normalizar_coord(b["lat"], b["lon"])
-
-            if lat_a is None or lat_b is None:
+        coords_list = []
+        for p in pontos:
+            lat, lon = self._normalizar_coord(p.get("lat"), p.get("lon"))
+            if lat is None or lon is None:
                 continue
-
-            # ========================================================
-            # 🔸 Coordenadas idênticas
-            # ========================================================
-            if abs(lat_a - lat_b) < 1e-5 and abs(lon_a - lon_b) < 1e-5:
-                logger.warning(
-                    f"⚠️ Coordenadas idênticas entre ({a.get('pdv_id', 'N/A')}) e ({b.get('pdv_id', 'N/A')}). "
-                    "Tempo de serviço considerado, sem deslocamento."
-                )
-                total_min += self.service_min
-                warnings += 1
-                continue
-
-            # ========================================================
-            # 🔹 Tentativa com serviço de distância (OSRM/Google/cache)
-            # ========================================================
-            try:
-                result = self.distance_service.get_distance_time((lat_a, lon_a), (lat_b, lon_b))
-                total_km += result["distancia_km"]
-                total_min += result["tempo_min"]
-
-                coords_segmento = result.get("rota_coord", [])
-                if coords_segmento:
-                    rota_coords.extend([{"lat": c["lat"], "lon": c["lon"]} for c in coords_segmento])
-                else:
-                    # Fallback leve: apenas início e fim
-                    rota_coords.append({"lat": lat_a, "lon": lon_a})
-                    rota_coords.append({"lat": lat_b, "lon": lon_b})
-                    fallback_usado = True
-
-            # ========================================================
-            # 🔸 Fallback total: cálculo geodésico direto
-            # ========================================================
-            except Exception as e:
-                logger.warning(f"⚠️ Fallback geodesic entre ({lat_a},{lon_a}) e ({lat_b},{lon_b}) — {e}")
-                total_km += geodesic((lat_a, lon_a), (lat_b, lon_b)).km * self.alpha_path
-                rota_coords.append({"lat": lat_a, "lon": lon_a})
-                rota_coords.append({"lat": lat_b, "lon": lon_b})
-                fallback_usado = True
+            coords_list.append((lat, lon))
 
         # ============================================================
-        # 🧩 Garantir que a rota comece e termine no centro
+        # 3️⃣ 🚀 ROTA COMPLETA (OSRM TRIP)
         # ============================================================
-        if not rota_coords:
+        try:
+            result = self.distance_service.get_full_route(coords_list)
+
+            rota_coords = result.get("rota_coord", [])
+            total_km = float(result.get("distancia_km", 0.0))
+            total_min = float(result.get("tempo_min", 0.0))
+            fonte = result.get("fonte", "unknown")
+
+        except Exception as e:
+            logger.warning(f"⚠️ Falha rota completa ({e}) — fallback segmentado")
+
+            # ========================================================
+            # 🔁 FALLBACK SEGMENTADO (robustez)
+            # ========================================================
+            rota_coords = []
+            total_km = 0.0
+            total_min = 0.0
+
+            for i in range(len(coords_list) - 1):
+                a = coords_list[i]
+                b = coords_list[i + 1]
+
+                try:
+                    res = self.distance_service.get_distance_time(a, b)
+
+                    total_km += float(res["distancia_km"])
+                    total_min += float(res["tempo_min"])
+
+                    seg = res.get("rota_coord") or [
+                        {"lat": a[0], "lon": a[1]},
+                        {"lat": b[0], "lon": b[1]},
+                    ]
+
+                    # evita duplicar pontos
+                    if rota_coords and seg:
+                        if (
+                            rota_coords[-1]["lat"] == seg[0]["lat"]
+                            and rota_coords[-1]["lon"] == seg[0]["lon"]
+                        ):
+                            seg = seg[1:]
+
+                    rota_coords.extend(seg)
+
+                except Exception:
+                    continue
+
+            fonte = "fallback_segmentado"
+
+        # ============================================================
+        # 4️⃣ Garantir início e fim no centro
+        # ============================================================
+        if rota_coords:
+            first = rota_coords[0]
+            last = rota_coords[-1]
+
+            if abs(first["lat"] - centro["lat"]) > 1e-4:
+                rota_coords.insert(0, {"lat": centro["lat"], "lon": centro["lon"]})
+
+            if abs(last["lat"] - centro["lat"]) > 1e-4:
+                rota_coords.append({"lat": centro["lat"], "lon": centro["lon"]})
+        else:
+            # fallback extremo
             rota_coords = (
                 [{"lat": centro["lat"], "lon": centro["lon"]}]
                 + [{"lat": p["lat"], "lon": p["lon"]} for p in rota]
                 + [{"lat": centro["lat"], "lon": centro["lon"]}]
             )
-            logger.warning("⚠️ Nenhuma coordenada retornada — rota construída por fallback geométrico (centro → PDVs → centro).")
-            fallback_usado = True
-        else:
-            # garante início e fim no centro se faltarem
-            first = rota_coords[0]
-            last = rota_coords[-1]
-            if abs(first["lat"] - centro["lat"]) > 1e-4 or abs(first["lon"] - centro["lon"]) > 1e-4:
-                rota_coords.insert(0, {"lat": centro["lat"], "lon": centro["lon"]})
-            if abs(last["lat"] - centro["lat"]) > 1e-4 or abs(last["lon"] - centro["lon"]) > 1e-4:
-                rota_coords.append({"lat": centro["lat"], "lon": centro["lon"]})
 
         # ============================================================
-        # ⏱️ Tempo total inclui o tempo de serviço em cada PDV
+        # 5️⃣ Tempo de serviço (paradas)
         # ============================================================
-        total_min += len(pdvs) * self.service_min
+        total_min += len(rota) * self.service_min
 
         # ============================================================
-        # 🧾 Logs finais
+        # 6️⃣ LOG FINAL
         # ============================================================
-        if warnings > 0:
-            logger.warning(f"⚠️ {warnings} pares consecutivos com coordenadas idênticas tratados sem erro.")
-
-        if fallback_usado:
-            logger.warning("⚠️ Rota gerada parcialmente via fallback (Haversine ou reconstrução simples).")
-
         logger.success(
-            f"✅ Rota concluída | PDVs={len(pdvs)} | Dist={round(total_km,2)} km | Tempo={round(total_min,1)} min | "
-            f"Pontos={len(rota_coords)}"
+            f"✅ Rota concluída | PDVs={len(rota)} | dist={round(total_km,2)} km | "
+            f"tempo={round(total_min,1)} min | fonte={fonte}"
         )
 
         return {
             "sequencia": rota,
             "distancia_total_km": round(total_km, 2),
             "tempo_total_min": round(total_min, 1),
-            "rota_coord": rota_coords,  # ✅ sempre inicia e termina no centro
+            "rota_coord": rota_coords,
         }
 
     # ============================================================

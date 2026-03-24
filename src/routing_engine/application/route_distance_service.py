@@ -23,7 +23,7 @@ class RouteDistanceService:
     """
 
     def __init__(self, v_kmh: float | None = None, alpha_path: float | None = None):
-        self.v_kmh = float(v_kmh or os.getenv("VEL_KMH", 30.0))
+        self.v_kmh = float(v_kmh or os.getenv("VEL_KMH", 60.0))
         self.alpha_path = float(alpha_path or os.getenv("ALPHA_PATH", 1.3))
 
         self.osrm_url = os.getenv("OSRM_URL", "http://osrm:5000")

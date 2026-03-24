@@ -34,7 +34,6 @@ class GeocodeAddressesUseCase:
     def execute(self, addresses, tenant_id=1, origem="api"):
 
         start = time.time()
-
         request_id = str(uuid.uuid4())
 
         logger.info(
@@ -48,44 +47,52 @@ class GeocodeAddressesUseCase:
         google_hits = 0
         falhas = 0
 
-        resolved = {}
-
         total = len(addresses)
 
-        for i, item in enumerate(addresses, start=1):
+        # =====================================================
+        # 🔥 PRÉ-PROCESSAMENTO
+        # =====================================================
+        enderecos = []
+        meta_info = []
 
-            # -------------------------------------------------
-            # progresso
-            # -------------------------------------------------
+        for item in addresses:
+            endereco = item.get("address")
+            cidade = item.get("cidade")
+            uf = item.get("uf")
+
+            enderecos.append(endereco)
+            meta_info.append({
+                "id": item["id"],
+                "cidade": cidade,
+                "uf": uf,
+                "endereco": endereco
+            })
+
+        # =====================================================
+        # 🚀 GEOCODING EM LOTE
+        # =====================================================
+        resultados_batch = self.service.geocode_batch(enderecos)
+
+        # =====================================================
+        # 🔄 PROCESSAMENTO DOS RESULTADOS
+        # =====================================================
+        for i, meta in enumerate(meta_info, start=1):
 
             if i % 100 == 0 or i == total:
                 logger.info(
                     f"[GEOCODE_PROGRESS] {i}/{total} endereços processados"
                 )
 
-            endereco = item.get("address")
+            lat, lon, source = resultados_batch.get(i - 1, (None, None, "falha"))
 
-            cidade = item.get("cidade")
-            uf = item.get("uf")
-
-            endereco_base = normalize_base(endereco)
-            cache_key = normalize_for_cache(endereco_base)
+            endereco = meta["endereco"]
+            cidade = meta["cidade"]
+            uf = meta["uf"]
 
             # -------------------------------------------------
-            # CACHE LOCAL (evita repetir geocode no mesmo batch)
+            # VALIDAÇÃO GEOGRÁFICA (mantida)
             # -------------------------------------------------
-
-            if cache_key in resolved:
-
-                lat, lon, source = resolved[cache_key]
-
-            else:
-
-                lat, lon, source = self.service.geocode(endereco)
-
-                # -------------------------------------------------
-                # VALIDAÇÃO GEOGRÁFICA
-                # -------------------------------------------------
+            if lat is not None and lon is not None:
 
                 status_geo = GeoValidator.validar_ponto(
                     lat,
@@ -105,25 +112,24 @@ class GeocodeAddressesUseCase:
                     lon = None
                     source = "invalid_geo"
 
-                # -------------------------------------------------
-                # SALVAR CACHE GLOBAL
-                # -------------------------------------------------
+            # -------------------------------------------------
+            # SALVAR CACHE (mantido)
+            # -------------------------------------------------
+            if lat and lon and source != "cache":
 
-                if lat and lon and source != "cache":
+                endereco_base = normalize_base(endereco)
+                cache_key = normalize_for_cache(endereco_base)
 
-                    self.writer.salvar_cache(
-                        cache_key,
-                        lat,
-                        lon,
-                        source
-                    )
-
-                resolved[cache_key] = (lat, lon, source)
+                self.writer.salvar_cache(
+                    cache_key,
+                    lat,
+                    lon,
+                    source
+                )
 
             # -------------------------------------------------
             # CONTADORES
             # -------------------------------------------------
-
             if source == "cache":
                 cache_hits += 1
 
@@ -137,18 +143,19 @@ class GeocodeAddressesUseCase:
                 falhas += 1
 
             # -------------------------------------------------
-            # RESULTADO
+            # RESULTADO FINAL
             # -------------------------------------------------
-
             results.append({
-                "id": item["id"],
+                "id": meta["id"],
                 "lat": lat,
                 "lon": lon,
                 "source": source
             })
 
+        # =====================================================
+        # FINALIZAÇÃO
+        # =====================================================
         tempo_ms = int((time.time() - start) * 1000)
-
         sucesso = len(addresses) - falhas
 
         logger.info(
@@ -165,23 +172,19 @@ class GeocodeAddressesUseCase:
         # -------------------------------------------------
         # HISTÓRICO
         # -------------------------------------------------
-
-        self.history_repo.salvar(
-            request_id=request_id,
-            tenant_id=tenant_id,
-            origem=origem,
-            total=len(addresses),
-            sucesso=sucesso,
-            falhas=falhas,
-            cache_hits=cache_hits,
-            nominatim_hits=nominatim_hits,
-            google_hits=google_hits,
-            tempo_ms=tempo_ms
-        )
-
-        # -------------------------------------------------
-        # RETORNO
-        # -------------------------------------------------
+        if origem != "subjob":
+            self.history_repo.salvar(
+                request_id=request_id,
+                tenant_id=tenant_id,
+                origem=origem,
+                total=len(addresses),
+                sucesso=sucesso,
+                falhas=falhas,
+                cache_hits=cache_hits,
+                nominatim_hits=nominatim_hits,
+                google_hits=google_hits,
+                tempo_ms=tempo_ms
+            )
 
         return {
             "request_id": request_id,

@@ -19,6 +19,25 @@ from geocoding_engine.domain.geo_validator import GeoValidator
 from geocoding_engine.infrastructure.nominatim_client import NominatimClient
 from geocoding_engine.infrastructure.google_client import GoogleClient
 
+import redis
+
+_redis = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+def rate_limit(key="geo_rate", limit=40, window=1):
+
+    try:
+        current = _redis.incr(key)
+
+        if current == 1:
+            _redis.expire(key, window)
+
+        if current > limit:
+            time.sleep(window)
+
+    except Exception:
+        # fallback: não trava o processo se Redis falhar
+        pass
+
 
 class GeolocationService:
     """
@@ -39,7 +58,7 @@ class GeolocationService:
       - não retorna coordenada inválida
     """
 
-    def __init__(self, reader, max_workers=20):
+    def __init__(self, reader, max_workers=8):
         self.reader = reader
 
         self.nominatim = NominatimClient()
