@@ -9,7 +9,7 @@ class GeoJSONBuilder:
 
         for r in records:
 
-            if not r.get("lat") or not r.get("lon"):
+            if r.get("lat") is None or r.get("lon") is None:
                 continue
 
             features.append({

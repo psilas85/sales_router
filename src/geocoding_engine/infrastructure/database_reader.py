@@ -3,96 +3,165 @@
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
-import unicodedata
+from loguru import logger
 
-def normalize(text):
-    return unicodedata.normalize("NFKD", text).encode("ASCII", "ignore").decode("utf-8").upper()
+from geocoding_engine.domain.address_normalizer import normalize_for_cache
 
 
 class DatabaseReader:
 
     def __init__(self):
-        self.conn = psycopg2.connect(
-            dbname=os.getenv("DB_NAME"),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            host=os.getenv("DB_HOST"),
-            port=os.getenv("DB_PORT"),
-        )
+        self.conn = None
+        self._connect()
+
+    # ---------------------------------------------------------
+    # 🔥 CONEXÃO RESILIENTE
+    # ---------------------------------------------------------
+    def _connect(self):
+
+        try:
+            self.conn = psycopg2.connect(
+                dbname=os.getenv("DB_NAME"),
+                user=os.getenv("DB_USER"),
+                password=os.getenv("DB_PASSWORD"),
+                host=os.getenv("DB_HOST"),
+                port=os.getenv("DB_PORT"),
+            )
+            self.conn.autocommit = True
+            logger.info("[DB] conectado")
+
+        except Exception as e:
+            logger.error(f"[DB][CONNECT_ERROR] {e}")
+            raise
+
+    def _ensure_connection(self):
+
+        try:
+            if self.conn is None or self.conn.closed != 0:
+                logger.warning("[DB] reconectando...")
+                self._connect()
+
+        except Exception as e:
+            logger.error(f"[DB][RECONNECT_ERROR] {e}")
+            self._connect()
 
     # ---------------------------------------------------------
     # CACHE GLOBAL INDIVIDUAL
     # ---------------------------------------------------------
-
     def buscar_cache(self, endereco):
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT lat, lon
-                FROM enderecos_cache
-                WHERE endereco = %s
-                LIMIT 1
-                """,
-                (endereco,),
-            )
 
-            row = cur.fetchone()
+        if not endereco:
+            return None
 
-            if row:
-                return row["lat"], row["lon"]
+        self._ensure_connection()
+
+        endereco_norm = normalize_for_cache(endereco)
+
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+
+                cur.execute(
+                    """
+                    SELECT lat, lon
+                    FROM enderecos_cache
+                    WHERE endereco_normalizado = %s
+                    LIMIT 1
+                    """,
+                    (endereco_norm,),
+                )
+
+                row = cur.fetchone()
+
+                if row:
+                    return row["lat"], row["lon"]
+
+        except Exception as e:
+            logger.warning(f"[CACHE][ERRO] {e}")
 
         return None
 
     # ---------------------------------------------------------
     # CACHE GLOBAL EM LOTE
     # ---------------------------------------------------------
-
     def buscar_cache_em_lote(self, enderecos):
+
         if not enderecos:
             return {}
 
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT endereco, lat, lon
-                FROM enderecos_cache
-                WHERE endereco = ANY(%s)
-                """,
-                (list(enderecos),),
-            )
+        self._ensure_connection()
 
-            rows = cur.fetchall()
+        # 🔥 normalização única e consistente
+        enderecos_norm = [
+            normalize_for_cache(e)
+            for e in enderecos
+            if e
+        ]
 
-        return {
-            r["endereco"]: (r["lat"], r["lon"])
-            for r in rows
-        }
-   
+        if not enderecos_norm:
+            return {}
 
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+
+                cur.execute(
+                    """
+                    SELECT endereco_normalizado, lat, lon
+                    FROM enderecos_cache
+                    WHERE endereco_normalizado = ANY(%s)
+                    """,
+                    (enderecos_norm,),
+                )
+
+                rows = cur.fetchall()
+
+            return {
+                r["endereco_normalizado"]: (r["lat"], r["lon"])
+                for r in rows
+            }
+
+        except Exception as e:
+            logger.warning(f"[CACHE_LOTE][ERRO] {e}")
+            return {}
+
+    # ---------------------------------------------------------
+    # BUSCA FILTRADA (UI / edição manual)
+    # ---------------------------------------------------------
     def buscar_cache_filtrado(self, cidade, uf, endereco=None, limit=50):
 
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+        self._ensure_connection()
 
-            termos = normalize(f"{cidade} {uf} {endereco or ''}").split()
+        try:
+            termos = normalize_for_cache(
+                f"{cidade} {uf} {endereco or ''}"
+            ).split()
 
-            where_clauses = []
-            params = []
+            if not termos:
+                return []
 
-            for termo in termos:
-                where_clauses.append("endereco_normalizado ILIKE %s")
-                params.append(f"%{termo}%")
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
 
-            where_sql = " AND ".join(where_clauses)
+                where_clauses = []
+                params = []
 
-            query = f"""
-            SELECT id, endereco, lat, lon, origem, atualizado_em
-            FROM enderecos_cache
-            WHERE {where_sql}
-            ORDER BY atualizado_em DESC
-            LIMIT %s
-            """
+                for termo in termos:
+                    where_clauses.append("endereco_normalizado ILIKE %s")
+                    params.append(f"%{termo}%")
 
-            params.append(limit)
+                where_sql = " AND ".join(where_clauses)
 
-            cur.execute(query, tuple(params))
-            return cur.fetchall()
+                query = f"""
+                SELECT id, endereco, lat, lon, origem, atualizado_em
+                FROM enderecos_cache
+                WHERE {where_sql}
+                ORDER BY atualizado_em DESC
+                LIMIT %s
+                """
+
+                params.append(limit)
+
+                cur.execute(query, tuple(params))
+                return cur.fetchall()
+
+        except Exception as e:
+            logger.warning(f"[CACHE_FILTRO][ERRO] {e}")
+            return []

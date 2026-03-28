@@ -3,21 +3,27 @@
 import argparse
 import pandas as pd
 from rq import get_current_job
+from loguru import logger
+import traceback
 
 from geocoding_engine.application.geocode_spreadsheet_use_case import GeocodeSpreadsheetUseCase
 
 
 # =========================================================
-# 🔥 PROGRESSO DIRETO NO REDIS (SEM STDOUT)
+# 🔥 PROGRESSO REDIS
 # =========================================================
 def update_progress(pct, step):
 
-    job = get_current_job()
+    try:
+        job = get_current_job()
 
-    if job:
-        job.meta["progress"] = int(pct)
-        job.meta["step"] = step
-        job.save_meta()
+        if job:
+            job.meta["progress"] = int(pct)
+            job.meta["step"] = step
+            job.save_meta()
+
+    except Exception as e:
+        logger.warning(f"[PROGRESS][ERRO] {e}")
 
 
 # =========================================================
@@ -31,39 +37,79 @@ def main():
 
     args = parser.parse_args()
 
-    # -----------------------------------------------------
-    # LEITURA
-    # -----------------------------------------------------
-    update_progress(5, "Lendo arquivo")
-
-    df = pd.read_excel(args.arquivo)
-
-    # -----------------------------------------------------
-    # PROCESSAMENTO
-    # -----------------------------------------------------
-    update_progress(20, "Geocodificando")
-
-    uc = GeocodeSpreadsheetUseCase()
-    excel_buffer, stats = uc.execute(df)
-
-    # -----------------------------------------------------
-    # SALVAR
-    # -----------------------------------------------------
-    update_progress(90, "Salvando resultado")
-
-    with open(args.saida, "wb") as f:
-        f.write(excel_buffer.getvalue())
-
-    # -----------------------------------------------------
-    # FINALIZAÇÃO
-    # -----------------------------------------------------
-    update_progress(100, "Concluído")
-
-    # 🔥 mantém resultado no job (sem stdout)
     job = get_current_job()
-    if job:
-        job.meta["result"] = stats
-        job.save_meta()
+
+    try:
+        # -----------------------------------------------------
+        # LEITURA
+        # -----------------------------------------------------
+        update_progress(5, "Lendo arquivo")
+
+        logger.info(f"[JOB] lendo arquivo: {args.arquivo}")
+
+        df = pd.read_excel(args.arquivo)
+
+        if df.empty:
+            raise Exception("Arquivo vazio")
+
+        logger.info(f"[JOB] linhas carregadas: {len(df)}")
+
+        # -----------------------------------------------------
+        # PROCESSAMENTO
+        # -----------------------------------------------------
+        update_progress(20, "Geocodificando")
+
+        uc = GeocodeSpreadsheetUseCase()
+
+        excel_buffer, stats = uc.execute(
+            df,
+            progress_callback=update_progress  # ✅ CORRETO
+        )
+
+        logger.info(f"[JOB] processamento concluído: {stats}")
+
+        # -----------------------------------------------------
+        # SALVAR
+        # -----------------------------------------------------
+        update_progress(90, "Salvando resultado")
+
+        try:
+            with open(args.saida, "wb") as f:
+                f.write(excel_buffer.getvalue())
+
+            logger.info(f"[JOB] arquivo salvo: {args.saida}")
+
+        except Exception as e:
+            logger.error(f"[JOB][ERRO_SALVAR] {e}")
+            raise
+
+        # -----------------------------------------------------
+        # FINALIZAÇÃO
+        # -----------------------------------------------------
+        update_progress(100, "Concluído")
+
+        if job:
+            job.meta["result"] = stats
+            job.meta["status"] = "done"
+            job.save_meta()
+
+    except Exception as e:
+
+        erro = str(e)
+        stack = traceback.format_exc()
+
+        logger.error(f"[JOB][ERRO] {erro}")
+        logger.error(stack)
+
+        update_progress(100, "Erro")
+
+        if job:
+            job.meta["status"] = "failed"
+            job.meta["error"] = erro
+            job.meta["stack"] = stack
+            job.save_meta()
+
+        raise
 
 
 if __name__ == "__main__":

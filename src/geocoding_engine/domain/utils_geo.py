@@ -2,7 +2,8 @@
 
 from geopy.distance import geodesic
 
-CEP_INVALIDO_LIST = set()  # recomendado: deixar vazio
+CEP_INVALIDO_LIST = set()
+
 
 def cep_invalido(cep: str) -> bool:
     if not cep:
@@ -19,7 +20,6 @@ def cep_invalido(cep: str) -> bool:
     if cep == "00000000":
         return True
 
-    # Apenas os realmente problemáticos (se quiser manter)
     if cep in CEP_INVALIDO_LIST:
         return True
 
@@ -27,22 +27,26 @@ def cep_invalido(cep: str) -> bool:
 
 
 def coordenada_generica(lat: float, lon: float) -> bool:
+    """
+    Validação leve de coordenada.
+    NÃO deve rejeitar coordenadas válidas.
+    """
 
     if lat is None or lon is None:
         return True
 
-    if abs(lat) < 0.0001 and abs(lon) < 0.0001:
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except Exception:
         return True
 
+    # inválido global
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         return True
 
-    # Fallback Limeira (Nominatim antigo)
-    if geodesic((lat, lon), (-22.563, -47.401)).km < 5:
-        return True
-
-    # Fallback Centro do Brasil (Google)
-    if geodesic((lat, lon), (-14.235004, -51.92528)).km < 10:
+    # coordenada zero
+    if abs(lat) < 0.0001 and abs(lon) < 0.0001:
         return True
 
     return False

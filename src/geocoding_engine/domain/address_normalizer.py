@@ -1,12 +1,10 @@
-#sales_router/src/geocoding_engine/domain/address_normalizer.py
+# sales_router/src/geocoding_engine/domain/address_normalizer.py
 
 import re
 import unicodedata
 
-from pdv_preprocessing.utils.endereco_normalizer import (
-    corrigir_truncados,
-    expandir_abreviacoes,
-)
+from pdv_preprocessing.utils.endereco_normalizer import corrigir_truncados
+
 
 # ============================================================
 # 🔤 Utils internos
@@ -28,6 +26,30 @@ def _limpeza_basica(s: str) -> str:
     return s
 
 
+def _smart_title(s: str) -> str:
+
+    def fix_word(w):
+        if re.match(r"^[A-Z]{2,3}$", w):
+            return w
+        if re.match(r"^[A-Z]{2,3}-\d+", w):
+            return w
+        return w.capitalize()
+
+    return " ".join(fix_word(w) for w in s.split())
+
+
+def _normalize_cep(cep: str) -> str:
+    if not cep:
+        return ""
+
+    cep = re.sub(r"\D", "", cep)
+
+    if len(cep) != 8:
+        return ""
+
+    return cep
+
+
 # ============================================================
 # 🧱 NORMALIZAÇÃO BASE
 # ============================================================
@@ -38,6 +60,10 @@ def normalize_base(endereco: str) -> str:
 
     s = endereco.strip()
 
+    # remove caracteres invisíveis
+    s = re.sub(r"[\u200B-\u200D\uFEFF]", "", s)
+
+    s = re.sub(r"[^\S\r\n]+", " ", s)
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"\s*,\s*", ", ", s)
 
@@ -47,58 +73,31 @@ def normalize_base(endereco: str) -> str:
 
 
 # ============================================================
-# 🧭 PARA GEOCODIFICAÇÃO (FIXADO)
+# 🧭 PARA GEOCODIFICAÇÃO
 # ============================================================
 
 def normalize_for_geocoding(endereco: str) -> str:
     if not endereco:
         return ""
 
-    original = endereco
-
     s = normalize_base(endereco)
 
-    # correções leves
     s = corrigir_truncados(s)
 
-    # padroniza casing
-    s = s.title()
+    s = _smart_title(s)
 
-    # expansões SEGURAS
     s = re.sub(r"\bSta\b", "Santa", s)
     s = re.sub(r"\bSto\b", "Santo", s)
-    s = re.sub(r"\bS\b", "São", s)
 
-    # ❌ NÃO remover logradouro (isso só piora resultado)
-    # REMOVIDO
-
-    # ============================================================
-    # ✅ FIX PRINCIPAL: NÃO destruir cidade
-    # ============================================================
-
-    # remove apenas o trecho do complemento, NÃO o resto da string
+    # complemento expandido
     s = re.sub(
-        r"\b(Bloco|Bl|Loja|Lj|Sala|Sl|Apto|Apt|Cj|Conj)\b[^,]*",
+        r"\b(Bloco|Bl|Loja|Lj|Sala|Sl|Apto|Apt|Cj|Conj|Andar|Fundos|Casa|Galpao|Quadra)\s*\w*",
         "",
         s,
         flags=re.IGNORECASE
     )
 
     s = _limpeza_basica(s)
-
-    # ============================================================
-    # 🔒 GARANTIA: cidade/UF nunca somem
-    # ============================================================
-
-    # tenta extrair cidade/UF do original se sumiram
-    match = re.search(r",\s*([^,]+)\s*-\s*([A-Z]{2})$", original, re.IGNORECASE)
-
-    if match:
-        cidade = match.group(1).strip().title()
-        uf = match.group(2).upper()
-
-        if cidade.lower() not in s.lower():
-            s = f"{s}, {cidade} - {uf}"
 
     return s
 
@@ -107,7 +106,7 @@ def normalize_for_geocoding(endereco: str) -> str:
 # 🧠 CACHE
 # ============================================================
 
-def normalize_for_cache(endereco: str) -> str:
+def normalize_for_cache(endereco: str, cep: str = None) -> str:
     if not endereco:
         return ""
 
@@ -117,6 +116,11 @@ def normalize_for_cache(endereco: str) -> str:
     s = s.upper()
 
     s = re.sub(r"[^A-Z0-9 ,\-]", "", s)
+
+    cep_norm = _normalize_cep(cep)
+
+    if cep_norm:
+        s = f"{s} | CEP:{cep_norm}"
 
     s = _limpeza_basica(s)
 

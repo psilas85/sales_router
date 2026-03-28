@@ -10,8 +10,7 @@ class GenerateMapUseCase:
 
         repo = MapRepository()
 
-        records = repo.load_job_json(json_path)
+        data = repo.load_job_json(json_path)
 
-        geojson = GeoJSONBuilder.build(records)
-
-        return geojson
+        # 🔥 já é geojson, só retorna
+        return data
