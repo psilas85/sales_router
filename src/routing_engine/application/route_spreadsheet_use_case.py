@@ -31,7 +31,7 @@ class RouteSpreadsheetUseCase:
     def __init__(self):
 
         self.loader = SpreadsheetLoaderService()
-        self.validator = SpreadsheetValidator()
+        self.validator = None
 
         
         self.history_repo = RoutingHistoryRepository()
@@ -95,11 +95,16 @@ class RouteSpreadsheetUseCase:
 
         logger.info(f"[ROUTING_START] request_id={request_id}")
 
+        # =========================================================
+        # LOAD + VALIDATE (CENTRALIZADO)
+        # =========================================================
         df_raw = self.loader.load(file_bytes, filename)
-        validation = self.validator.validate(df_raw)
-        df = validation.dataframe
 
-        consultor_service = ConsultorService(tenant_id)
+        self.validator = SpreadsheetValidator(tenant_id)
+        validation = self.validator.validate(df_raw)
+
+        df = validation.dataframe
+        df_invalidos = pd.DataFrame()  # validator já bloqueia erro
 
         logger.info(f"📥 Linhas válidas: {len(df)}")
 
@@ -137,19 +142,17 @@ class RouteSpreadsheetUseCase:
             grupos_dict.setdefault(p.grupo_utilizado, []).append(p)
 
         total_grupos = len(grupos_dict)
-        
+
         # =========================================================
-        # 🚀 EXECUÇÃO PARALELA POR GRUPO (RQ)
+        # EXECUÇÃO PARALELA
         # =========================================================
-        resultados, stats = executar_routing_job(grupos_dict, {
+        resultados, stats, falhados = executar_routing_job(grupos_dict, {
             "tenant_id": tenant_id,
             "dias_uteis": dias_uteis,
             "freq_visita": freq_visita,
             "min_pdvs_rota": min_pdvs_rota,
             "max_pdvs_rota": max_pdvs_rota,
-            "aplicar_two_opt": True,
-
-            # 🔥 DEFAULTS (correto aqui)
+            "aplicar_two_opt": aplicar_two_opt,
             "v_kmh": 60.0,
             "service_min": 30.0,
             "alpha_path": 1.3
@@ -163,15 +166,16 @@ class RouteSpreadsheetUseCase:
         haversine_hits = stats.get("haversine_hits", 0)
 
         # =========================================================
-        # 🔒 VALIDAÇÃO DE INTEGRIDADE
+        # VALIDAÇÃO DE INTEGRIDADE
         # =========================================================
         logger.error(f"Resultados recebidos: {len(resultados)} / {total_grupos}")
-        if len(resultados) != total_grupos:
-            logger.error(f"❌ Grupos perdidos: esperado={total_grupos} recebido={len(resultados)}")
-            raise RuntimeError("Falha em subjobs de roteirização")
 
-        # garante ordem determinística
-        resultados.sort(key=lambda x: str(x.get("grupo_utilizado", "")))
+        if len(resultados) != total_grupos:
+            logger.warning(
+                f"⚠️ Grupos com erro: {total_grupos - len(resultados)} de {total_grupos}"
+            )
+
+        resultados.sort(key=lambda x: str(x.get("grupo_utilizado") or x.get("group_id") or ""))
 
         # =========================================================
         # DATAFRAMES
@@ -224,8 +228,9 @@ class RouteSpreadsheetUseCase:
         # EXPORT
         # =========================================================
         df_metricas = pd.DataFrame([{
-            "total_pdvs": len(pdvs),
-            "total_grupos": total_grupos,
+            "total_pdvs_validos": len(pdvs),
+            "total_pdvs_invalidos": len(df_invalidos),
+            "total_grupos_validos": total_grupos,
             "total_rotas": rota_global_id - 1,
             "cache_hits": cache_hits,
             "osrm_hits": osrm_hits,
@@ -240,10 +245,14 @@ class RouteSpreadsheetUseCase:
             df_detalhe=df_detalhe,
             df_resumo=df_resumo,
             df_metricas=df_metricas,
+            df_invalidos=pd.DataFrame(),
             output_dir=output_dir,
             filename=filename_out
         )
 
+        # =========================================================
+        # HISTÓRICO
+        # =========================================================
         self.history_repo.salvar_historico(
             request_id=request_id,
             tenant_id=tenant_id,
@@ -261,7 +270,7 @@ class RouteSpreadsheetUseCase:
         logger.success(f"[ROUTING_DONE] request_id={request_id} file={file_path}")
 
         # =========================================================
-        # BUILD ROTAS (MAPA)
+        # BUILD ROTAS
         # =========================================================
         rotas = []
 
@@ -294,17 +303,33 @@ class RouteSpreadsheetUseCase:
         # =========================================================
         # RETURN FINAL
         # =========================================================
+        total_grupos_processados = len(resultados)
+        total_grupos_com_erro = len(falhados) if falhados else 0
+
         return {
             "output": file_path,
             "rotas": rotas,
+            "erros": list(falhados.values()) if falhados else [],
+            "invalidos": [],
             "metricas": {
-                "total_pdvs": len(pdvs),
-                "total_grupos": total_grupos,
+                "total_pdvs_validos": len(pdvs),
+                "total_pdvs_invalidos": 0,
+                "total_grupos_validos": total_grupos,
+                "total_grupos_enviados": total_grupos,
+                "grupos_processados": total_grupos_processados,
+                "grupos_com_erro": total_grupos_com_erro,
                 "total_rotas": rota_global_id - 1,
+                "taxa_sucesso": round(
+                    (total_grupos_processados / total_grupos) * 100, 1
+                ) if total_grupos > 0 else 0,
                 "cache_hits": cache_hits,
                 "osrm_hits": osrm_hits,
                 "google_hits": google_hits,
                 "haversine_hits": haversine_hits,
-                "tempo_execucao_ms": int((time.time() - start) * 1000)
+                "tempo_execucao_ms": int((time.time() - start) * 1000),
+                "validacao": {
+                    "qtd_invalidos": 0,
+                    "detalhes": []
+                }
             }
         }

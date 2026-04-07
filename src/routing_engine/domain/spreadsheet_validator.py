@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List
 
 import pandas as pd
 
 from routing_engine.domain.utils_geo import normalize_coord, is_valid_lat_lon
+from routing_engine.application.consultor_service import ConsultorService
 
 
 REQUIRED_COLUMNS_BASE = [
@@ -20,10 +21,12 @@ REQUIRED_COLUMNS_BASE = [
     "cep",
     "lat",
     "lon",
+    "consultor",  # 🔥 obrigatório
 ]
 
 OPTIONAL_COLUMNS = [
     "nome_fantasia",
+    "setor",  # opcional
 ]
 
 
@@ -35,8 +38,10 @@ class ValidationResult:
 
 
 class SpreadsheetValidator:
-    def __init__(self) -> None:
+
+    def __init__(self, tenant_id: int = 1) -> None:
         self.warnings: List[str] = []
+        self.tenant_id = tenant_id
 
     def validate(self, df: pd.DataFrame) -> ValidationResult:
 
@@ -47,22 +52,56 @@ class SpreadsheetValidator:
 
         df = self._normalize_strings(df)
 
-        # ✔️ grupo linha a linha (correto)
-        df["grupo_utilizado"] = df["setor"].fillna(df["consultor"])
+        # =========================================================
+        # 🔥 CONSULTOR OBRIGATÓRIO E NÃO VAZIO
+        # =========================================================
+        invalid_consultor = df["consultor"].isna() | (df["consultor"].astype(str).str.strip() == "")
 
-        df["fonte_grupo"] = df.apply(
-            lambda x: "setor" if pd.notna(x.get("setor")) else "consultor",
-            axis=1
-        )
+        if invalid_consultor.any():
+            idxs = list(df[invalid_consultor].index[:10] + 2)
+            raise ValueError(f"Coluna 'consultor' possui valores vazios. Linhas exemplo: {idxs}")
 
+        # =========================================================
+        # 🔥 NORMALIZA CONSULTOR
+        # =========================================================
+        df["consultor"] = df["consultor"].astype(str).str.strip().str.upper()
+
+        # =========================================================
+        # 🔥 VALIDA CONSULTOR NA BASE
+        # =========================================================
+        consultor_service = ConsultorService(self.tenant_id)
+        consultores_validos = set(consultor_service.get_all_consultores())
+
+        invalidos = ~df["consultor"].isin(consultores_validos)
+
+        if invalidos.any():
+            exemplos = df.loc[invalidos, "consultor"].dropna().unique()[:5]
+            raise ValueError(f"Consultores não cadastrados: {list(exemplos)}")
+
+        # =========================================================
+        # 🔥 DEFINE GRUPO (SEMPRE CONSULTOR)
+        # =========================================================
+        df["grupo_utilizado"] = df["consultor"]
+        df["fonte_grupo"] = "consultor"
+
+        # =========================================================
+        # 🔥 COORDENADAS
+        # =========================================================
         df = self._normalize_coordinates(df)
 
+        # =========================================================
+        # 🔥 VALORES OBRIGATÓRIOS
+        # =========================================================
         df = self._validate_required_values(df)
 
+        # =========================================================
+        # 🔥 DEDUPLICAÇÃO
+        # =========================================================
         df = self._deduplicate(df)
 
-        df["grupo_utilizado"] = df["grupo_utilizado"].astype(str).str.strip()
-
+        # =========================================================
+        # 🔥 COLUNAS FINAIS
+        # =========================================================
         df["nome_fantasia"] = df["nome_fantasia"] if "nome_fantasia" in df.columns else None
 
         ordered_cols = [
@@ -84,17 +123,18 @@ class SpreadsheetValidator:
 
         return ValidationResult(
             dataframe=df.reset_index(drop=True),
-            fonte_grupo="misto",
+            fonte_grupo="consultor",
             warnings=self.warnings,
         )
+
+    # =========================================================
+    # INTERNOS
+    # =========================================================
 
     def _validate_required_columns(self, df: pd.DataFrame) -> None:
         missing = [c for c in REQUIRED_COLUMNS_BASE if c not in df.columns]
         if missing:
             raise ValueError(f"Colunas obrigatórias ausentes: {', '.join(missing)}")
-
-        if "consultor" not in df.columns:
-            raise ValueError("Coluna 'consultor' é obrigatória.")
 
     def _normalize_col(self, col: str) -> str:
         return (
@@ -116,6 +156,7 @@ class SpreadsheetValidator:
         )
 
     def _normalize_strings(self, df: pd.DataFrame) -> pd.DataFrame:
+
         text_cols = [
             "cnpj",
             "nome_fantasia",
@@ -144,6 +185,7 @@ class SpreadsheetValidator:
         return value
 
     def _normalize_coordinates(self, df: pd.DataFrame) -> pd.DataFrame:
+
         lat_norm = []
         lon_norm = []
 
@@ -158,7 +200,7 @@ class SpreadsheetValidator:
 
             if not is_valid_lat_lon(lat_f, lon_f):
                 raise ValueError(
-                    f"Linha {idx + 2}: coordenadas fora do range esperado do Brasil ({lat_f}, {lon_f})"
+                    f"Linha {idx + 2}: coordenadas fora do Brasil ({lat_f}, {lon_f})"
                 )
 
             lat_norm.append(lat_f)
@@ -166,6 +208,7 @@ class SpreadsheetValidator:
 
         df["lat"] = lat_norm
         df["lon"] = lon_norm
+
         return df
 
     def _validate_required_values(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -185,7 +228,7 @@ class SpreadsheetValidator:
             if invalid.any():
                 idxs = list(df[invalid].index[:10] + 2)
                 raise ValueError(
-                    f"Coluna '{col}' possui valores obrigatórios vazios. Linhas exemplo: {idxs}"
+                    f"Coluna '{col}' possui valores vazios. Linhas exemplo: {idxs}"
                 )
 
         return df

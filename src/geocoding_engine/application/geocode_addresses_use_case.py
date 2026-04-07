@@ -7,8 +7,7 @@ from loguru import logger
 from geocoding_engine.services.geolocation_service import GeolocationService
 from geocoding_engine.infrastructure.database_reader import DatabaseReader
 from geocoding_engine.infrastructure.database_writer import DatabaseWriter
-
-from geocoding_engine.domain.address_normalizer import normalize_for_cache
+from geocoding_engine.domain.cache_key_builder import build_cache_key
 
 
 class GeocodeAddressesUseCase:
@@ -18,101 +17,107 @@ class GeocodeAddressesUseCase:
         self.writer = DatabaseWriter(self.reader.conn)
         self.service = GeolocationService(reader=self.reader)
 
-    # =====================================================
-    # 🚀 EXECUTE
-    # =====================================================
     def execute(self, addresses, tenant_id=1, origem="api"):
 
         start = time.time()
         request_id = str(uuid.uuid4())
 
-        logger.info(f"[GEOCODE_V5_START] total={len(addresses)}")
+        logger.info(f"[GEOCODE_START] total={len(addresses)}")
 
-        # -------------------------------------------------
-        # 🔹 PRÉ-PROCESSAMENTO
-        # -------------------------------------------------
+        # =====================================================
+        # 🔹 ENRICH + CHAVE PADRÃO
+        # =====================================================
         enriched = []
 
         for item in addresses:
 
-            raw = item.get("address")
+            logradouro = item.get("logradouro")
+            numero = item.get("numero")
             cidade = item.get("cidade")
             uf = item.get("uf")
             cep = item.get("cep")
+            raw = item.get("address")
 
-            if not raw:
+            if not logradouro or not numero or not cidade or not uf:
                 continue
 
-            cache_key = normalize_for_cache(raw, cep=cep)
+            cache_key = build_cache_key(
+                logradouro,
+                numero,
+                cidade,
+                uf,
+            )
 
             enriched.append({
                 "id": item["id"],
-                "raw": raw,
-                "cache_key": cache_key,
+                "logradouro": logradouro,
+                "numero": numero,
                 "cidade": cidade,
                 "uf": uf,
-                "cep": cep
+                "cep": cep,
+                "raw": raw,
+                "cache_key": cache_key
             })
 
-        # -------------------------------------------------
-        # 🔹 DEDUP (CORRIGIDO)
-        # -------------------------------------------------
+        # =====================================================
+        # 🔹 DEDUP
+        # =====================================================
         unique_map = {}
 
         for e in enriched:
-            dedup_key = e["cache_key"]   # 🔥 FIX
-            unique_map[dedup_key] = e
+            unique_map[e["cache_key"]] = e
 
-        unique_list = [
-            {**v, "dedup_key": k}
-            for k, v in unique_map.items()
-        ]
+        unique_list = list(unique_map.values())
 
         logger.info(f"[DEDUP] {len(enriched)} → {len(unique_list)} únicos")
 
-        # -------------------------------------------------
-        # 🔹 RESULTADOS
-        # -------------------------------------------------
+        # =====================================================
+        # 🔹 CACHE LOTE
+        # =====================================================
+        cache_keys = [e["cache_key"] for e in unique_list]
+
+        cache_map = self.reader.buscar_cache_em_lote(cache_keys) or {}
+
+        logger.info(f"[CACHE_LOTE] encontrados={len(cache_map)}")
+
+        # =====================================================
+        # 🔹 APPLY CACHE
+        # =====================================================
         result_map = {}
+        to_geocode = []
 
         cache_hits = 0
         nominatim_hits = 0
         google_hits = 0
         falhas = 0
 
-        # -------------------------------------------------
-        # 🔹 CACHE EM LOTE
-        # -------------------------------------------------
-        cache_keys = [e["cache_key"] for e in unique_list]
-
-        try:
-            cache_map = self.reader.buscar_cache_em_lote(cache_keys)
-        except Exception as e:
-            logger.warning(f"[CACHE_LOTE][ERRO] {e}")
-            cache_map = {}
-
-        to_geocode = []
-
         for e in unique_list:
 
-            cache_key = e["cache_key"]
-            dedup_key = e["dedup_key"]
+            key = e["cache_key"]
 
-            if cache_key in cache_map:
+            if key in cache_map:
 
-                lat, lon = cache_map[cache_key]
+                lat, lon = cache_map[key]
 
                 if lat is not None and lon is not None:
-                    result_map[dedup_key] = (lat, lon, "cache")
-                    cache_hits += 1
-                    continue
+
+                    if self.service._validar_geo(lat, lon, e["cidade"], e["uf"], "CACHE"):
+
+                        result_map[key] = (lat, lon, "cache")
+                        cache_hits += 1
+                        continue
 
             to_geocode.append(e)
 
-        # -------------------------------------------------
+        logger.info(f"[CACHE] hits={cache_hits} miss={len(to_geocode)}")
+
+        # =====================================================
         # 🔹 GEOCODING
-        # -------------------------------------------------
+        # =====================================================
         if to_geocode:
+
+            # 🔥 mapa para lookup O(1)
+            map_to_geocode = {e["cache_key"]: e for e in to_geocode}
 
             payload = [
                 {
@@ -123,71 +128,69 @@ class GeocodeAddressesUseCase:
                     "cep": e["cep"],
                     "cache_key": e["cache_key"]
                 }
-                for e in to_geocode   # 🔥 FIX (faltava loop)
+                for e in to_geocode
             ]
 
-            res = self.service.geocode_batch_enriched(payload)
-
-            if isinstance(res, dict):
-                results_batch = res.get("results", [])
-            elif isinstance(res, list):
-                results_batch = res
-            else:
-                logger.error(f"[ERRO_BATCH_FORMAT] tipo inesperado: {type(res)}")
-                results_batch = []
-
-            if not isinstance(results_batch, list):
-                logger.error(f"[ERRO_BATCH_FORMAT] {type(results_batch)}")
-                results_batch = []
+            results_batch = self.service.geocode_batch_enriched(payload)
 
             for r in results_batch:
 
-                dedup_key = r["cache_key"]  # 🔥 FIX
+                key = r["cache_key"]
 
                 lat = r["lat"]
                 lon = r["lon"]
                 source = r["source"]
                 is_valid = r["valid"]
 
-                logger.info(
-                    f"[PIPE_RESULT] lat={lat} lon={lon} source={source} valid={is_valid} tipo_lat={type(lat)} tipo_lon={type(lon)}"
-                )
                 if is_valid and lat is not None and lon is not None:
 
-                    result_map[dedup_key] = (lat, lon, source)
+                    result_map[key] = (lat, lon, source)
 
-                    if source == "cache":
-                        cache_hits += 1
-                    elif "nominatim" in str(source):
+                    # 🔥 PERSISTE CACHE (CORRETO E PERFORMÁTICO)
+                    try:
+                        orig = map_to_geocode.get(key)
+
+                        if orig and source != "fallback_cidade":
+
+                            endereco_padrao = (
+                                f"{orig['logradouro']} {orig['numero']}, "
+                                f"{orig['cidade']} - {orig['uf']}"
+                            ).replace(" ,", ",").strip()
+
+                            self.writer.salvar_cache(
+                                logradouro=orig["logradouro"],
+                                numero=orig["numero"],
+                                cidade=orig["cidade"],
+                                uf=orig["uf"],
+                                endereco_original=endereco_padrao,
+                                lat=lat,
+                                lon=lon,
+                                origem=source
+                            )
+
+                    except Exception as e:
+                        logger.warning(f"[CACHE_SAVE_FAIL] {e}")
+
+                    if "nominatim" in str(source):
                         nominatim_hits += 1
                     elif source == "google":
                         google_hits += 1
 
-                    try:
-                        self.writer.salvar_cache(
-                            r["cache_key"],
-                            lat,
-                            lon,
-                            source
-                        )
-                    except Exception as err:
-                        logger.warning(f"[CACHE_SAVE_ERRO] {err}")
-
                 else:
-                    result_map[dedup_key] = (None, None, "falha")
+                    result_map[key] = (None, None, "falha")
                     falhas += 1
 
-        # -------------------------------------------------
-        # 🔹 EXPANSÃO (CORRIGIDO)
-        # -------------------------------------------------
+        # =====================================================
+        # 🔹 EXPANSÃO FINAL
+        # =====================================================
         results = []
 
         for e in enriched:
 
-            dedup_key = e["cache_key"]  # 🔥 FIX
+            key = e["cache_key"]
 
             lat, lon, source = result_map.get(
-                dedup_key,
+                key,
                 (None, None, "falha")
             )
 
@@ -198,14 +201,14 @@ class GeocodeAddressesUseCase:
                 "source": source
             })
 
-        # -------------------------------------------------
+        # =====================================================
         # 🔹 STATS
-        # -------------------------------------------------
+        # =====================================================
         total = len(addresses)
         tempo_ms = int((time.time() - start) * 1000)
 
         logger.info(
-            f"[GEOCODE_V5_END] total={total} "
+            f"[GEOCODE_END] total={total} "
             f"cache={cache_hits} "
             f"nominatim={nominatim_hits} "
             f"google={google_hits} "

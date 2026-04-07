@@ -103,8 +103,15 @@ def job_status(job_id: str):
 
     try:
         job = Job.fetch(job_id, connection=conn)
-    except:
-        raise HTTPException(status_code=404, detail="Job não encontrado")
+    except Exception:
+        return {
+            "status": "not_found"
+        }
+
+    if not job:
+        return {
+            "status": "not_found"
+        }
 
     response = {
         "job_id": job.id,
@@ -114,14 +121,17 @@ def job_status(job_id: str):
         "summary": job.meta.get("summary")
     }
 
+    # ✔ sucesso
     if job.is_finished:
         response["result"] = job.result
 
+    # ✔ erro (SIMPLES E CORRETO)
     if job.is_failed:
-        response["error"] = str(job.exc_info)
+        response["error"] = job.meta.get("error") or {
+            "mensagem": "Erro desconhecido no processamento"
+        }
 
     return response
-
 
 # ============================================================
 # DOWNLOAD

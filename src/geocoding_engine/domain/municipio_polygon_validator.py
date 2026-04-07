@@ -9,6 +9,8 @@ from functools import lru_cache
 
 from shapely.geometry import shape, Point
 
+BUFFER_GRAUS = float(os.getenv("MUNICIPIO_BUFFER_GRAUS", "0.005"))
+
 
 BASE_PATH = Path(
     os.getenv(
@@ -85,7 +87,7 @@ def _norm_cidade(cidade: str | None, uf: str | None = None) -> str | None:
 
 
 # ============================================================
-# LOAD DOS POLÍGONOS
+# LOAD DOS POLÍGONOS (DICT)
 # ============================================================
 
 @lru_cache(maxsize=1)
@@ -129,8 +131,29 @@ def _load_polygons():
 
 
 # ============================================================
+# LOAD GEOPANDAS (PARA BATCH FAST)
+# ============================================================
+
+@lru_cache(maxsize=1)
+def carregar_municipios_gdf():
+    import geopandas as gpd
+
+    if not BASE_PATH.exists():
+        raise FileNotFoundError(f"GeoJSON não encontrado: {BASE_PATH}")
+
+    gdf = gpd.read_file(BASE_PATH)
+
+    # 🔥 ESSAS DUAS LINHAS AQUI
+    gdf["cidade"] = gdf["NM_MUN"].apply(_norm_cidade)
+    gdf["uf"] = gdf["SIGLA_UF"].apply(_norm_uf)
+
+    return gdf
+
+# ============================================================
 # API PÚBLICA
 # ============================================================
+
+from loguru import logger
 
 def ponto_dentro_municipio(
     lat: float,
@@ -138,53 +161,68 @@ def ponto_dentro_municipio(
     cidade: str | None,
     uf: str | None
 ) -> bool | None:
-    """
-    Retornos:
-        True  -> ponto validado dentro do município
-        False -> ponto válido, mas fora do município / coordenada inválida
-        None  -> não foi possível validar (cidade/uf ausentes ou polígono não encontrado)
-    """
 
-    # --------------------------------------------------------
-    # coordenadas básicas
-    # --------------------------------------------------------
     if lat is None or lon is None:
+        logger.debug(f"[POLYGON][SKIP] lat/lon None | cidade={cidade} uf={uf}")
         return False
 
     try:
         lat = float(lat)
         lon = float(lon)
     except Exception:
+        logger.debug(f"[POLYGON][SKIP] lat/lon inválido | lat={lat} lon={lon}")
         return False
 
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        logger.debug(f"[POLYGON][SKIP] fora range global | lat={lat} lon={lon}")
         return False
 
-    # --------------------------------------------------------
-    # normalização cidade/uf
-    # --------------------------------------------------------
     uf_norm = _norm_uf(uf)
     cidade_norm = _norm_cidade(cidade, uf=uf_norm)
 
     if not cidade_norm or not uf_norm:
+        logger.debug(f"[POLYGON][SKIP] cidade/uf inválidos | cidade={cidade} uf={uf}")
         return None
 
-    # --------------------------------------------------------
-    # busca polígono
-    # --------------------------------------------------------
     polygons = _load_polygons()
     poly = polygons.get((cidade_norm, uf_norm))
 
     if poly is None:
+        logger.warning(
+            f"[POLYGON][NOT_FOUND] cidade_norm={cidade_norm} uf_norm={uf_norm} "
+            f"| original={cidade}/{uf}"
+        )
         return None
 
-    # --------------------------------------------------------
-    # validação geométrica
-    # contains = interior
-    # touches  = aceita ponto exatamente na borda
-    # --------------------------------------------------------
     try:
         ponto = Point(lon, lat)
-        return bool(poly.contains(ponto) or poly.touches(ponto))
-    except Exception:
+
+        inside_strict = poly.contains(ponto)
+        inside_buffer = poly.buffer(BUFFER_GRAUS).contains(ponto)
+
+        logger.info(
+            f"[POLYGON][CHECK] lat={lat} lon={lon} "
+            f"| cidade={cidade_norm}-{uf_norm} "
+            f"| strict={inside_strict} buffer={inside_buffer}"
+        )
+
+        if inside_strict:
+            return True
+
+        if inside_buffer:
+            logger.warning(
+                f"[POLYGON][BUFFER_HIT] ponto aceito por tolerância "
+                f"| lat={lat} lon={lon} cidade={cidade_norm}-{uf_norm}"
+            )
+            return True
+
+        logger.warning(
+            f"[POLYGON][OUTSIDE] fora do município "
+            f"| lat={lat} lon={lon} cidade={cidade_norm}-{uf_norm}"
+        )
+
         return False
+
+    except Exception as e:
+        logger.error(f"[POLYGON][ERRO] {e}")
+        return None

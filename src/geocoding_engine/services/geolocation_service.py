@@ -7,6 +7,8 @@ import threading
 import re
 import unicodedata
 
+from geocoding_engine.domain.municipio_polygon_validator import carregar_municipios_gdf
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
 
@@ -19,13 +21,13 @@ from geocoding_engine.domain.geo_validator import GeoValidator
 from geocoding_engine.infrastructure.nominatim_client import NominatimClient
 from geocoding_engine.infrastructure.google_client import GoogleClient
 from geocoding_engine.domain.capital_polygon_validator import ponto_dentro_capital
-from geocoding_engine.domain.municipio_polygon_validator import ponto_dentro_municipio
+
 
 import redis
 
 _redis = redis.Redis(host="redis", port=6379, decode_responses=True)
 
-def rate_limit(key="geo_rate", limit=40, window=1):
+def rate_limit(key="geo_rate", limit=10, window=1):
 
     try:
         current = _redis.incr(key)
@@ -37,7 +39,6 @@ def rate_limit(key="geo_rate", limit=40, window=1):
             time.sleep(window)
 
     except Exception:
-        # fallback: não trava o processo se Redis falhar
         pass
 
 
@@ -63,11 +64,15 @@ class GeolocationService:
     # AJUSTE NO INIT
     # =========================================================
 
-    def __init__(self, reader, max_workers=8):  # 🔥 reduzir aqui
+    def __init__(self, reader, writer=None, max_workers=8):
         self.reader = reader
+        self.writer = writer  # 🔥 novo
 
         self.nominatim = NominatimClient()
         self.google = GoogleClient()
+
+        # 🔥 FIX CRÍTICO
+        self.nominatim_url = os.getenv("NOMINATIM_LOCAL_URL")
 
         self.timeout = 5
         self.max_workers = max_workers
@@ -84,7 +89,24 @@ class GeolocationService:
             "total": 0,
         }
 
+    
         self.stats_lock = threading.Lock()
+        self.gdf_municipios = carregar_municipios_gdf()
+
+    def _normalize_street(self, street: str):
+
+        if not street:
+            return None
+
+        street = street.upper().strip()
+
+        street = street.replace("R ", "RUA ")
+        street = street.replace("AV ", "AVENIDA ")
+        street = street.replace("ROD ", "RODOVIA ")
+
+        street = re.sub(r"\s+", " ", street)
+
+        return street
 
     # ---------------------------------------------------------
     # normalização de texto
@@ -98,6 +120,21 @@ class GeolocationService:
         txt = "".join(c for c in txt if not unicodedata.combining(c))
         return txt.upper().strip()
 
+    def _tem_numero(self, endereco):
+        return bool(re.search(r"\b\d{1,5}\b", endereco or ""))
+    
+    def _montar_query_google(self, endereco, cidade=None, uf=None, cep=None):
+
+        if not endereco:
+            return None
+
+        # 🔥 REMOVE duplicação de cidade/UF
+        endereco_limpo = endereco
+
+        if cep:
+            return f"{endereco_limpo}, {cep}, BRASIL"
+
+        return f"{endereco_limpo}, BRASIL"
     # ---------------------------------------------------------
     # extração robusta de cidade / UF
     # ---------------------------------------------------------
@@ -131,33 +168,51 @@ class GeolocationService:
     # ---------------------------------------------------------
 
     def _extrair_componentes_endereco(self, endereco):
-        """
-        Espera algo como:
-        'Rua X, 123, Bairro, São Paulo - SP'
-        ou
-        'Praça da Sé, São Paulo - SP'
-        """
 
         if not endereco:
             return None, None, None
 
-        m = re.search(r",\s*([^,]+?)\s*-\s*([A-Za-z]{2})\s*(?:,|$)", endereco)
+        endereco = endereco.strip()
 
-        if not m:
+        # =====================================================
+        # PADRÕES DE CIDADE/UF (cobre 90% dos casos)
+        # =====================================================
+        patterns = [
+            r",\s*([^,]+?)\s*-\s*([A-Za-z]{2})",   # , cidade - UF
+            r",\s*([^,]+?)\s*/\s*([A-Za-z]{2})",   # , cidade/UF
+            r"\b([^,]+?)\s*-\s*([A-Za-z]{2})$",    # final
+            r"\b([^,]+?)\s*/\s*([A-Za-z]{2})$",    # final /
+            r",\s*([^,]+?)\s*,\s*([A-Za-z]{2})",   # , cidade, UF
+        ]
+
+        city = None
+        state = None
+        match = None
+
+        for p in patterns:
+            m = re.search(p, endereco)
+            if m:
+                match = m
+                city = m.group(1).strip().upper()
+                state = m.group(2).strip().upper()
+                break
+
+        if not match:
             return None, None, None
 
-        city = m.group(1).strip()
-        state = m.group(2).strip()
-
-        street_part = endereco[:m.start()].strip().strip(",")
+        # =====================================================
+        # STREET (ANTES DA CIDADE)
+        # =====================================================
+        street_part = endereco[:match.start()].strip(", ").strip()
 
         if not street_part:
             return None, city, state
 
+        # 🔥 REMOVE BAIRRO (muito importante)
         street = street_part.split(",")[0].strip()
 
-        if not street:
-            return None, city, state
+        # 🔥 NORMALIZA
+        street = self._normalize_street(street)
 
         return street, city, state
 
@@ -232,79 +287,143 @@ class GeolocationService:
     # helper nominatim request
     # ---------------------------------------------------------
 
-    def _nominatim_request(self, params, trace, modo):
+    def _nominatim_request(self, params, trace, tag):
 
-        headers = {"User-Agent": "SalesRouter-Geocoder"}
+        # 🔥 valida URL antes de tudo
+        if not getattr(self, "nominatim_url", None):
+            logger.error(f"[NOMINATIM][{tag}][ERRO] URL não configurada")
+            return None
 
+        rate_limit()
         try:
-            rate_limit()
-
             r = requests.get(
-                f"{self.nominatim.url}/search",
+                f"{self.nominatim_url}/search",
                 params=params,
-                headers=headers,
-                timeout=self.timeout,
+                headers={"User-Agent": "SalesRouter-Geocoder"},
+                timeout=5
             )
 
+            # -----------------------------------------------------
+            # HTTP inválido
+            # -----------------------------------------------------
             if r.status_code != 200:
-                logger.warning(f"[NOMINATIM][{modo}][HTTP_{r.status_code}]")
+                logger.warning(f"[NOMINATIM][{tag}][HTTP_{r.status_code}] params={params}")
                 return None
 
-            data = r.json()
+            # -----------------------------------------------------
+            # JSON inválido
+            # -----------------------------------------------------
+            try:
+                data = r.json()
+            except Exception:
+                logger.warning(f"[NOMINATIM][{tag}][ERRO_JSON] resposta inválida")
+                return None
 
+            # -----------------------------------------------------
+            # MISS
+            # -----------------------------------------------------
             if not data:
+                logger.info(f"[NOMINATIM][{tag}][MISS] params={params}")
                 return None
 
             item = data[0]
 
-            import math
-
+            # -----------------------------------------------------
+            # EXTRAÇÃO SEGURA
+            # -----------------------------------------------------
             try:
-                lat = float(item["lat"])
-                lon = float(item["lon"])
-            except:
+                lat = float(item.get("lat"))
+                lon = float(item.get("lon"))
+            except Exception:
+                logger.warning(f"[NOMINATIM][{tag}][ERRO_COORD] item={item}")
                 return None
-
-            # 🔥 VALIDAÇÃO NA RAIZ
-            if (
-                math.isnan(lat) or
-                math.isnan(lon) or
-                math.isinf(lat) or
-                math.isinf(lon)
-            ):
-                logger.error(
-                    f"[ERRO_COORD_INVALIDA][NOMINATIM_RAW] "
-                    f"params={params} lat={lat} lon={lon}"
-                )
-                return None
-
-            address = item.get("address", {})
-
-            cidade_res = (
-                address.get("city")
-                or address.get("town")
-                or address.get("village")
-                or address.get("municipality")
-            )
-
-            # 🔥 AQUI
-            if not cidade_res:
-                logger.warning(f"[NOMINATIM][SEM_CIDADE] params={params}")
-
-            state_res = address.get("state")
 
             tipo = item.get("type")
             addresstype = item.get("addresstype")
 
-            logger.debug(
-                f"[NOMINATIM][{modo}] HIT lat={lat} lon={lon} cidade='{cidade_res}' tipo='{addresstype}'"
+            # -----------------------------------------------------
+            # LOG PADRONIZADO
+            # -----------------------------------------------------
+            logger.info(
+                f"[NOMINATIM][{tag}][HIT] lat={lat} lon={lon} "
+                f"type={tipo} addresstype={addresstype}"
             )
 
-            return lat, lon, cidade_res, state_res, tipo, addresstype
+            return lat, lon, tipo, addresstype
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"[NOMINATIM][{tag}][TIMEOUT]")
+            return None
+
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"[NOMINATIM][{tag}][CONNECTION_ERROR]")
+            return None
 
         except Exception as e:
-            logger.warning(f"[NOMINATIM][{modo}][ERRO] {e}")
+            logger.warning(f"[NOMINATIM][{tag}][ERRO] {e}")
             return None
+
+    def _formatar_endereco_nominatim(self, endereco, cidade=None, uf=None):
+
+        if not endereco:
+            return None, None, None, None
+
+        endereco = str(endereco).upper().strip()
+
+        # remove múltiplos espaços
+        endereco = re.sub(r"\s+", " ", endereco)
+
+        # remove .0
+        endereco = re.sub(r"\.0\b", "", endereco)
+
+        # -----------------------------------------------------
+        # SEPARA PARTES
+        # -----------------------------------------------------
+        partes = [p.strip() for p in endereco.split(",") if p.strip()]
+
+        street = None
+
+        if partes:
+            street = partes[0]
+
+        # -----------------------------------------------------
+        # REMOVE BAIRRO (fica só rua + número)
+        # -----------------------------------------------------
+        if street:
+            street = re.split(r" - |,", street)[0].strip()
+
+        # -----------------------------------------------------
+        # NORMALIZA PREFIXOS
+        # -----------------------------------------------------
+        if street:
+            street = street.replace("R ", "RUA ")
+            street = street.replace("AV ", "AVENIDA ")
+            street = street.replace("ROD ", "RODOVIA ")
+
+        # -----------------------------------------------------
+        # GARANTE NÚMERO
+        # -----------------------------------------------------
+        if street and not re.search(r"\b\d{1,5}\b", street):
+            street = None  # evita erro no nominatim
+
+        # -----------------------------------------------------
+        # NORMALIZA CIDADE / UF
+        # -----------------------------------------------------
+        if cidade:
+            cidade = str(cidade).upper().strip()
+
+        if uf:
+            uf = str(uf).upper().strip()
+
+        # -----------------------------------------------------
+        # MONTA STRING FINAL (fallback)
+        # -----------------------------------------------------
+        endereco_formatado = None
+
+        if street and cidade and uf:
+            endereco_formatado = f"{street}, {cidade}, {uf}, BRAZIL"
+
+        return street, cidade, uf, endereco_formatado
 
     # ---------------------------------------------------------
     # nominatim estruturado (CORRIGIDO COMPLETO)
@@ -312,123 +431,58 @@ class GeolocationService:
 
     def _buscar_nominatim_estruturado(self, endereco, trace, cidade=None, uf=None, cep=None):
 
-        street, city, state = self._extrair_componentes_endereco(endereco)
+        street, cidade, uf, endereco_formatado = self._formatar_endereco_nominatim(
+            endereco, cidade, uf
+        )
 
-        # -----------------------------------------------------
-        # fallback: se não extrair, tenta query livre
-        # -----------------------------------------------------
-        if not city or not state:
-
-            logger.info(f"[{trace}][NOMINATIM][FALLBACK_QUERY] {endereco}")
-
-            params = {
-                "q": endereco,
-                "country": "Brazil",
-                "format": "json",
-                "limit": 1,
-                "addressdetails": 1,
-            }
-
-            res = self._nominatim_request(params, trace, "FREE_QUERY")
-
-            if res:
-                lat, lon, *_ = res
-                return lat, lon
-
+        if not street or not cidade or not uf:
+            logger.warning(f"[NOMINATIM][SKIP] dados insuficientes")
             return None
 
-        # =====================================================
-        # 1. COM NÚMERO
-        # =====================================================
-        if street:
+        logger.info(f"[NOMINATIM][TRY][STRUCT] {street} | {cidade} | {uf}")
 
-            params = {
-                "street": street,
-                "city": city,
-                "state": state,
-                "country": "Brazil",
-                "format": "json",
-                "limit": 1,
-                "addressdetails": 1,
-            }
+        query = f"{street}, {cidade}, {uf}, BRAZIL"
 
-            res = self._nominatim_request(params, trace, "STRUCT_COM_NUMERO")
+        try:
+            res = self.nominatim.geocode(query)
 
-            if res:
-                lat, lon, cidade_res, state_res, *_ = res
+            if not res:
+                logger.info(f"[NOMINATIM][MISS] {query}")
+                return None
 
-                if uf and state_res:
-                    if uf.lower() not in state_res.lower():
-                        return None
+            lat, lon, tipo, addresstype = res
 
-                return lat, lon
+            # -------------------------------------------------
+            # 🔥 NOVA REGRA (SIMPLES E CORRETA)
+            # -------------------------------------------------
+            INVALID_TYPES = [
+                "city",
+                "town",
+                "village",
+                "hamlet",
+                "state",
+                "region",
+                "county",
+                "postcode",
+                "country"
+            ]
 
-        # =====================================================
-        # 2. SEM NÚMERO
-        # =====================================================
-        street_sem_num = self._remover_numero_street(street)
+            if addresstype in INVALID_TYPES:
+                logger.warning(
+                    f"[NOMINATIM][REJEITADO] tipo={addresstype} query='{query}'"
+                )
+                return None
 
-        if street_sem_num and street_sem_num != street:
+            logger.info(
+                f"[NOMINATIM][HIT] lat={lat} lon={lon} tipo={tipo} addresstype={addresstype}"
+            )
 
-            params = {
-                "street": street_sem_num,
-                "city": city,
-                "state": state,
-                "country": "Brazil",
-                "format": "json",
-                "limit": 1,
-                "addressdetails": 1,
-            }
-
-            res = self._nominatim_request(params, trace, "STRUCT_SEM_NUMERO")
-
-            if res:
-                lat, lon, cidade_res, state_res, *_ = res
-
-                if uf and state_res:
-                    if uf.lower() not in state_res.lower():
-                        return None
-
-                return lat, lon
-
-        # =====================================================
-        # 3. CEP
-        # =====================================================
-        if cep:
-
-            params = {
-                "postalcode": cep,
-                "country": "Brazil",
-                "format": "json",
-                "limit": 1,
-                "addressdetails": 1,
-            }
-
-            res = self._nominatim_request(params, trace, "CEP")
-
-            if res:
-                lat, lon, *_ = res
-                return lat, lon
-
-        # =====================================================
-        # 4. QUERY LIVRE FINAL
-        # =====================================================
-        params = {
-            "q": endereco,
-            "country": "Brazil",
-            "format": "json",
-            "limit": 1,
-            "addressdetails": 1,
-        }
-
-        res = self._nominatim_request(params, trace, "FREE_QUERY_FINAL")
-
-        if res:
-            lat, lon, *_ = res
             return lat, lon
 
+        except Exception as e:
+            logger.warning(f"[NOMINATIM][ERRO] query='{query}' erro={e}")
+
         return None
-                
     # ---------------------------------------------------------
     # google fallback (CORRIGIDO COMPLETO)
     # ---------------------------------------------------------
@@ -438,78 +492,42 @@ class GeolocationService:
         if not self.GOOGLE_ENABLED:
             return None
 
+        if self.stats["google"] > 1000:
+            logger.warning("[GOOGLE][BLOCKED] limite atingido")
+            return None
+
         try:
 
-            queries = []
+            query = self._montar_query_google(
+                endereco,
+                cidade=cidade,
+                uf=uf,
+                cep=cep
+            )
 
-            # 1. endereço completo
-            if endereco:
-                queries.append(endereco)
+            logger.info(f"[{trace}][GOOGLE][CALL] query='{query}'")
 
-            # 2. sem número
-            street = endereco.split(",")[0] if endereco else None
-            if street:
-                street_sem_num = re.sub(r"\b\d+\w?\b", "", street)
-                street_sem_num = re.sub(r"\s+", " ", street_sem_num).strip(" ,-")
-                if street_sem_num and street_sem_num != street:
-                    queries.append(street_sem_num)
+            res = self.google.geocode(query)
+            if not res:
+                return None
 
-            # 3. cidade + UF
-            if cidade and uf:
-                queries.append(f"{cidade}, {uf}")
+            lat = res.get("lat") if isinstance(res, dict) else res[0]
+            lon = res.get("lon") if isinstance(res, dict) else res[1]
 
-            # 4. CEP
-            if cep:
-                queries.append(cep)
+            if lat is None or lon is None:
+                return None
 
-            for q in queries:
+            # 🔥 filtro leve de cidade
+            # 🔥 NÃO BLOQUEAR GOOGLE POR TEXTO
+            if cidade:
+                texto = str(res)
+                if cidade.upper() not in texto.upper():
+                    logger.warning(
+                        f"[GOOGLE][CIDADE_MISMATCH] cidade={cidade} resposta={texto}"
+                    )
 
-                if not q:
-                    continue
-
-                logger.info(f"[{trace}][GOOGLE][CALL] query='{q}'")
-
-                res = self.google.geocode(q)
-
-                if not res:
-                    continue
-
-                # 🔥 suporta tuple e dict
-                if isinstance(res, tuple):
-                    lat, lon = res
-                else:
-                    import math
-
-                    if isinstance(res, tuple):
-                        lat, lon = res
-                    else:
-                        lat = res.get("lat")
-                        lon = res.get("lon")
-
-                    if lat is None or lon is None:
-                        continue
-
-                    # 🔥 VALIDAÇÃO NA RAIZ
-                    if (
-                        not isinstance(lat, (int, float)) or
-                        not isinstance(lon, (int, float)) or
-                        math.isnan(lat) or
-                        math.isnan(lon) or
-                        math.isinf(lat) or
-                        math.isinf(lon)
-                    ):
-                        logger.error(
-                            f"[ERRO_COORD_INVALIDA][GOOGLE_RAW] "
-                            f"query='{q}' lat={lat} lon={lon}"
-                        )
-                        continue
-
-                if lat is None or lon is None:
-                    continue
-
-                logger.info(f"[{trace}][GOOGLE][HIT] lat={lat} lon={lon}")
-
-                return lat, lon
+            # ✅ AGORA CORRETO (fora do if)
+            return lat, lon
 
         except Exception as e:
             logger.warning(f"[{trace}][GOOGLE][ERRO] {e}")
@@ -519,30 +537,26 @@ class GeolocationService:
     # geocode individual (REFATORADO SEGURO)
     # ---------------------------------------------------------
 
-    def geocode(self, endereco, cidade=None, uf=None, cep=None):
+    def geocode(self, endereco, cidade=None, uf=None, cep=None, cache_key=None):
 
         trace = f"GEO-{int(time.time() * 1000)}"
 
         # -----------------------------------------------------
-        # VALIDAÇÃO INPUT
+        # VALIDAÇÃO INICIAL
         # -----------------------------------------------------
         if not endereco or not str(endereco).strip():
             with self.stats_lock:
                 self.stats["total"] += 1
                 self.stats["falha"] += 1
-
             return None, None, "falha", False
 
         raw = str(endereco).strip()
-
-        # 🔥 remove ".0" de números (CRÍTICO)
         raw = re.sub(r"\.0\b", "", raw)
 
-        endereco_base = normalize_base(raw)
-        endereco_geo = normalize_for_geocoding(endereco_base)
-        endereco_cache = normalize_for_cache(endereco_base, cep=cep)
+        endereco_base = raw
 
-        cidade_extr, uf_extr = self._extrair_cidade_uf(endereco_geo)
+        # 🔥 usa original para extrair cidade/UF
+        cidade_extr, uf_extr = self._extrair_cidade_uf(endereco_base)
 
         cidade = cidade or cidade_extr
         uf = uf or uf_extr
@@ -550,33 +564,24 @@ class GeolocationService:
         with self.stats_lock:
             self.stats["total"] += 1
 
-        # -----------------------------------------------------
-        # 1. CACHE
-        # -----------------------------------------------------
-        try:
-            cache = self.reader.buscar_cache(endereco_cache)
-
-            if cache:
-                lat, lon = cache
-
-                if self._validar_geo(lat, lon, cidade, uf, trace):
-                    with self.stats_lock:
-                        self.stats["cache_db"] += 1
-
-                    return lat, lon, "cache", True
-
-        except Exception:
-            pass
+        if not cidade or not uf:
+            with self.stats_lock:
+                self.stats["falha"] += 1
+            return None, None, "falha", False
 
         # -----------------------------------------------------
-        # 2. NOMINATIM (já inclui fallback interno)
+        # NORMALIZA PARA GEOCODING
+        # -----------------------------------------------------
+        endereco_geo = normalize_for_geocoding(endereco_base)
+
+        # -----------------------------------------------------
+        # NOMINATIM
         # -----------------------------------------------------
         res = self._buscar_nominatim_estruturado(
             endereco_geo,
             trace,
             cidade=cidade,
-            uf=uf,
-            cep=cep
+            uf=uf
         )
 
         if res:
@@ -585,14 +590,11 @@ class GeolocationService:
             if self._validar_geo(lat, lon, cidade, uf, trace):
                 with self.stats_lock:
                     self.stats["nominatim_struct"] += 1
-
                 return lat, lon, "nominatim_struct", True
 
         # -----------------------------------------------------
-        # 3. GOOGLE
+        # GOOGLE
         # -----------------------------------------------------
-        # 🔥 só chama Google se endereço tiver número
-        # 🔥 SEMPRE tenta Google se Nominatim falhar
         res = self._buscar_google(
             endereco_geo,
             trace,
@@ -607,18 +609,13 @@ class GeolocationService:
             if self._validar_geo(lat, lon, cidade, uf, trace):
                 with self.stats_lock:
                     self.stats["google"] += 1
-
                 return lat, lon, "google", True
 
         # -----------------------------------------------------
-        # FALHA FINAL
+        # FALHA
         # -----------------------------------------------------
         with self.stats_lock:
             self.stats["falha"] += 1
-
-        logger.error(
-            f"[FALHA] geo='{endereco_geo}' cidade='{cidade}' uf='{uf}'"
-        )
 
         return None, None, "falha", False
 
@@ -626,86 +623,52 @@ class GeolocationService:
     # batch otimizado
     # ---------------------------------------------------------
 
-    def geocode_batch(self, enderecos):
-        """
-        Retorna:
-            {idx_original: (lat, lon, source, is_valid)}
-        """
+    def geocode_batch(self, items):
+
         resultados = {}
 
-        if not enderecos:
+        if not items:
             return resultados
 
-        base = [normalize_base(str(e).strip()) for e in enderecos]
-        cache_keys = [normalize_for_cache(e) for e in base]
+        def worker(idx, item):
+            try:
+                lat, lon, src, valid = self.geocode(
+                    item["address"],
+                    cidade=item.get("cidade"),
+                    uf=item.get("uf"),
+                    cep=item.get("cep"),
+                    cache_key=item.get("cache_key"),
+                )
+                return idx, lat, lon, src, valid
 
-        # ---------------------------------------------------------
-        # CACHE EM LOTE
-        # ---------------------------------------------------------
-        try:
-            cache_map = self.reader.buscar_cache_em_lote(cache_keys)
-        except Exception as e:
-            logger.warning(f"[BATCH][CACHE_LOTE][ERRO] {e}")
-            cache_map = {}
+            except Exception as e:
+                logger.error(f"[BATCH][ERRO][idx={idx}] {e}")
+                return idx, None, None, "erro", False
 
-        misses = []
-
-        # ---------------------------------------------------------
-        # CACHE HIT
-        # ---------------------------------------------------------
-        for idx, key in enumerate(cache_keys):
-
-            if key in cache_map:
-                lat, lon = cache_map[key]
-
-                endereco_base = base[idx]
-                endereco_geo = normalize_for_geocoding(endereco_base)
-                cidade, uf = self._extrair_cidade_uf(endereco_geo)
-                trace = f"BATCH-{idx}-{int(time.time() * 1000)}"
-
-                if self._validar_geo(lat, lon, cidade, uf, trace):
-                    resultados[idx] = (lat, lon, "cache", True)
-                else:
-                    resultados[idx] = (None, None, "falha", False)
-
-            else:
-                misses.append((idx, enderecos[idx]))
-
-        # ---------------------------------------------------------
-        # WORKER
-        # ---------------------------------------------------------
-        def worker(idx, endereco_raw):
-            lat, lon, src, is_valid = self.geocode(endereco_raw)
-            return idx, lat, lon, src, is_valid
-
-        # ---------------------------------------------------------
-        # PROCESSAMENTO PARALELO
-        # ---------------------------------------------------------
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, 5)) as executor:
 
             futures = {
-                executor.submit(worker, idx, endereco_raw): idx
-                for idx, endereco_raw in misses
+                executor.submit(worker, idx, item): idx
+                for idx, item in enumerate(items)
             }
 
             for future in as_completed(futures):
                 idx = futures[future]
-
                 try:
-                    idx_ret, lat, lon, src, is_valid = future.result()
-                    resultados[idx_ret] = (lat, lon, src, is_valid)
-
+                    idx_ret, lat, lon, src, valid = future.result()
+                    resultados[idx_ret] = (lat, lon, src, valid)
                 except Exception as e:
                     logger.error(f"[BATCH][ERRO][idx={idx}] {e}")
                     resultados[idx] = (None, None, "erro", False)
 
         return resultados
-
+            
     # ---------------------------------------------------------
     # resumo stats
     # ---------------------------------------------------------
 
     def show_stats(self):
+
         total = self.stats["total"]
 
         logger.info("Resumo Geocoding")
@@ -717,6 +680,15 @@ class GeolocationService:
             pct = (v / total * 100) if total else 0
             logger.info(f"{k}: {v} ({pct:.1f}%)")
 
+        logger.info(
+            f"[FINAL_STATS] "
+            f"cache={self.stats['cache_db']} "
+            f"nominatim={self.stats['nominatim_struct']} "
+            f"google={self.stats['google']} "
+            f"falha={self.stats['falha']} "
+            f"total={self.stats['total']}"
+        )
+
     def geocode_batch_enriched(self, items):
 
         resultados = []
@@ -727,7 +699,8 @@ class GeolocationService:
                     item["address"],
                     cidade=item.get("cidade"),
                     uf=item.get("uf"),
-                    cep=item.get("cep")
+                    cep=item.get("cep"),
+                    cache_key=item.get("cache_key")  # 🔥 ESSENCIAL
                 )
 
                 return {
@@ -736,13 +709,13 @@ class GeolocationService:
                     "lon": lon,
                     "source": source,
                     "valid": valid,
-                    "cache_key": normalize_for_cache(
-                        item["address"],
-                        cep=item.get("cep")
-                    ),
+
+                    # 🔥 CORREÇÃO CRÍTICA — SEM CEP
+                    "cache_key": item["cache_key"],
+
                     "cidade": item.get("cidade"),
                     "uf": item.get("uf"),
-                    "endereco": item.get("address")  # 🔥 AQUI
+                    "endereco": item.get("address")
                 }
 
             except Exception as e:
@@ -754,13 +727,13 @@ class GeolocationService:
                     "lon": None,
                     "source": "erro",
                     "valid": False,
-                    "cache_key": normalize_for_cache(
-                        item["address"],
-                        cep=item.get("cep")
-                    ),
+
+                    # 🔥 CORREÇÃO CRÍTICA — SEM CEP
+                    "cache_key": item["cache_key"],
+
                     "cidade": item.get("cidade"),
                     "uf": item.get("uf"),
-                    "endereco": item.get("address")  # 🔥 AQUI TAMBÉM
+                    "endereco": item.get("address")
                 }
 
         # 🔥 PARALELISMO CONTROLADO

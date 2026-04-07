@@ -6,6 +6,7 @@
 # ============================================================
 
 from geocoding_engine.config.uf_bounds import UF_BOUNDS
+import pandas as pd
 
 
 class GeoValidator:
@@ -69,86 +70,27 @@ class GeoValidator:
 
 
 # ============================================================
-# 🧠 VALIDAÇÃO PESADA (USAR FORA DO PIPELINE)
-# ============================================================
-
-def validar_municipio(lat, lon, cidade, uf):
-    """
-    Validação pesada usando polígono IBGE.
-
-    ⚠️ NÃO usar dentro do pipeline principal.
-    ⚠️ Usar apenas em pós-processamento (batch).
-    """
-
-    from geocoding_engine.domain.municipio_polygon_validator import (
-        ponto_dentro_municipio
-    )
-
-    if lat is None or lon is None:
-        return False
-
-    if not cidade or not uf:
-        return False
-
-    try:
-        return ponto_dentro_municipio(lat, lon, cidade, uf)
-    except Exception:
-        return False
-
-
-# ============================================================
-# 🚀 BATCH (PARA SPREADSHEET / FINAL)
-# ============================================================
-
-def validar_municipios_batch(df):
-    """
-    Validação em lote (simples).
-    """
-
-    resultados = []
-
-    for _, row in df.iterrows():
-
-        lat = row.get("lat")
-        lon = row.get("lon")
-        cidade = row.get("cidade")
-        uf = row.get("uf")
-
-        ok = validar_municipio(lat, lon, cidade, uf)
-
-        resultados.append(ok)
-
-    df["valido_municipio"] = resultados
-
-    return df
-
-
-# ============================================================
 # 🚀 BATCH OTIMIZADO (GEOPANDAS)
 # ============================================================
 
 def validar_municipios_batch_fast(df, gdf_municipios):
-    """
-    Validação em lote otimizada (recomendado para grandes volumes).
-
-    Requisitos:
-        - geopandas
-        - shapely
-        - gdf_municipios carregado previamente
-    """
 
     import geopandas as gpd
     from shapely.geometry import Point
 
-    # cria geometria
+    # 🔥 GARANTE COLUNAS
+    df["cidade"] = df["cidade"].astype(str).str.upper().str.strip()
+    df["uf"] = df["uf"].astype(str).str.upper().str.strip()
+
+    # 🔥 cria geometria
     geometry = [
-        Point(lon, lat) if lat is not None and lon is not None else None
+        Point(lon, lat) if pd.notnull(lat) and pd.notnull(lon) else None
         for lat, lon in zip(df["lat"], df["lon"])
     ]
 
     gdf = gpd.GeoDataFrame(df.copy(), geometry=geometry, crs="EPSG:4326")
 
-    # spatial join
+    # 🔥 join
     joined = gpd.sjoin(
         gdf,
         gdf_municipios,
@@ -156,6 +98,13 @@ def validar_municipios_batch_fast(df, gdf_municipios):
         predicate="within"
     )
 
-    df["valido_municipio"] = joined.index_right.notnull()
+    print("[DEBUG JOIN COLS]", joined.columns.tolist())
+
+    # 🔥 VALIDAÇÃO CORRETA (SEM ADIVINHAÇÃO)
+    df["valido_municipio"] = (
+        joined["index_right"].notnull() &
+        (joined["cidade_left"] == joined["cidade_right"]) &
+        (joined["uf_left"] == joined["uf_right"])
+    )
 
     return df

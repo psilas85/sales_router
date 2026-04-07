@@ -8,12 +8,15 @@ from uuid import uuid4
 import os
 import time
 import gc
+import re
+import unicodedata
 
 import pandas as pd
 import redis
 
 from rq import Queue
 from geocoding_engine.visualization.geojson_builder import GeoJSONBuilder
+from geocoding_engine.application.reprocess_invalids_service import geocode_google_direto
 
 logger = logging.getLogger("geocode_jobs")
 logger.setLevel(logging.INFO)
@@ -29,10 +32,77 @@ if not logger.handlers:
 # HELPERS
 # =========================================================
 
+def _normalize_text(txt: str) -> str:
+    if not txt:
+        return ""
+
+    # remove acento
+    txt = unicodedata.normalize("NFKD", str(txt))
+    txt = "".join(c for c in txt if not unicodedata.combining(c))
+
+    # upper + trim
+    txt = txt.upper().strip()
+
+    # remove múltiplos espaços
+    txt = re.sub(r"\s+", " ", txt)
+
+    return txt
+
+
+def cidade_existe_ibge(cidade, uf, gdf_municipios):
+    """
+    Valida se cidade + UF existem no IBGE.
+
+    Regras:
+    - Normaliza acento
+    - Case insensitive
+    - Remove espaços duplicados
+    - Fail fast se dado inválido
+    """
+
+    # -------------------------------------------------
+    # 🔴 FAIL FAST
+    # -------------------------------------------------
+    if not cidade or not uf:
+        return False
+
+    cidade = _normalize_text(cidade)
+    uf = _normalize_text(uf)
+
+    if not cidade or not uf or len(uf) != 2:
+        return False
+
+    # -------------------------------------------------
+    # 🔥 GARANTE NORMALIZAÇÃO NO GDF (UMA VEZ SÓ)
+    # -------------------------------------------------
+    if "cidade_norm" not in gdf_municipios.columns:
+        gdf_municipios["cidade_norm"] = gdf_municipios["cidade"].apply(_normalize_text)
+
+    if "uf_norm" not in gdf_municipios.columns:
+        gdf_municipios["uf_norm"] = gdf_municipios["uf"].apply(_normalize_text)
+
+    # -------------------------------------------------
+    # 🔍 MATCH
+    # -------------------------------------------------
+    match = gdf_municipios[
+        (gdf_municipios["cidade_norm"] == cidade) &
+        (gdf_municipios["uf_norm"] == uf)
+    ]
+
+    return not match.empty
 def chunk_list(lst, size):
     for i in range(0, len(lst), size):
         yield lst[i:i + size]
 
+def validar_input_basico(row):
+
+    obrigatorios = ["logradouro", "numero", "cidade", "uf"]
+
+    for campo in obrigatorios:
+        if pd.isna(row.get(campo)) or not str(row.get(campo)).strip():
+            return False, f"{campo}_invalido"
+
+    return True, None
 
 def montar_addresses(df: pd.DataFrame):
     addresses = []
@@ -51,8 +121,7 @@ def montar_addresses(df: pd.DataFrame):
             partes.append(str(logradouro).strip())
 
         if pd.notna(numero) and str(numero).strip():
-            if partes:
-                partes[-1] = f"{partes[-1]} {str(numero).strip()}"
+            partes[-1] = f"{partes[-1]} {str(numero).strip()}"
 
         if pd.notna(bairro) and str(bairro).strip():
             partes.append(str(bairro).strip())
@@ -62,12 +131,29 @@ def montar_addresses(df: pd.DataFrame):
 
         endereco = ", ".join(partes)
 
+        valido, motivo = validar_input_basico(row)
+
+        if not valido:
+            addresses.append({
+                "id": str(idx),
+                "address": None,
+                "logradouro": None,
+                "numero": None,
+                "cidade": None,
+                "uf": None,
+                "cep": None,
+                "erro": motivo
+            })
+            continue
+
         addresses.append({
             "id": str(idx),
             "address": endereco,
-            "cidade": None if pd.isna(cidade) else str(cidade).strip(),
-            "uf": None if pd.isna(uf) else str(uf).strip(),
-            "cep": None if pd.isna(cep) else str(cep).strip()
+            "logradouro": str(logradouro).strip() if pd.notna(logradouro) else None,
+            "numero": str(numero).strip() if pd.notna(numero) else None,
+            "cidade": str(cidade).strip() if pd.notna(cidade) else None,
+            "uf": str(uf).strip() if pd.notna(uf) else None,
+            "cep": str(cep).strip() if pd.notna(cep) else None
         })
 
     return addresses
@@ -77,7 +163,7 @@ def _safe_int(v, default=0):
     try:
         return int(v)
     except Exception:
-        return default
+        return None
 
 
 def _get_hash_stats(redis_conn, stats_key: str):
@@ -163,6 +249,41 @@ def processar_geocode(file_path):
         df = pd.read_excel(file_path)
         df = df.reset_index(drop=True)
 
+        # 🔥 DEFINE ID GLOBAL (CRÍTICO)
+        df["id"] = df.index.astype(str)
+
+        # 🔥 GUARDA ORIGINAL
+        df_original = df.copy()
+
+        # =====================================================
+        # 🔥 VALIDAÇÃO DE CIDADE (ANTES DE TUDO)
+        # =====================================================
+        from geocoding_engine.domain.municipio_polygon_validator import carregar_municipios_gdf
+
+        gdf_municipios = carregar_municipios_gdf()
+
+        df["cidade"] = df["cidade"].astype(str).str.upper().str.strip()
+        df["uf"] = df["uf"].astype(str).str.upper().str.strip()
+
+        df["cidade_valida"] = df.apply(
+            lambda row: cidade_existe_ibge(row["cidade"], row["uf"], gdf_municipios),
+            axis=1
+        )
+
+        df_invalidos_cidade = df[~df["cidade_valida"]].copy()
+
+        if not df_invalidos_cidade.empty:
+            logger.warning(f"[CIDADE_INVALIDA] total={len(df_invalidos_cidade)}")
+
+        # 🔥 SEGUE SÓ COM VÁLIDOS
+        df_invalidos_cidade["motivo_invalidacao"] = "cidade_invalida"
+        df_invalidos_cidade["status_final"] = "invalido"
+
+        # 🔥 mantém separado
+        df_validos_input = df[df["cidade_valida"]].copy()
+
+        df = df_validos_input.copy()
+
         for col in ["setor", "consultor", "cnpj", "razao_social", "nome_fantasia"]:
             if col not in df.columns:
                 df[col] = None
@@ -173,11 +294,6 @@ def processar_geocode(file_path):
         # =====================================================
         # PREPARAÇÃO
         # =====================================================
-        if job:
-            job.meta["progress"] = 10
-            job.meta["step"] = "Preparando endereços"
-            job.save_meta()
-
         addresses = montar_addresses(df)
 
         if not addresses:
@@ -185,7 +301,19 @@ def processar_geocode(file_path):
 
         logger.info(f"[DEBUG] total_addresses={len(addresses)}")
 
-        # Limpeza forte de chaves da execução
+        # 🔥 NOVO — separação
+        addresses_validos = [a for a in addresses if a.get("address")]
+        addresses_invalidos_input = [a for a in addresses if not a.get("address")]
+
+        logger.info(f"[INPUT] validos={len(addresses_validos)} invalidos={len(addresses_invalidos_input)}")
+
+        # 🔥 NOVO — dataframe de inválidos de entrada
+        df_invalidos_input = pd.DataFrame(addresses_invalidos_input)
+
+        if not df_invalidos_input.empty:
+            df_invalidos_input["motivo_invalidacao"] = df_invalidos_input["erro"]
+
+        # Limpeza Redis
         redis_str.delete(redis_results_key)
         redis_str.delete(redis_done_key)
         redis_str.delete(redis_stats_key)
@@ -199,13 +327,14 @@ def processar_geocode(file_path):
             job.save_meta()
 
         subjob_ids = []
-        total_chunks = (len(addresses) + CHUNK_SIZE - 1) // CHUNK_SIZE
+        total_chunks = (len(addresses_validos) + CHUNK_SIZE - 1) // CHUNK_SIZE
 
         logger.info(f"📦 {total_chunks} chunks estimados")
 
         chunk_id = 0
 
-        for chunk in chunk_list(addresses, CHUNK_SIZE):
+        for chunk in chunk_list(addresses_validos, CHUNK_SIZE):
+
             payload = {
                 "chunk_id": chunk_id,
                 "parent_id": job_id,
@@ -224,17 +353,7 @@ def processar_geocode(file_path):
             except Exception as e:
                 logger.error(f"[ENQUEUE][ERRO] chunk_id={chunk_id} erro={e}")
 
-            if chunk_id % 10 == 0:
-                logger.info(f"[ENQUEUE] chunk {chunk_id + 1}/{total_chunks}")
-
             chunk_id += 1
-
-        if len(subjob_ids) != total_chunks:
-            logger.warning(
-                f"[ENQUEUE][DIVERGENCIA] enviados={len(subjob_ids)} estimados={total_chunks}"
-            )
-
-        logger.info(f"🚀 {len(subjob_ids)} subjobs enviados")
 
         # =====================================================
         # AGUARDAR CONCLUSÃO REAL DOS CHUNKS
@@ -384,7 +503,6 @@ def processar_geocode(file_path):
         # =====================================================
         # PREPARAR DF ORIGINAL
         # =====================================================
-        df["id"] = df.index.astype(str)
 
         logger.info(f"[DEBUG] df_ids_sample={df['id'].head(10).tolist()}")
         logger.info(f"[DEBUG] df_result_ids_sample={df_result['id'].head(10).tolist()}")
@@ -453,97 +571,487 @@ def processar_geocode(file_path):
         # SEPARAÇÃO
         # =====================================================
         df_validos = df_final.dropna(subset=["lat", "lon"]).copy()
-        df_invalidos = df_final[df_final["lat"].isnull() | df_final["lon"].isnull()].copy()
-
-        df_invalidos["motivo_invalidacao"] = "falha_geocode"
 
         logger.info(f"[FINAL] validos={len(df_validos)} invalidos={len(df_invalidos)}")
+        df_invalidos_criticos = pd.DataFrame()
 
-        from geocoding_engine.domain.municipio_polygon_validator import ponto_dentro_municipio
+        # =====================================================
+        # VALIDAÇÃO DE MUNICÍPIO (OTIMIZADA)
+        # =====================================================
+        from geocoding_engine.domain.geo_validator import validar_municipios_batch_fast
+        
+        df_invalidos_criticos = pd.DataFrame()
 
         if not df_validos.empty:
 
-            logger.info("[POLIGONO] iniciando validação por município")
+            logger.info("[POLIGONO] validação batch iniciada")
 
             df_validos["cidade"] = df_validos["cidade"].astype(str).str.upper().str.strip()
             df_validos["uf"] = df_validos["uf"].astype(str).str.upper().str.strip()
 
-            total_antes = len(df_validos)  # 🔥 CORRETO
+            df_validos = validar_municipios_batch_fast(df_validos, gdf_municipios)
 
-            valido_mask = []
+            # 🔥 separação correta
+            df_invalidos_criticos = df_validos[~df_validos["valido_municipio"]].copy()
+            df_invalidos_criticos["motivo_invalidacao"] = "fora_municipio"
 
-            for _, row in df_validos.iterrows():
-
-                try:
-                    ok = ponto_dentro_municipio(
-                        row.get("lat"),
-                        row.get("lon"),
-                        row.get("cidade"),
-                        row.get("uf")
-                    )
-                    valido_mask.append(ok is True)
-
-                except Exception as e:
-                    logger.warning(f"[POLIGONO][ERRO] erro={e}")
-                    valido_mask.append(False)
-
-            df_validos["valido_municipio"] = valido_mask
-
-            df_invalidos_municipio = df_validos[~df_validos["valido_municipio"]].copy()
             df_validos = df_validos[df_validos["valido_municipio"]].copy()
 
-            df_invalidos_municipio["motivo_invalidacao"] = "fora_municipio"
+            # 🔥 FAIL FAST (CRÍTICO)
+            if "id" not in df_validos.columns:
+                raise Exception("[ERRO CRÍTICO] df_validos perdeu coluna 'id'")
 
-            df_invalidos = pd.concat(
-                [df_invalidos, df_invalidos_municipio],
-                ignore_index=True
-            )
+            if "id" not in df_invalidos_criticos.columns:
+                raise Exception("[ERRO CRÍTICO] df_invalidos_criticos perdeu coluna 'id'")
 
-            total_rejeitados = len(df_invalidos_municipio)
-            taxa = (total_rejeitados / total_antes) if total_antes else 0
+            # 🔥 GARANTE TIPO
+            df_validos["id"] = df_validos["id"].astype(str)
+            df_invalidos_criticos["id"] = df_invalidos_criticos["id"].astype(str)
 
             logger.info(
-                f"[POLIGONO] validos={len(df_validos)} "
-                f"invalidos_municipio={len(df_invalidos_municipio)} "
-                f"taxa_rejeicao={taxa:.2%}"
+                f"[POLIGONO] validos={len(df_validos)} invalidos_municipio={len(df_invalidos_criticos)}"
             )
+
+        # =====================================================
+        # 🔥 REPROCESSAMENTO CONTROLADO
+        # =====================================================
+        from geocoding_engine.application.reprocess_invalids_service import ReprocessInvalidsService
+        from geocoding_engine.infrastructure.database_writer import DatabaseWriter
+        from geocoding_engine.infrastructure.database_reader import DatabaseReader
+
+        logger.info("♻ Reprocessamento iniciado")
+
+        df_reprocessar = df_invalidos_criticos.copy()
+
+        logger.info(f"♻ Reprocessando: {len(df_reprocessar)}")
+
+        df_recuperados = pd.DataFrame()
+        df_restantes = df_invalidos_criticos.copy()
+
+        if not df_reprocessar.empty:
+
+            reader = DatabaseReader()
+            conn = reader.conn
+            writer = DatabaseWriter(conn)
+
+            reprocessor = ReprocessInvalidsService(writer)
+
+            df_recuperados, df_restantes = reprocessor.execute(df_reprocessar)
+
+        # =====================================================
+        # 🔥 REVALIDAÇÃO DOS RECUPERADOS (CORRIGIDA)
+        # =====================================================
+        df_recuperados_validos = pd.DataFrame()
+        df_recuperados_invalidos = pd.DataFrame()
+
+        if not df_recuperados.empty:
+
+            if "id" not in df_recuperados.columns:
+                raise Exception("[ERRO CRÍTICO] df_recuperados sem coluna 'id'")
+
+            df_recuperados["id"] = df_recuperados["id"].astype(str)
+
+            # -------------------------------------------------
+            # 🔥 SEPARA FALLBACK (CRÍTICO)
+            # -------------------------------------------------
+            df_fallback = df_recuperados[
+                df_recuperados["source"] == "fallback_cidade"
+            ].copy()
+
+            df_nao_fallback = df_recuperados[
+                df_recuperados["source"] != "fallback_cidade"
+            ].copy()
+
+            # -------------------------------------------------
+            # 🔥 VALIDA SOMENTE NÃO-FALLBACK
+            # -------------------------------------------------
+            if not df_nao_fallback.empty:
+
+                df_nao_fallback = validar_municipios_batch_fast(df_nao_fallback, gdf_municipios)
+
+                df_nao_fallback_validos = df_nao_fallback[
+                    df_nao_fallback["valido_municipio"]
+                ].copy()
+
+                df_nao_fallback_invalidos = df_nao_fallback[
+                    ~df_nao_fallback["valido_municipio"]
+                ].copy()
+
+            else:
+                df_nao_fallback_validos = pd.DataFrame()
+                df_nao_fallback_invalidos = pd.DataFrame()
+
+
+            # -------------------------------------------------
+            # 🔥 NOVA REGRA — GOOGLE FORA DO POLÍGONO → FALLBACK
+            # -------------------------------------------------
+            if not df_nao_fallback_invalidos.empty:
+
+                logger.warning("[GOOGLE_FORA_POLIGONO] → fallback cidade")
+
+                df_fallback_extra = df_nao_fallback_invalidos.copy()
+
+                for idx, row in df_fallback_extra.iterrows():
+
+                    lat_fb, lon_fb = geocode_google_direto(f"{row['cidade']}, {row['uf']}, Brasil")
+
+                    if lat_fb is not None and lon_fb is not None:
+                        df_fallback_extra.at[idx, "lat"] = lat_fb
+                        df_fallback_extra.at[idx, "lon"] = lon_fb
+                        df_fallback_extra.at[idx, "source"] = "fallback_cidade"
+                        df_fallback_extra.at[idx, "valido_municipio"] = True
+
+            else:
+                df_fallback_extra = pd.DataFrame()
+
+
+            # -------------------------------------------------
+            # 🔥 FALLBACK ORIGINAL (mantém)
+            # -------------------------------------------------
+            if not df_fallback.empty:
+
+                df_fallback = validar_municipios_batch_fast(df_fallback, gdf_municipios)
+
+                fora = (~df_fallback["valido_municipio"]).sum()
+
+                if fora > 0:
+                    logger.warning(f"[FALLBACK_FORA_POLIGONO] total={fora}")
+
+                df_fallback["valido_municipio"] = True
+
+
+            # -------------------------------------------------
+            # 🔥 CONSOLIDA FINAL
+            # -------------------------------------------------
+            df_recuperados_validos = pd.concat([
+                df_nao_fallback_validos,
+                df_fallback,
+                df_fallback_extra
+            ], ignore_index=True)
+
+
+            df_recuperados_invalidos = pd.DataFrame()
+
+            logger.info(
+                f"[REPROCESS_POLIGONO] validos={len(df_recuperados_validos)} "
+                f"invalidos={len(df_recuperados_invalidos)} "
+                f"(fallback_incluidos={len(df_fallback)})"
+            )
+
+        # =====================================================
+        # 🔥 FALLBACK CONTROLADO (SEM CONTAMINAR)
+        # =====================================================
+
+        # 🔥 NÃO DESCARTA FALLBACK
+        if not df_recuperados_invalidos.empty:
+            logger.warning(
+                f"[INVALIDOS_REAIS] fora do município (não fallback): {len(df_recuperados_invalidos)}"
+            )
+
+        # =====================================================
+        # 🔥 CONSOLIDAÇÃO FINAL
+        # =====================================================
+
+        df_validos_final = pd.concat([
+            df_validos,
+            df_recuperados_validos
+        ], ignore_index=True)
+
+        df_validos_final = df_validos_final.drop_duplicates(subset=["id"], keep="first")
+
+        # 🔥 FAIL FAST FINAL
+        if "id" not in df_final.columns:
+            raise Exception("[ERRO CRÍTICO] df_final sem coluna 'id'")
+
+        logger.info(f"[FINAL] total={len(df_final)}")
+
+        
+        # =====================================================
+        # 🔥 INVALIDOS REAIS (OPCIONAL EXPORT)
+        # =====================================================
+
+        dfs_invalidos = []
+
+        if not df_invalidos_criticos.empty:
+            dfs_invalidos.append(df_invalidos_criticos)
+
+        if not df_recuperados_invalidos.empty:
+            dfs_invalidos.append(df_recuperados_invalidos)
+
+        df_invalidos_final = pd.concat(dfs_invalidos, ignore_index=True) if dfs_invalidos else pd.DataFrame()
+
+        logger.info(f"[INVALIDOS_FINAL] total={len(df_invalidos_final)}")
+
+        # =====================================================
+        # 🔥 CACHE SEGURO
+        # =====================================================
+
+        df_cache = df_validos_final.copy()
+
+        if "valido_municipio" in df_cache.columns:
+            df_cache = df_cache[df_cache["valido_municipio"] == True]
+
+        
+        # =====================================================
+        # 🔥 PADRONIZAÇÃO INVALIDOS INPUT (CRÍTICO)
+        # =====================================================
+
+        if not df_invalidos_input.empty:
+            for col in df_final.columns:
+                if col not in df_invalidos_input.columns:
+                    df_invalidos_input[col] = None
+        
+        # ======================================================
+        # CONSOLIDAÇÃO FINAL CORRETA (SEM DUPLICAÇÃO)
+        # ======================================================
+
+        # 🔥 válidos finais já estão corretos
+        df_validos = df_validos_final.copy()
+
+        # 🔥 base correta = ORIGINAL (CRÍTICO)
+        df_base = df_original.copy()
+
+        # garante tipo
+        df_base["id"] = df_base.index.astype(str)
+        df_validos["id"] = df_validos["id"].astype(str)
+
+        # 🔥 todos os IDs válidos
+        ids_validos = set(df_validos["id"])
+
+        # 🔥 inválidos = tudo que NÃO está nos válidos
+        df_invalidos = df_base[~df_base["id"].isin(ids_validos)].copy()
+
+        # -----------------------------------------------------
+        # MOTIVO DE INVALIDAÇÃO
+        # -----------------------------------------------------
+
+        # default
+        df_invalidos["motivo_invalidacao"] = "falha_geocode"
+
+        # prioridade: polígono
+        if not df_invalidos_criticos.empty:
+
+            df_invalidos_criticos["id"] = df_invalidos_criticos["id"].astype(str)
+
+            df_invalidos = df_invalidos.merge(
+                df_invalidos_criticos[["id", "motivo_invalidacao"]],
+                on="id",
+                how="left",
+                suffixes=("", "_critico")
+            )
+
+            df_invalidos["motivo_invalidacao"] = df_invalidos["motivo_invalidacao_critico"].combine_first(
+                df_invalidos["motivo_invalidacao"]
+            )
+
+            df_invalidos.drop(columns=["motivo_invalidacao_critico"], inplace=True)
+
+        # -----------------------------------------------------
+        # INPUT INVALIDO (SEM DUPLICAR)
+        # -----------------------------------------------------
+
+        if not df_invalidos_input.empty:
+
+            df_invalidos_input["id"] = df_invalidos_input["id"].astype(str)
+
+            df_invalidos = pd.concat([
+                df_invalidos,
+                df_invalidos_input[~df_invalidos_input["id"].isin(df_invalidos["id"])]
+            ], ignore_index=True)
+
+        # -----------------------------------------------------
+        # CIDADE INVALIDA (CRÍTICO)
+        # -----------------------------------------------------
+
+        if not df_invalidos_cidade.empty:
+
+            df_invalidos_cidade = df_invalidos_cidade.copy()
+            df_invalidos_cidade["id"] = df_invalidos_cidade["id"].astype(str)
+
+            # padroniza colunas
+            for col in df_invalidos.columns:
+                if col not in df_invalidos_cidade.columns:
+                    df_invalidos_cidade[col] = None
+
+            df_invalidos = pd.concat([
+                df_invalidos,
+                df_invalidos_cidade[~df_invalidos_cidade["id"].isin(df_invalidos["id"])]
+            ], ignore_index=True)
+
+        # -----------------------------------------------------
+        # DEDUP FINAL
+        # -----------------------------------------------------
+
+        df_invalidos = df_invalidos.drop_duplicates(subset=["id"], keep="first")
+
+        # -----------------------------------------------------
+        # STATUS FINAL
+        # -----------------------------------------------------
+
+        df_validos["status_final"] = "valido"
+        df_invalidos["status_final"] = "invalido"
+
+        # -----------------------------------------------------
+        # CONSISTÊNCIA
+        # -----------------------------------------------------
+
+        total_final = len(df_validos) + len(df_invalidos)
+
+        if total_final != len(df_original):
+            logger.error(f"[ERRO_CONSISTENCIA] total_final={total_final} original={len(df_original)}")
+        else:
+            logger.info(f"[CONSISTENTE] total={len(df_original)} validos={len(df_validos)} invalidos={len(df_invalidos)}")
+                                
+        
+        # =====================================================
+        # 🔥 PERSISTÊNCIA DE CACHE FINAL (VERSÃO DEFINITIVA)
+        # =====================================================
+
+        from geocoding_engine.infrastructure.database_writer import DatabaseWriter
+        from geocoding_engine.infrastructure.database_reader import DatabaseReader
+
+        import math
+
+        try:
+            reader = DatabaseReader()
+            conn = reader.conn
+            writer = DatabaseWriter(conn)
+
+            df_cache = df_validos_final.copy()
+
+            # 🔥 GARANTE VALIDAÇÃO FINAL
+            if "valido_municipio" in df_cache.columns:
+                df_cache = df_cache[df_cache["valido_municipio"] == True]
+
+            # 🔥 SOMENTE COM COORDENADA
+            df_cache = df_cache[
+                df_cache["lat"].notnull() &
+                df_cache["lon"].notnull()
+            ].copy()
+
+            # 🔥 NORMALIZA CAMPOS
+            df_cache["logradouro"] = df_cache["logradouro"].astype(str).str.strip()
+            df_cache["numero"] = df_cache["numero"].astype(str).str.replace(".0", "").str.strip()
+            df_cache["cidade"] = df_cache["cidade"].astype(str).str.strip()
+            df_cache["uf"] = df_cache["uf"].astype(str).str.strip()
+
+            # 🔥 DEDUP REAL
+            df_cache = df_cache.drop_duplicates(
+                subset=["logradouro", "numero", "cidade", "uf"]
+            )
+
+            logger.info(f"[CACHE_FINAL] candidatos={len(df_cache)}")
+
+            saved = 0
+
+            for _, row in df_cache.iterrows():
+
+                # -------------------------------------------------
+                # 🔴 NÃO SALVAR FALLBACK OU INVÁLIDO
+                # -------------------------------------------------
+                if (
+                    str(row.get("source")) == "fallback_cidade"
+                    or not row.get("valido_municipio", True)
+                ):
+                    continue
+
+                logradouro = row.get("logradouro")
+                numero = row.get("numero")
+                cidade = row.get("cidade")
+                uf = row.get("uf")
+
+                if not cidade or not uf:
+                    continue
+
+                lat = row.get("lat")
+                lon = row.get("lon")
+
+                if lat is None or lon is None:
+                    continue
+
+                try:
+                    if math.isnan(lat) or math.isnan(lon):
+                        continue
+                except Exception:
+                    continue
+
+                endereco_raw = (
+                    f"{logradouro} {numero}, {cidade} - {uf}"
+                ).replace(" ,", ",").strip()
+
+                if len(endereco_raw) < 10:
+                    continue
+
+                if "NAN" in endereco_raw.upper():
+                    continue
+
+                try:
+                    writer.salvar_cache(
+                        logradouro=logradouro,
+                        numero=numero,
+                        cidade=cidade,
+                        uf=uf,
+                        endereco_original=endereco_raw,
+                        lat=float(lat),
+                        lon=float(lon),
+                        origem=row.get("source")
+                    )
+                    saved += 1
+
+                except Exception as e:
+                    logger.warning(f"[CACHE_FINAL][ERRO] {e}")
+
+            logger.info(f"[CACHE_FINAL] salvos={saved}")
+
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except:
+                pass
+
         # =====================================================
         # EXCEL
         # =====================================================
         with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-            df_validos.to_excel(writer, sheet_name="geocodificados", index=False)
+            df_validos_final.to_excel(writer, sheet_name="geocodificados", index=False)
             df_invalidos.to_excel(writer, sheet_name="invalidos", index=False)
 
         logger.info("✅ Excel salvo")
 
+        
         # =====================================================
         # JSON
         # =====================================================
-        result = df_validos[["lat", "lon"]].copy()
+        result = df_validos_final[["lat", "lon"]].copy()
 
-        # 🔥 CRIAR ENDEREÇO
-        result = df_validos[["lat", "lon"]].copy()
+        
+        # =====================================================
+        # 🔥 CRIAR ENDEREÇO (CORRETO)
+        # =====================================================
+
+        result = df_validos_final[["lat", "lon"]].copy()
 
         result["endereco"] = (
-            df_validos["logradouro"].fillna("").astype(str) + " " +
-            df_validos["numero"].fillna("").astype(str) + ", " +
-            df_validos["bairro"].fillna("").astype(str) + ", " +
-            df_validos["cidade"].fillna("").astype(str) + " - " +
-            df_validos["uf"].fillna("").astype(str)
+            df_validos_final["logradouro"].fillna("").astype(str) + " " +
+            df_validos_final["numero"].fillna("").astype(str) + ", " +
+            df_validos_final["bairro"].fillna("").astype(str) + ", " +
+            df_validos_final["cidade"].fillna("").astype(str) + " - " +
+            df_validos_final["uf"].fillna("").astype(str)
         ).str.replace(" ,", ",").str.strip()
 
-        if "cidade" in df_validos.columns:
-            result["cidade"] = df_validos["cidade"]
+        # =====================================================
+        # 🔥 CAMPOS ADICIONAIS
+        # =====================================================
 
-        if "endereco" in df_validos.columns:
-            result["endereco"] = df_validos["endereco"]
+        if "cidade" in df_validos_final.columns:
+            result["cidade"] = df_validos_final["cidade"]
 
-        if "setor" in df_validos.columns:
-            result["setor"] = df_validos["setor"]
+        if "setor" in df_validos_final.columns:
+            result["setor"] = df_validos_final["setor"]
 
-        # 🔥 ESSA LINHA FALTAVA
-        if "consultor" in df_validos.columns:
-            result["consultor"] = df_validos["consultor"]      
+        if "consultor" in df_validos_final.columns:
+            result["consultor"] = df_validos_final["consultor"]
 
         # =====================================================
         # LIMPEZA (EVITA ERRO 500 JSON)
@@ -625,7 +1133,7 @@ def processar_geocode(file_path):
         # =====================================================
         live_stats = _get_hash_stats(redis_str, redis_stats_key)
 
-        total = int(len(df_final))
+        total = int(len(df_original))
         sucesso = int(len(df_validos))
         falhas = int(len(df_invalidos))
         tempo_ms = int((time.time() - started_at) * 1000)

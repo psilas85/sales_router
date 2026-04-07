@@ -66,3 +66,8 @@ openpyxl
 scikit-learn-extra==0.3.0
 
 python-multipart
+
+geopandas
+shapely
+pyproj
+fiona

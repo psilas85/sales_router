@@ -48,14 +48,14 @@ class DatabaseReader:
     # ---------------------------------------------------------
     # CACHE GLOBAL INDIVIDUAL
     # ---------------------------------------------------------
-    def buscar_cache(self, endereco):
+   
 
-        if not endereco:
+    def buscar_cache(self, cache_key):
+
+        if not cache_key:
             return None
 
         self._ensure_connection()
-
-        endereco_norm = normalize_for_cache(endereco)
 
         try:
             with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -67,7 +67,7 @@ class DatabaseReader:
                     WHERE endereco_normalizado = %s
                     LIMIT 1
                     """,
-                    (endereco_norm,),
+                    (cache_key,),
                 )
 
                 row = cur.fetchone()
@@ -83,22 +83,12 @@ class DatabaseReader:
     # ---------------------------------------------------------
     # CACHE GLOBAL EM LOTE
     # ---------------------------------------------------------
-    def buscar_cache_em_lote(self, enderecos):
+    def buscar_cache_em_lote(self, cache_keys):
 
-        if not enderecos:
+        if not cache_keys:
             return {}
 
         self._ensure_connection()
-
-        # 🔥 normalização única e consistente
-        enderecos_norm = [
-            normalize_for_cache(e)
-            for e in enderecos
-            if e
-        ]
-
-        if not enderecos_norm:
-            return {}
 
         try:
             with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -109,7 +99,7 @@ class DatabaseReader:
                     FROM enderecos_cache
                     WHERE endereco_normalizado = ANY(%s)
                     """,
-                    (enderecos_norm,),
+                    (cache_keys,),
                 )
 
                 rows = cur.fetchall()
@@ -122,7 +112,7 @@ class DatabaseReader:
         except Exception as e:
             logger.warning(f"[CACHE_LOTE][ERRO] {e}")
             return {}
-
+            
     # ---------------------------------------------------------
     # BUSCA FILTRADA (UI / edição manual)
     # ---------------------------------------------------------

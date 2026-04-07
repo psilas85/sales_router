@@ -31,3 +31,18 @@ class ConsultorService:
             raise ValueError(f"Consultor sem coordenadas: {consultor}")
 
         return float(lat), float(lon)
+
+    def get_all_consultores(self):
+
+        query = """
+            SELECT DISTINCT UPPER(consultor)
+            FROM consultores
+            WHERE tenant_id = %s
+        """
+
+        with self.conn.cursor() as cur:
+            cur.execute(query, (self.tenant_id,))
+            rows = cur.fetchall()
+
+        # retorna lista simples
+        return [r[0] for r in rows if r[0]]

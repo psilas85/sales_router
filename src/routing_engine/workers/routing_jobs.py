@@ -136,6 +136,7 @@ def processar_routing(file_path, params=None):
 
     resumo = None
     rotas = []
+    line_buffer = []
 
     if proc.stdout:
         for line in iter(proc.stdout.readline, ""):
@@ -144,6 +145,8 @@ def processar_routing(file_path, params=None):
 
             if not line:
                 continue
+
+            line_buffer.append(line)
 
             if not line.startswith("{"):
                 logger.info(f"[MAIN] {line}")
@@ -175,7 +178,43 @@ def processar_routing(file_path, params=None):
     proc.wait()
 
     if proc.returncode != 0:
-        raise RuntimeError(f"Routing subprocess falhou (code={proc.returncode})")
+
+        error_message = None
+
+        # 🔥 pega a última mensagem relevante
+        for line in reversed(line_buffer):
+
+            if "ValueError" in line or "Exception" in line:
+                error_message = line
+                break
+
+        # fallback
+        if not error_message and line_buffer:
+            error_message = line_buffer[-1]
+
+        if not error_message:
+            error_message = "Erro no processamento de roteirização"
+
+        # 🔥 limpa mensagem (remove prefixos feios)
+        error_message = (
+            error_message
+            .replace("ValueError:", "")
+            .replace("Exception:", "")
+            .strip()
+        )
+
+        if job:
+            job.meta["error"] = {
+                "mensagem": error_message,
+                "tipo": "VALIDACAO_DADOS" if "ValueError" in error_message else "EXECUCAO",
+                "detalhes": None,
+                "subjobs_falhados": job.meta.get("subjob_errors")
+            }
+
+            job.meta["error_debug"] = line_buffer[-50:] if line_buffer else []
+            job.save_meta()
+
+        raise RuntimeError(error_message)
 
     logger.info(f"✅ Routing job finalizado | job_id={job_id}")
 
@@ -192,16 +231,20 @@ def processar_routing(file_path, params=None):
         metricas = resumo["output"].get("metricas", {})
 
     summary = {
-        "total_pdvs": metricas.get("total_pdvs"),
+        "total_pdvs_validos": metricas.get("total_pdvs_validos"),
+        "total_pdvs_invalidos": metricas.get("total_pdvs_invalidos"),
+        "total_grupos_validos": metricas.get("total_grupos_validos"),
+        "grupos_processados": metricas.get("grupos_processados"),
+        "grupos_com_erro": metricas.get("grupos_com_erro"),
         "total_rotas": metricas.get("total_rotas"),
-        "total_grupos": metricas.get("total_grupos"),
+        "taxa_sucesso": metricas.get("taxa_sucesso"),
         "tempo_execucao_ms": metricas.get("tempo_execucao_ms"),
         "cache_hits": metricas.get("cache_hits"),
         "osrm_hits": metricas.get("osrm_hits"),
         "google_hits": metricas.get("google_hits"),
         "haversine_hits": metricas.get("haversine_hits"),
+        "validacao": metricas.get("validacao"),
     }
-
     if job:
         job.meta.update({
             "progress": 100,

@@ -12,7 +12,12 @@ ENV PYTHONPATH=/app/src
 
 COPY ./requirements.txt /tmp/requirements.txt
 
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+RUN apt-get update && apt-get install -y \
+    gdal-bin \
+    libgdal-dev \
+    libgeos-dev \
+    libproj-dev \
+    && pip install --no-cache-dir -r /tmp/requirements.txt
 
 # ----------------------------------------------------
 # copia código

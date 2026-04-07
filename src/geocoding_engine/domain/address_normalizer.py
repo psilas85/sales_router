@@ -136,3 +136,31 @@ def normalize_for_display(endereco: str) -> str:
         return ""
 
     return normalize_base(endereco)
+
+# ============================================================
+# 🏙 NORMALIZAÇÃO DE CIDADE (CRÍTICA)
+# ============================================================
+
+def normalize_city(text: str) -> str:
+    if not text:
+        return ""
+
+    s = str(text)
+
+    # remove acento
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+
+    # upper
+    s = s.upper().strip()
+
+    # 🔥 remove hífen (CRÍTICO)
+    s = s.replace("-", " ")
+
+    # remove lixo
+    s = re.sub(r"[^A-Z0-9 ]", " ", s)
+
+    # normaliza espaços
+    s = re.sub(r"\s+", " ", s)
+
+    return s.strip()

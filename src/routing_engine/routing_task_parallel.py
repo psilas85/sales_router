@@ -3,6 +3,7 @@
 import json
 import time
 from rq import get_current_job
+from loguru import logger
 
 from routing_engine.infrastructure.queue_factory import get_queue
 from routing_engine.application.consultor_service import ConsultorService
@@ -34,7 +35,15 @@ def executar_routing_subjob(payload: dict):
     consultor_service = ConsultorService(params.get("tenant_id", 1))
 
     consultor = str(grupo_id).strip().upper()
-    base_lat, base_lon = consultor_service.get_base(consultor)
+
+    try:
+        base_lat, base_lon = consultor_service.get_base(consultor)
+    except Exception as e:
+        return {
+            "erro": f"Consultor não encontrado: {consultor}",
+            "grupo_id": grupo_id,
+            "qtd_pdvs": len(lista_pdvs)
+        }
 
     pdvs = [PDVData(**p) for p in lista_pdvs]
 
@@ -67,10 +76,12 @@ def executar_routing_subjob(payload: dict):
 # =========================================================
 # 🚀 JOB PRINCIPAL (ORQUESTRADOR)
 # =========================================================
+from rq import get_current_job
+import time
+
 def executar_routing_job(grupos_dict, params):
 
     job = get_current_job()
-
     queue = get_queue("routing_subjobs")
 
     jobs = []
@@ -85,7 +96,7 @@ def executar_routing_job(grupos_dict, params):
 
         payload = {
             "grupo_id": grupo_id,
-            "pdvs": [p.__dict__ for p in lista_pdvs],  # serializável
+            "pdvs": [p.__dict__ for p in lista_pdvs],
             "params": params
         }
 
@@ -96,7 +107,6 @@ def executar_routing_job(grupos_dict, params):
         )
 
         jobs.append(subjob)
-
         enviados += 1
 
         if job:
@@ -105,38 +115,78 @@ def executar_routing_job(grupos_dict, params):
             job.save_meta()
 
     # =====================================================
-    # COLETA RESULTADOS
+    # COLETA RESULTADOS (ROBUSTA)
     # =====================================================
     resultados = []
     stats_list = []
-    finalizados = 0
 
-    while finalizados < total:
+    finalizados = set()
+    falhados = {}
 
-        finalizados = 0
+    start_wait = time.time()
+    TIMEOUT_GLOBAL = 3600  # 1h
 
-        resultados_temp = []
-        stats_temp = []
+    while len(finalizados) + len(falhados) < total:
 
         for j in jobs:
-            if j.is_finished:
-                finalizados += 1
 
-                if j.result and j.result.get("grupo"):
-                    resultados_temp.append(j.result["grupo"])
-                    stats_temp.append(j.result.get("stats", {}))
+            j.refresh()
 
-        # só atualiza quando tem resultado
-        if resultados_temp:
-            resultados = resultados_temp
-            stats_list = stats_temp
+            # ===============================
+            # SUCESSO
+            # ===============================
+            if j.is_finished and j.id not in finalizados:
 
+                finalizados.add(j.id)
+
+                if j.result:
+
+                    if j.result.get("grupo"):
+                        resultados.append(j.result["grupo"])
+                        stats_list.append(j.result.get("stats", {}))
+
+                    elif j.result.get("erro"):
+                        falhados[j.id] = j.result
+
+            # ===============================
+            # FALHA HARD
+            # ===============================
+            elif j.is_failed and j.id not in falhados:
+
+                falhados[j.id] = {
+                    "trace": j.exc_info,
+                }
+
+        # ===============================
+        # PROGRESSO
+        # ===============================
         if job:
-            job.meta["progress"] = 30 + int((finalizados / total) * 60)
-            job.meta["step"] = f"Processando grupos ({finalizados}/{total})"
+            concluidos = len(finalizados) + len(falhados)
+
+            job.meta["progress"] = 30 + int((concluidos / total) * 60)
+            job.meta["step"] = (
+                f"Processando grupos "
+                f"(ok={len(finalizados)} falha={len(falhados)} total={total})"
+            )
+
+            if falhados:
+                job.meta["subjob_errors"] = falhados
+
             job.save_meta()
 
+        # ===============================
+        # TIMEOUT
+        # ===============================
+        if time.time() - start_wait > TIMEOUT_GLOBAL:
+            raise TimeoutError("Timeout aguardando subjobs de roteirização")
+
         time.sleep(1)
+
+    # =====================================================
+    # SE HOUVE FALHAS → QUEBRA O JOB
+    # =====================================================
+    if falhados:
+        logger.warning(f"{len(falhados)} subjobs falharam, mas continuando")
 
     # =====================================================
     # AGREGA STATS
@@ -148,4 +198,4 @@ def executar_routing_job(grupos_dict, params):
         "haversine_hits": sum(s.get("haversine_hits", 0) for s in stats_list),
     }
 
-    return resultados, stats_total
+    return resultados, stats_total, falhados

@@ -1,7 +1,7 @@
 #sales_router/src/geocoding_engine/infrastructure/database_writer.py
 
-from geocoding_engine.domain.address_normalizer import normalize_for_cache
 from loguru import logger
+from geocoding_engine.domain.cache_key_builder import build_cache_key
 
 
 class DatabaseWriter:
@@ -9,17 +9,29 @@ class DatabaseWriter:
     def __init__(self, conn):
         self.conn = conn
 
-    # ---------------------------------------------------------
-    # 🔥 SALVAR CACHE
-    # ---------------------------------------------------------
-    def salvar_cache(self, endereco, lat, lon, origem):
+    def salvar_cache(
+        self,
+        logradouro,
+        numero,
+        cidade,
+        uf,
+        endereco_original,
+        lat,
+        lon,
+        origem
+    ):
 
-        if not endereco:
+        if not logradouro or not numero or not cidade or not uf:
             return
 
         try:
 
-            endereco_norm = normalize_for_cache(endereco)
+            endereco_norm = build_cache_key(
+                logradouro,
+                numero,
+                cidade,
+                uf
+            )
 
             with self.conn.cursor() as cur:
 
@@ -40,7 +52,13 @@ class DatabaseWriter:
                         origem = EXCLUDED.origem,
                         atualizado_em = NOW()
                     """,
-                    (endereco, endereco_norm, lat, lon, origem)
+                    (
+                        endereco_original,
+                        endereco_norm,
+                        lat,
+                        lon,
+                        origem
+                    )
                 )
 
             self.conn.commit()

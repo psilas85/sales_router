@@ -1,7 +1,5 @@
 # sales_router/src/routing_engine/visualization/map_repository.py
 
-# sales_router/src/routing_engine/visualization/map_repository.py
-
 import json
 import os
 
