@@ -43,7 +43,7 @@ class MKPGeolocationService:
         self,
         reader: DatabaseReader,
         writer: DatabaseWriter,
-        max_workers: int = 20,
+        max_workers: int = 4,
         usar_google: bool = True,
     ):
         self.reader = reader

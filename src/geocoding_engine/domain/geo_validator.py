@@ -75,36 +75,54 @@ class GeoValidator:
 
 def validar_municipios_batch_fast(df, gdf_municipios):
 
-    import geopandas as gpd
     from shapely.geometry import Point
+    from shapely.prepared import prep
+    from geocoding_engine.domain.municipio_polygon_validator import (
+        BUFFER_GRAUS,
+        _load_polygons,
+        _norm_cidade,
+        _norm_uf,
+    )
 
     # 🔥 GARANTE COLUNAS
-    df["cidade"] = df["cidade"].astype(str).str.upper().str.strip()
-    df["uf"] = df["uf"].astype(str).str.upper().str.strip()
-
-    # 🔥 cria geometria
-    geometry = [
-        Point(lon, lat) if pd.notnull(lat) and pd.notnull(lon) else None
-        for lat, lon in zip(df["lat"], df["lon"])
+    df["cidade"] = [
+        _norm_cidade(cidade, uf=uf)
+        for cidade, uf in zip(df["cidade"], df["uf"])
     ]
+    df["uf"] = [_norm_uf(uf) for uf in df["uf"]]
 
-    gdf = gpd.GeoDataFrame(df.copy(), geometry=geometry, crs="EPSG:4326")
+    polygons = _load_polygons()
+    prepared_cache = {}
+    validos = []
 
-    # 🔥 join
-    joined = gpd.sjoin(
-        gdf,
-        gdf_municipios,
-        how="left",
-        predicate="within"
-    )
+    for row in df.itertuples(index=False):
+        cidade = getattr(row, "cidade", None)
+        uf = getattr(row, "uf", None)
+        lat = getattr(row, "lat", None)
+        lon = getattr(row, "lon", None)
 
-    print("[DEBUG JOIN COLS]", joined.columns.tolist())
+        if not cidade or not uf or pd.isnull(lat) or pd.isnull(lon):
+            validos.append(False)
+            continue
 
-    # 🔥 VALIDAÇÃO CORRETA (SEM ADIVINHAÇÃO)
-    df["valido_municipio"] = (
-        joined["index_right"].notnull() &
-        (joined["cidade_left"] == joined["cidade_right"]) &
-        (joined["uf_left"] == joined["uf_right"])
-    )
+        poly_key = (cidade, uf)
+        poly = polygons.get(poly_key)
+
+        if poly is None:
+            validos.append(False)
+            continue
+
+        if poly_key not in prepared_cache:
+            prepared_cache[poly_key] = (
+                prep(poly),
+                prep(poly.buffer(BUFFER_GRAUS)),
+            )
+
+        strict_poly, buffer_poly = prepared_cache[poly_key]
+        point = Point(float(lon), float(lat))
+
+        validos.append(strict_poly.contains(point) or buffer_poly.contains(point))
+
+    df["valido_municipio"] = validos
 
     return df

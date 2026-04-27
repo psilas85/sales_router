@@ -83,6 +83,8 @@ def main():
 
     load_dotenv()
     setup_logging(tenant_id)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
 
     logging.info(f"🚀 Iniciando pré-processamento | tenant={tenant_id}")
     logging.info(f"🆔 input_id={input_id}")

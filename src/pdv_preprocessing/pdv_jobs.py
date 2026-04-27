@@ -20,6 +20,7 @@ from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
 
 logger = logging.getLogger("pdv_jobs")
 logger.setLevel(logging.INFO)
+logger.propagate = False
 
 handler = logging.StreamHandler(sys.stdout)
 handler.setLevel(logging.INFO)

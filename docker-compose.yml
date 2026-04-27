@@ -94,6 +94,10 @@ services:
       - PYTHONPATH=/app/src
       - AUTH_SERVICE_URL=http://authentication_service:8000
       - GMAPS_API_KEY=${GMAPS_API_KEY}
+      - GEOCODING_ENGINE_URL=${GEOCODING_ENGINE_URL:-http://geocoding_engine:8007/api/v1}
+      - GEOCODING_ENGINE_TIMEOUT=${GEOCODING_ENGINE_TIMEOUT:-60}
+      - GEOCODING_ENGINE_JOB_TIMEOUT=${GEOCODING_ENGINE_JOB_TIMEOUT:-3600}
+      - GEOCODING_ENGINE_POLL_INTERVAL=${GEOCODING_ENGINE_POLL_INTERVAL:-2}
 
     expose:
       - "8000"
@@ -123,6 +127,10 @@ services:
       - PYTHONPATH=/app/src
       - REDIS_URL=redis://redis:6379/0
       - NOMINATIM_LOCAL_URL=${NOMINATIM_LOCAL_URL}
+      - GEOCODING_ENGINE_URL=${GEOCODING_ENGINE_URL:-http://geocoding_engine:8007/api/v1}
+      - GEOCODING_ENGINE_TIMEOUT=${GEOCODING_ENGINE_TIMEOUT:-60}
+      - GEOCODING_ENGINE_JOB_TIMEOUT=${GEOCODING_ENGINE_JOB_TIMEOUT:-3600}
+      - GEOCODING_ENGINE_POLL_INTERVAL=${GEOCODING_ENGINE_POLL_INTERVAL:-2}
     depends_on:
       - redis
       - sales_router_db
@@ -137,6 +145,18 @@ services:
       rq worker -v -u redis://redis:6379/0 pdv_jobs
 
     restart: always
+
+  # ======================
+  # MKP Workers (desabilitados)
+  # ======================
+  # Mantidos fora do compose principal para evitar sobrecarga na EC2 t3.xlarge.
+  # Serviços antigos observados no host:
+  # - worker_mkp_base
+  # - worker_mkp_1
+  # - worker_mkp_2
+  # - worker_mkp_3
+  # - worker_mkp_master_finalize
+  # Se precisarem voltar, subir de forma isolada e com escala conservadora.
 
   
   # ======================

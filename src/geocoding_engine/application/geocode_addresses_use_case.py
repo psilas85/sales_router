@@ -2,12 +2,14 @@
 
 import uuid
 import time
+import pandas as pd
 from loguru import logger
 
 from geocoding_engine.services.geolocation_service import GeolocationService
 from geocoding_engine.infrastructure.database_reader import DatabaseReader
 from geocoding_engine.infrastructure.database_writer import DatabaseWriter
 from geocoding_engine.domain.cache_key_builder import build_cache_key
+from geocoding_engine.domain.geo_validator import GeoValidator, validar_municipios_batch_fast
 
 
 class GeocodeAddressesUseCase:
@@ -17,7 +19,7 @@ class GeocodeAddressesUseCase:
         self.writer = DatabaseWriter(self.reader.conn)
         self.service = GeolocationService(reader=self.reader)
 
-    def execute(self, addresses, tenant_id=1, origem="api"):
+    def execute(self, addresses, tenant_id=1, origem="api", persist_cache=True, validate_polygon=True):
 
         start = time.time()
         request_id = str(uuid.uuid4())
@@ -28,18 +30,33 @@ class GeocodeAddressesUseCase:
         # 🔹 ENRICH + CHAVE PADRÃO
         # =====================================================
         enriched = []
+        skipped_results = []
 
-        for item in addresses:
+        for idx, item in enumerate(addresses):
 
-            logradouro = item.get("logradouro")
-            numero = item.get("numero")
+            logradouro = item.get("logradouro") or item.get("endereco")
+            numero = item.get("numero") or ""
             cidade = item.get("cidade")
             uf = item.get("uf")
             cep = item.get("cep")
             raw = item.get("address")
 
-            if not logradouro or not numero or not cidade or not uf:
+            if not logradouro or not cidade or not uf:
+                skipped_results.append({
+                    "id": item.get("id", idx),
+                    "lat": None,
+                    "lon": None,
+                    "source": "invalid_input"
+                })
                 continue
+
+            if not raw:
+                partes_rua = " ".join(
+                    p for p in [str(logradouro).strip(), str(numero).strip()] if p
+                )
+                bairro = item.get("bairro")
+                bairro_part = f", {bairro}" if bairro else ""
+                raw = f"{partes_rua}{bairro_part}, {cidade} - {uf}"
 
             cache_key = build_cache_key(
                 logradouro,
@@ -85,11 +102,13 @@ class GeocodeAddressesUseCase:
         # =====================================================
         result_map = {}
         to_geocode = []
+        cache_candidates = []
+        cache_candidate_keys = set()
 
         cache_hits = 0
         nominatim_hits = 0
         google_hits = 0
-        falhas = 0
+        falhas = len(skipped_results)
 
         for e in unique_list:
 
@@ -100,14 +119,36 @@ class GeocodeAddressesUseCase:
                 lat, lon = cache_map[key]
 
                 if lat is not None and lon is not None:
-
-                    if self.service._validar_geo(lat, lon, e["cidade"], e["uf"], "CACHE"):
-
-                        result_map[key] = (lat, lon, "cache")
-                        cache_hits += 1
+                    if GeoValidator.validar_ponto(lat, lon, e["cidade"], e["uf"]) == "ok":
+                        cache_candidates.append({
+                            "cache_key": key,
+                            "id": e["id"],
+                            "cidade": e["cidade"],
+                            "uf": e["uf"],
+                            "lat": lat,
+                            "lon": lon,
+                        })
+                        cache_candidate_keys.add(key)
                         continue
 
             to_geocode.append(e)
+
+        if cache_candidates:
+            df_cache = pd.DataFrame(cache_candidates)
+            df_cache = validar_municipios_batch_fast(df_cache, None)
+
+            valid_cache_keys = set(
+                df_cache.loc[df_cache["valido_municipio"], "cache_key"].astype(str)
+            )
+
+            for row in df_cache[df_cache["valido_municipio"]].itertuples(index=False):
+                result_map[row.cache_key] = (row.lat, row.lon, "cache")
+                cache_hits += 1
+
+            for e in unique_list:
+                key = e["cache_key"]
+                if key in cache_candidate_keys and key not in valid_cache_keys:
+                    to_geocode.append(e)
 
         logger.info(f"[CACHE] hits={cache_hits} miss={len(to_geocode)}")
 
@@ -131,7 +172,10 @@ class GeocodeAddressesUseCase:
                 for e in to_geocode
             ]
 
-            results_batch = self.service.geocode_batch_enriched(payload)
+            results_batch = self.service.geocode_batch_enriched(
+                payload,
+                validate_polygon=validate_polygon,
+            )
 
             for r in results_batch:
 
@@ -146,30 +190,30 @@ class GeocodeAddressesUseCase:
 
                     result_map[key] = (lat, lon, source)
 
-                    # 🔥 PERSISTE CACHE (CORRETO E PERFORMÁTICO)
-                    try:
-                        orig = map_to_geocode.get(key)
+                    if persist_cache:
+                        try:
+                            orig = map_to_geocode.get(key)
 
-                        if orig and source != "fallback_cidade":
+                            if orig and source != "fallback_cidade":
 
-                            endereco_padrao = (
-                                f"{orig['logradouro']} {orig['numero']}, "
-                                f"{orig['cidade']} - {orig['uf']}"
-                            ).replace(" ,", ",").strip()
+                                endereco_padrao = (
+                                    f"{orig['logradouro']} {orig['numero']}, "
+                                    f"{orig['cidade']} - {orig['uf']}"
+                                ).replace(" ,", ",").strip()
 
-                            self.writer.salvar_cache(
-                                logradouro=orig["logradouro"],
-                                numero=orig["numero"],
-                                cidade=orig["cidade"],
-                                uf=orig["uf"],
-                                endereco_original=endereco_padrao,
-                                lat=lat,
-                                lon=lon,
-                                origem=source
-                            )
+                                self.writer.salvar_cache(
+                                    logradouro=orig["logradouro"],
+                                    numero=orig["numero"],
+                                    cidade=orig["cidade"],
+                                    uf=orig["uf"],
+                                    endereco_original=endereco_padrao,
+                                    lat=lat,
+                                    lon=lon,
+                                    origem=source
+                                )
 
-                    except Exception as e:
-                        logger.warning(f"[CACHE_SAVE_FAIL] {e}")
+                        except Exception as e:
+                            logger.warning(f"[CACHE_SAVE_FAIL] {e}")
 
                     if "nominatim" in str(source):
                         nominatim_hits += 1
@@ -183,7 +227,7 @@ class GeocodeAddressesUseCase:
         # =====================================================
         # 🔹 EXPANSÃO FINAL
         # =====================================================
-        results = []
+        results = list(skipped_results)
 
         for e in enriched:
 

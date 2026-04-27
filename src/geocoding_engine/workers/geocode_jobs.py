@@ -39,6 +39,10 @@ def _normalize_text(txt: str) -> str:
     # remove acento
     txt = unicodedata.normalize("NFKD", str(txt))
     txt = "".join(c for c in txt if not unicodedata.combining(c))
+    txt = txt.replace("/", " ")
+    txt = txt.replace(" - ", " ")
+    txt = txt.replace("-", " ")
+    txt = re.sub(r"[.,;:]+$", "", txt)
 
     # upper + trim
     txt = txt.upper().strip()
@@ -47,6 +51,20 @@ def _normalize_text(txt: str) -> str:
     txt = re.sub(r"\s+", " ", txt)
 
     return txt
+
+
+def _normalize_city_strict(cidade: str | None, uf: str | None = None) -> str | None:
+    cidade = _normalize_text(cidade)
+    if not cidade:
+        return None
+
+    uf_norm = _normalize_text(uf)
+    if uf_norm and len(uf_norm) == 2:
+        cidade = re.sub(rf"\b{re.escape(uf_norm)}\b$", "", cidade).strip()
+        cidade = re.sub(rf"\b{re.escape(uf_norm)}\b", "", cidade).strip()
+        cidade = re.sub(r"\s+", " ", cidade).strip()
+
+    return cidade or None
 
 
 def cidade_existe_ibge(cidade, uf, gdf_municipios):
@@ -66,7 +84,7 @@ def cidade_existe_ibge(cidade, uf, gdf_municipios):
     if not cidade or not uf:
         return False
 
-    cidade = _normalize_text(cidade)
+    cidade = _normalize_city_strict(cidade, uf=uf)
     uf = _normalize_text(uf)
 
     if not cidade or not uf or len(uf) != 2:
@@ -76,7 +94,10 @@ def cidade_existe_ibge(cidade, uf, gdf_municipios):
     # 🔥 GARANTE NORMALIZAÇÃO NO GDF (UMA VEZ SÓ)
     # -------------------------------------------------
     if "cidade_norm" not in gdf_municipios.columns:
-        gdf_municipios["cidade_norm"] = gdf_municipios["cidade"].apply(_normalize_text)
+        gdf_municipios["cidade_norm"] = [
+            _normalize_city_strict(cidade_ref, uf=uf_ref)
+            for cidade_ref, uf_ref in zip(gdf_municipios["cidade"], gdf_municipios["uf"])
+        ]
 
     if "uf_norm" not in gdf_municipios.columns:
         gdf_municipios["uf_norm"] = gdf_municipios["uf"].apply(_normalize_text)
@@ -191,6 +212,40 @@ def _get_hash_stats(redis_conn, stats_key: str):
         }
 
 
+def _update_job_meta(job, progress: int, step: str, status: str = "started"):
+    if not job:
+        return
+
+    job.meta["progress"] = progress
+    job.meta["step"] = step
+    job.meta["status"] = status
+    job.save_meta()
+
+
+def _append_missing_invalid_rows(df_base: pd.DataFrame, df_extra: pd.DataFrame) -> pd.DataFrame:
+    if df_extra is None or df_extra.empty:
+        return df_base
+
+    if "id" not in df_base.columns or "id" not in df_extra.columns:
+        return df_base
+
+    ids_existentes = set(df_base["id"].astype(str))
+    df_extra = df_extra.copy()
+    df_extra["id"] = df_extra["id"].astype(str)
+    df_extra = df_extra[~df_extra["id"].isin(ids_existentes)]
+
+    if df_extra.empty:
+        return df_base
+
+    for col in df_base.columns:
+        if col not in df_extra.columns:
+            df_extra[col] = None
+
+    df_extra = df_extra[df_base.columns.tolist()]
+
+    return pd.concat([df_base, df_extra], ignore_index=True)
+
+
 # =========================================================
 # JOB PRINCIPAL
 # =========================================================
@@ -212,7 +267,7 @@ def processar_geocode(file_path):
     redis_str = redis.Redis(host="redis", port=6379, decode_responses=True)
     subjob_queue = Queue("geocode_subjobs", connection=redis_conn)
 
-    CHUNK_SIZE = 50
+    CHUNK_SIZE = int(os.getenv("GEOCODE_BATCH_JSON_CHUNK_SIZE", "25"))
     redis_results_key = f"geocode_result:{job_id}"
     redis_done_key = f"geocode_done:{job_id}"
     redis_stats_key = f"geocode_stats:{job_id}"
@@ -242,9 +297,7 @@ def processar_geocode(file_path):
         # LEITURA
         # =====================================================
         if job:
-            job.meta["progress"] = 5
-            job.meta["step"] = "Lendo arquivo"
-            job.save_meta()
+            _update_job_meta(job, 5, "Lendo arquivo")
 
         df = pd.read_excel(file_path)
         df = df.reset_index(drop=True)
@@ -260,7 +313,13 @@ def processar_geocode(file_path):
         # =====================================================
         from geocoding_engine.domain.municipio_polygon_validator import carregar_municipios_gdf
 
+        if job:
+            _update_job_meta(job, 8, "Carregando malha IBGE")
+
         gdf_municipios = carregar_municipios_gdf()
+
+        if job:
+            _update_job_meta(job, 12, "Validando cidades")
 
         df["cidade"] = df["cidade"].astype(str).str.upper().str.strip()
         df["uf"] = df["uf"].astype(str).str.upper().str.strip()
@@ -322,9 +381,7 @@ def processar_geocode(file_path):
         # ENQUEUE
         # =====================================================
         if job:
-            job.meta["progress"] = 15
-            job.meta["step"] = "Enfileirando subjobs"
-            job.save_meta()
+            _update_job_meta(job, 15, "Enfileirando subjobs")
 
         subjob_ids = []
         total_chunks = (len(addresses_validos) + CHUNK_SIZE - 1) // CHUNK_SIZE
@@ -374,7 +431,7 @@ def processar_geocode(file_path):
             if job:
                 prev = job.meta.get("progress", 0)
                 job.meta["progress"] = max(prev, progress)
-                job.meta["step"] = f"Processando ({finished_chunks}/{total_chunks})"
+                job.meta["step"] = f"Aguardando subjobs ({finished_chunks}/{total_chunks})"
                 job.meta["status"] = "started"
                 job.save_meta()
 
@@ -389,9 +446,7 @@ def processar_geocode(file_path):
         # CONSOLIDAR
         # =====================================================
         if job:
-            job.meta["progress"] = 85
-            job.meta["step"] = "Consolidando resultados"
-            job.save_meta()
+            _update_job_meta(job, 85, "Consolidando resultados")
 
         raw = redis_str.lrange(redis_results_key, 0, -1)
         logger.info(f"[DEBUG] redis_items={len(raw)}")
@@ -550,9 +605,7 @@ def processar_geocode(file_path):
         # PADRONIZAÇÃO
         # =====================================================
         if job:
-            job.meta["progress"] = 90
-            job.meta["step"] = "Salvando"
-            job.save_meta()
+            _update_job_meta(job, 90, "Preparando resultados")
 
         colunas_padrao = [
             "cnpj", "razao_social", "nome_fantasia",
@@ -571,6 +624,15 @@ def processar_geocode(file_path):
         # SEPARAÇÃO
         # =====================================================
         df_validos = df_final.dropna(subset=["lat", "lon"]).copy()
+        df_invalidos_sem_coords = df_final[
+            df_final["lat"].isna() &
+            df_final["lon"].isna() &
+            df_final["source"].notna()
+        ].copy()
+        if not df_invalidos_sem_coords.empty:
+            df_invalidos_sem_coords["motivo_invalidacao"] = (
+                df_invalidos_sem_coords["source"].fillna("falha_geocode")
+            )
 
         logger.info(f"[FINAL] validos={len(df_validos)} invalidos={len(df_invalidos)}")
         df_invalidos_criticos = pd.DataFrame()
@@ -583,6 +645,8 @@ def processar_geocode(file_path):
         df_invalidos_criticos = pd.DataFrame()
 
         if not df_validos.empty:
+            if job:
+                _update_job_meta(job, 92, "Validando poligono")
 
             logger.info("[POLIGONO] validação batch iniciada")
 
@@ -619,14 +683,23 @@ def processar_geocode(file_path):
         from geocoding_engine.infrastructure.database_writer import DatabaseWriter
         from geocoding_engine.infrastructure.database_reader import DatabaseReader
 
+        if job:
+            _update_job_meta(job, 94, "Reprocessando invalidos")
+
         logger.info("♻ Reprocessamento iniciado")
 
-        df_reprocessar = df_invalidos_criticos.copy()
+        df_reprocessar = pd.concat(
+            [df_invalidos_criticos, df_invalidos_sem_coords],
+            ignore_index=True,
+        )
+        if not df_reprocessar.empty and "id" in df_reprocessar.columns:
+            df_reprocessar["id"] = df_reprocessar["id"].astype(str)
+            df_reprocessar = df_reprocessar.drop_duplicates(subset=["id"], keep="first")
 
         logger.info(f"♻ Reprocessando: {len(df_reprocessar)}")
 
         df_recuperados = pd.DataFrame()
-        df_restantes = df_invalidos_criticos.copy()
+        df_restantes = df_reprocessar.copy()
 
         if not df_reprocessar.empty:
 
@@ -699,10 +772,23 @@ def processar_geocode(file_path):
                         df_fallback_extra.at[idx, "lat"] = lat_fb
                         df_fallback_extra.at[idx, "lon"] = lon_fb
                         df_fallback_extra.at[idx, "source"] = "fallback_cidade"
-                        df_fallback_extra.at[idx, "valido_municipio"] = True
 
             else:
                 df_fallback_extra = pd.DataFrame()
+
+            if not df_fallback_extra.empty:
+                df_fallback_extra = validar_municipios_batch_fast(df_fallback_extra, gdf_municipios)
+
+                df_fallback_extra_validos = df_fallback_extra[
+                    df_fallback_extra["valido_municipio"]
+                ].copy()
+
+                df_fallback_extra_invalidos = df_fallback_extra[
+                    ~df_fallback_extra["valido_municipio"]
+                ].copy()
+            else:
+                df_fallback_extra_validos = pd.DataFrame()
+                df_fallback_extra_invalidos = pd.DataFrame()
 
 
             # -------------------------------------------------
@@ -717,7 +803,17 @@ def processar_geocode(file_path):
                 if fora > 0:
                     logger.warning(f"[FALLBACK_FORA_POLIGONO] total={fora}")
 
-                df_fallback["valido_municipio"] = True
+                df_fallback_validos = df_fallback[
+                    df_fallback["valido_municipio"]
+                ].copy()
+
+                df_fallback_invalidos = df_fallback[
+                    ~df_fallback["valido_municipio"]
+                ].copy()
+
+            else:
+                df_fallback_validos = pd.DataFrame()
+                df_fallback_invalidos = pd.DataFrame()
 
 
             # -------------------------------------------------
@@ -725,17 +821,21 @@ def processar_geocode(file_path):
             # -------------------------------------------------
             df_recuperados_validos = pd.concat([
                 df_nao_fallback_validos,
-                df_fallback,
-                df_fallback_extra
+                df_fallback_validos,
+                df_fallback_extra_validos
             ], ignore_index=True)
 
 
-            df_recuperados_invalidos = pd.DataFrame()
+            df_recuperados_invalidos = pd.concat([
+                df_nao_fallback_invalidos,
+                df_fallback_invalidos,
+                df_fallback_extra_invalidos
+            ], ignore_index=True)
 
             logger.info(
                 f"[REPROCESS_POLIGONO] validos={len(df_recuperados_validos)} "
                 f"invalidos={len(df_recuperados_invalidos)} "
-                f"(fallback_incluidos={len(df_fallback)})"
+                f"(fallback_incluidos={len(df_fallback_validos) + len(df_fallback_extra_validos)})"
             )
 
         # =====================================================
@@ -853,11 +953,7 @@ def processar_geocode(file_path):
         if not df_invalidos_input.empty:
 
             df_invalidos_input["id"] = df_invalidos_input["id"].astype(str)
-
-            df_invalidos = pd.concat([
-                df_invalidos,
-                df_invalidos_input[~df_invalidos_input["id"].isin(df_invalidos["id"])]
-            ], ignore_index=True)
+            df_invalidos = _append_missing_invalid_rows(df_invalidos, df_invalidos_input)
 
         # -----------------------------------------------------
         # CIDADE INVALIDA (CRÍTICO)
@@ -873,10 +969,7 @@ def processar_geocode(file_path):
                 if col not in df_invalidos_cidade.columns:
                     df_invalidos_cidade[col] = None
 
-            df_invalidos = pd.concat([
-                df_invalidos,
-                df_invalidos_cidade[~df_invalidos_cidade["id"].isin(df_invalidos["id"])]
-            ], ignore_index=True)
+            df_invalidos = _append_missing_invalid_rows(df_invalidos, df_invalidos_cidade)
 
         # -----------------------------------------------------
         # DEDUP FINAL
@@ -1013,6 +1106,9 @@ def processar_geocode(file_path):
         # =====================================================
         # EXCEL
         # =====================================================
+        if job:
+            _update_job_meta(job, 97, "Salvando arquivos")
+
         with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
             df_validos_final.to_excel(writer, sheet_name="geocodificados", index=False)
             df_invalidos.to_excel(writer, sheet_name="invalidos", index=False)

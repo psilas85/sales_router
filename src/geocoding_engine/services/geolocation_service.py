@@ -7,7 +7,7 @@ import threading
 import re
 import unicodedata
 
-from geocoding_engine.domain.municipio_polygon_validator import carregar_municipios_gdf
+from geocoding_engine.domain.municipio_polygon_validator import ponto_dentro_municipio
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from loguru import logger
@@ -64,7 +64,7 @@ class GeolocationService:
     # AJUSTE NO INIT
     # =========================================================
 
-    def __init__(self, reader, writer=None, max_workers=8):
+    def __init__(self, reader, writer=None, max_workers=4):
         self.reader = reader
         self.writer = writer  # 🔥 novo
 
@@ -91,7 +91,6 @@ class GeolocationService:
 
     
         self.stats_lock = threading.Lock()
-        self.gdf_municipios = carregar_municipios_gdf()
 
     def _normalize_street(self, street: str):
 
@@ -267,7 +266,7 @@ class GeolocationService:
     # validação geográfica centralizada
     # ---------------------------------------------------------
 
-    def _validar_geo(self, lat, lon, cidade, uf, trace):
+    def _validar_geo(self, lat, lon, cidade, uf, trace, validate_polygon=True):
 
         if not self._is_valid_number(lat) or not self._is_valid_number(lon):
             return False
@@ -280,6 +279,17 @@ class GeolocationService:
         if status != "ok":
             logger.debug(f"[VALIDACAO_UF][REJEITADO] lat={lat} lon={lon} uf={uf}")
             return False
+
+        if validate_polygon:
+            dentro_municipio = ponto_dentro_municipio(lat, lon, cidade, uf)
+
+            if dentro_municipio is not True:
+                logger.warning(
+                    f"[VALIDACAO_MUNICIPIO][REJEITADO] "
+                    f"lat={lat} lon={lon} cidade={cidade} uf={uf} "
+                    f"polygon_status={dentro_municipio}"
+                )
+                return False
 
         return True
 
@@ -517,15 +527,6 @@ class GeolocationService:
             if lat is None or lon is None:
                 return None
 
-            # 🔥 filtro leve de cidade
-            # 🔥 NÃO BLOQUEAR GOOGLE POR TEXTO
-            if cidade:
-                texto = str(res)
-                if cidade.upper() not in texto.upper():
-                    logger.warning(
-                        f"[GOOGLE][CIDADE_MISMATCH] cidade={cidade} resposta={texto}"
-                    )
-
             # ✅ AGORA CORRETO (fora do if)
             return lat, lon
 
@@ -537,7 +538,7 @@ class GeolocationService:
     # geocode individual (REFATORADO SEGURO)
     # ---------------------------------------------------------
 
-    def geocode(self, endereco, cidade=None, uf=None, cep=None, cache_key=None):
+    def geocode(self, endereco, cidade=None, uf=None, cep=None, cache_key=None, validate_polygon=True):
 
         trace = f"GEO-{int(time.time() * 1000)}"
 
@@ -587,7 +588,7 @@ class GeolocationService:
         if res:
             lat, lon = res
 
-            if self._validar_geo(lat, lon, cidade, uf, trace):
+            if self._validar_geo(lat, lon, cidade, uf, trace, validate_polygon=validate_polygon):
                 with self.stats_lock:
                     self.stats["nominatim_struct"] += 1
                 return lat, lon, "nominatim_struct", True
@@ -606,7 +607,7 @@ class GeolocationService:
         if res:
             lat, lon = res
 
-            if self._validar_geo(lat, lon, cidade, uf, trace):
+            if self._validar_geo(lat, lon, cidade, uf, trace, validate_polygon=validate_polygon):
                 with self.stats_lock:
                     self.stats["google"] += 1
                 return lat, lon, "google", True
@@ -623,7 +624,7 @@ class GeolocationService:
     # batch otimizado
     # ---------------------------------------------------------
 
-    def geocode_batch(self, items):
+    def geocode_batch(self, items, validate_polygon=True):
 
         resultados = {}
 
@@ -638,6 +639,7 @@ class GeolocationService:
                     uf=item.get("uf"),
                     cep=item.get("cep"),
                     cache_key=item.get("cache_key"),
+                    validate_polygon=validate_polygon,
                 )
                 return idx, lat, lon, src, valid
 
@@ -689,7 +691,7 @@ class GeolocationService:
             f"total={self.stats['total']}"
         )
 
-    def geocode_batch_enriched(self, items):
+    def geocode_batch_enriched(self, items, validate_polygon=True):
 
         resultados = []
 
@@ -700,7 +702,8 @@ class GeolocationService:
                     cidade=item.get("cidade"),
                     uf=item.get("uf"),
                     cep=item.get("cep"),
-                    cache_key=item.get("cache_key")  # 🔥 ESSENCIAL
+                    cache_key=item.get("cache_key"),  # 🔥 ESSENCIAL
+                    validate_polygon=validate_polygon,
                 )
 
                 return {

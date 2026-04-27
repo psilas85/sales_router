@@ -102,6 +102,17 @@ class ReprocessInvalidsService:
             f"{str(row.get('uf') or '').strip()}"
         ).replace(" ,", ",").strip()
 
+    def _validar_geo_leve(self, lat, lon, cidade, uf) -> bool:
+        status = GeoValidator.validar_ponto(lat, lon, cidade, uf)
+        if status != "ok":
+            logger.warning(
+                f"[REPROCESS][VALIDACAO_UF_FAIL] status={status} "
+                f"lat={lat} lon={lon} cidade={cidade} uf={uf}"
+            )
+            return False
+
+        return True
+
     def execute(self, df_invalid: pd.DataFrame):
 
         if df_invalid is None or df_invalid.empty:
@@ -171,7 +182,7 @@ class ReprocessInvalidsService:
 
                 logger.info(f"[REPROCESS][FALHA][GOOGLE] lat={lat} lon={lon}")
 
-                if lat is not None and lon is not None:
+                if lat is not None and lon is not None and self._validar_geo_leve(lat, lon, cidade, uf):
                     row["lat"] = lat
                     row["lon"] = lon
                     row["source"] = "fallback_cidade"
@@ -203,7 +214,7 @@ class ReprocessInvalidsService:
 
                     lat, lon = geocode_google_direto(f"{cidade}, {uf}, Brasil")
 
-                    if lat is not None and lon is not None:
+                    if lat is not None and lon is not None and self._validar_geo_leve(lat, lon, cidade, uf):
                         row["lat"] = lat
                         row["lon"] = lon
                         row["source"] = "fallback_cidade"
@@ -240,7 +251,7 @@ class ReprocessInvalidsService:
 
                         lat_fb, lon_fb = geocode_google_direto(f"{cidade}, {uf}, Brasil")
 
-                        if lat_fb and lon_fb:
+                        if lat_fb and lon_fb and self._validar_geo_leve(lat_fb, lon_fb, cidade, uf):
                             row["lat"] = lat_fb
                             row["lon"] = lon_fb
                             row["source"] = "fallback_cidade"
@@ -257,16 +268,13 @@ class ReprocessInvalidsService:
                     # -------------------------------------------------
                     # 🔥 VALIDAÇÃO UF (CORRIGIDA)
                     # -------------------------------------------------
-                    status = GeoValidator.validar_ponto(lat, lon, cidade, uf)
+                    if not self._validar_geo_leve(lat, lon, cidade, uf):
 
-                    # 🔴 erro real
-                    if status == "falha":
-
-                        logger.warning("[REPROCESS][UF_FAIL] → fallback cidade")
+                        logger.warning("[REPROCESS][GEO_FAIL] → fallback cidade")
 
                         lat_fb, lon_fb = geocode_google_direto(f"{cidade}, {uf}, Brasil")
 
-                        if lat_fb and lon_fb:
+                        if lat_fb and lon_fb and self._validar_geo_leve(lat_fb, lon_fb, cidade, uf):
                             row["lat"] = lat_fb
                             row["lon"] = lon_fb
                             row["source"] = "fallback_cidade"

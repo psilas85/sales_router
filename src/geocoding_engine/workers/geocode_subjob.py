@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import sys
 import time
 import gc
@@ -111,8 +112,8 @@ def processar_subjob(payload: dict):
     try:
         uc = GeocodeAddressesUseCase()
 
-        # Micro-batch pequeno para aliviar memória
-        batch_interno = 10
+        # Micro-batch moderado: reduz overhead sem carregar o chunk inteiro em memória.
+        batch_interno = int(os.getenv("GEOCODE_SUBJOB_MICROBATCH_SIZE", "10"))
 
         for i in range(0, len(addresses), batch_interno):
             batch = addresses[i:i + batch_interno]
@@ -120,7 +121,9 @@ def processar_subjob(payload: dict):
             result = uc.execute(
                 batch,
                 tenant_id=tenant_id,
-                origem=origem
+                origem=origem,
+                persist_cache=False,
+                validate_polygon=False,
             )
 
             results = result.get("results", [])
@@ -147,7 +150,7 @@ def processar_subjob(payload: dict):
                 lat = r_item.get("lat")
                 lon = r_item.get("lon")
 
-                logger.info(
+                logger.debug(
                     f"[SUBJOB_RAW] lat={lat} lon={lon} tipo_lat={type(lat)} tipo_lon={type(lon)}"
                 )
 
@@ -179,7 +182,7 @@ def processar_subjob(payload: dict):
                         "source": "falha"
                     })
 
-                logger.info(
+                logger.debug(
                     f"[SUBJOB_FINAL] lat={sanitized_results[-1]['lat']} lon={sanitized_results[-1]['lon']}"
                 )
             total_processados += len(sanitized_results)

@@ -11,6 +11,11 @@ from shapely.geometry import shape, Point
 
 BUFFER_GRAUS = float(os.getenv("MUNICIPIO_BUFFER_GRAUS", "0.005"))
 
+CITY_ALIASES = {
+    ("SANTANA DE PARNAI", "SP"): "SANTANA DE PARNAIBA",
+    ("SANTANA DE PARNAIBA", "SP"): "SANTANA DE PARNAIBA",
+}
+
 
 BASE_PATH = Path(
     os.getenv(
@@ -83,7 +88,12 @@ def _norm_cidade(cidade: str | None, uf: str | None = None) -> str | None:
         cidade = re.sub(rf"\b{re.escape(uf_norm)}\b", "", cidade).strip()
         cidade = re.sub(r"\s+", " ", cidade).strip()
 
-    return cidade or None
+    cidade = cidade or None
+
+    if cidade and uf_norm:
+        cidade = CITY_ALIASES.get((cidade, uf_norm), cidade)
+
+    return cidade
 
 
 # ============================================================

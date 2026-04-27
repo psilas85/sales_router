@@ -1,7 +1,5 @@
 #sales_router/src/geocoding_engine/docker-compose.yml
 
-version: "3.9"
-
 services:
 
   geocoding_engine:
@@ -61,6 +59,8 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - NOMINATIM_LOCAL_URL=${NOMINATIM_LOCAL_URL}
       - GMAPS_API_KEY=${GMAPS_API_KEY}
+      - GEOCODE_BATCH_JSON_CHUNK_SIZE=${GEOCODE_BATCH_JSON_CHUNK_SIZE:-25}
+      - GEOCODE_SUBJOB_TIMEOUT=${GEOCODE_SUBJOB_TIMEOUT:-1800}
 
     depends_on:
       - geocoding_engine
@@ -92,6 +92,7 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - NOMINATIM_LOCAL_URL=${NOMINATIM_LOCAL_URL}
       - GMAPS_API_KEY=${GMAPS_API_KEY}
+      - GEOCODE_SUBJOB_MICROBATCH_SIZE=${GEOCODE_SUBJOB_MICROBATCH_SIZE:-10}
 
     depends_on:
       - geocoding_engine
@@ -113,5 +114,3 @@ networks:
 
   sales_router_net:
     external: true
-
-  

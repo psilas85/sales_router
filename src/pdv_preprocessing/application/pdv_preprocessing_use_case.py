@@ -17,16 +17,20 @@ from rq import get_current_job
 
 from pdv_preprocessing.entities.pdv_entity import PDV
 from pdv_preprocessing.domain.pdv_validation_service import PDVValidationService
-from pdv_preprocessing.domain.geolocation_service import GeolocationService
+from pdv_preprocessing.domain.geolocation_service import GeolocationService as LocalGeolocationService
 from pdv_preprocessing.config.uf_bounds import UF_BOUNDS
 from pdv_preprocessing.domain.utils_texto import fix_encoding
+from pdv_preprocessing.infrastructure.geocoding_engine_client import GeocodingEngineClient
 
 # ✅ NOVO: normalizador (mesma regra do pipeline)
 from pdv_preprocessing.domain.address_normalizer import (
     normalize_base,
     normalize_for_cache,
 )
-
+from pdv_preprocessing.infrastructure.geocoding_engine_client import (
+    GeocodingEngineClient,
+    STATUS_FALHA_INTEGRACAO,
+)
 
 def extrair_logradouro_numero(logradouro_raw: str):
     """
@@ -84,6 +88,8 @@ def atualizar_progresso(atual, total, passo_min, passo_max, step):
 # 📦 CLASSE PRINCIPAL
 # ============================================================
 class PDVPreprocessingUseCase:
+    STATUS_INPUT_GEOCODING_INVALIDO = "falha_input_geocoding"
+
     def __init__(self, reader, writer, tenant_id, input_id=None, descricao=None, usar_google=True):
         self.reader = reader
         self.writer = writer
@@ -93,7 +99,24 @@ class PDVPreprocessingUseCase:
         self.usar_google = usar_google
 
         self.validator = PDVValidationService(db_reader=reader)
-        self.geo_service = GeolocationService(reader, writer, usar_google=self.usar_google)
+        self.geo_client = GeocodingEngineClient()
+        self.geo_service = None
+
+    def _normalizar_motivo_geocoding(self, status_geolocalizacao: str | None) -> str:
+        status = str(status_geolocalizacao or "").strip().lower()
+
+        mapping = {
+            self.STATUS_INPUT_GEOCODING_INVALIDO: self.STATUS_INPUT_GEOCODING_INVALIDO,
+            STATUS_FALHA_INTEGRACAO: STATUS_FALHA_INTEGRACAO,
+            "falha": "falha_geocoding",
+            "invalid_input": self.STATUS_INPUT_GEOCODING_INVALIDO,
+            "cidade_invalida": "cidade_invalida",
+            "fora_municipio": "fora_municipio",
+            "fallback_falhou": "fallback_falhou",
+            "falha_total": "falha_geocoding",
+        }
+
+        return mapping.get(status, status or "falha_geocoding")
 
     # ------------------------------------------------------------
     def normalizar_colunas(self, df):
@@ -228,6 +251,87 @@ class PDVPreprocessingUseCase:
         return df[colunas_presentes].copy()
 
     # ------------------------------------------------------------
+    def _preparar_payload_geocoding(self, df_validos: pd.DataFrame):
+        payload = []
+        resultados_locais = {}
+
+        for idx, row in df_validos.iterrows():
+            logradouro = str(row.get("logradouro", "") or "").strip()
+            cidade = str(row.get("cidade", "") or "").strip()
+            uf = str(row.get("uf", "") or "").strip()
+            address = str(row.get("pdv_endereco_completo", "") or "").strip()
+
+            if not logradouro or not cidade or len(uf) != 2 or not address:
+                resultados_locais[int(idx)] = (None, None, self.STATUS_INPUT_GEOCODING_INVALIDO)
+                continue
+
+            payload.append({
+                "id": int(idx),
+                "address": address,
+                "logradouro": logradouro,
+                "numero": str(row.get("numero", "") or "").strip(),
+                "bairro": str(row.get("bairro", "") or "").strip(),
+                "cidade": cidade,
+                "uf": uf,
+                "cep": str(row.get("cep", "") or "").strip(),
+            })
+
+        return payload, resultados_locais
+
+    # ------------------------------------------------------------
+    def _geocodificar_pdvs(self, df_validos: pd.DataFrame):
+        payload, resultados_locais = self._preparar_payload_geocoding(df_validos)
+
+        if not payload:
+            return resultados_locais
+
+        if self.geo_client.enabled:
+            try:
+                resultados_remotos = self.geo_client.geocode_pdv_batch_job(payload)
+                resultados_remotos.update(resultados_locais)
+                return resultados_remotos
+            except Exception as e:
+                if os.getenv("GEOCODING_ENGINE_ALLOW_LOCAL_FALLBACK", "false").lower() == "true":
+                    logger.warning(
+                        f"[GEOCODING_ENGINE][FALLBACK_LOCAL] erro={e}",
+                        exc_info=True,
+                    )
+                else:
+                    logger.error(
+                        f"[GEOCODING_ENGINE][JOB_ERRO] erro={e}",
+                        exc_info=True,
+                    )
+                    raise
+        else:
+            if os.getenv("GEOCODING_ENGINE_ALLOW_LOCAL_FALLBACK", "false").lower() == "true":
+                logger.warning(
+                    "[GEOCODING_ENGINE][DISABLED] GEOCODING_ENGINE_URL não configurada; "
+                    "usando geocoder local"
+                )
+            else:
+                raise RuntimeError(
+                    "GEOCODING_ENGINE_URL não configurada; "
+                    "pdv_preprocessing requer geocoding_engine para validação completa"
+                )
+
+        if self.geo_service is None:
+            self.geo_service = LocalGeolocationService(
+                self.reader,
+                self.writer,
+                usar_google=self.usar_google,
+            )
+
+        enderecos = df_validos["pdv_endereco_completo"].tolist()
+        resultados = self.geo_service.geocodificar_em_lote(enderecos)
+
+        resultados_finais = {
+            int(df_validos.index[pos]): resultado
+            for pos, resultado in resultados.items()
+        }
+        resultados_finais.update(resultados_locais)
+        return resultados_finais
+
+    # ------------------------------------------------------------
     # EXECUTE COM PROGRESSO + HISTÓRICO + TRATAMENTO COMPLETO
     # ------------------------------------------------------------
     def execute(self, input_path: str, sep=";"):
@@ -359,8 +463,14 @@ class PDVPreprocessingUseCase:
 
             df["pdv_endereco_completo"] = df.apply(montar_endereco, axis=1)
 
-            df["endereco_cache_key"] = df["pdv_endereco_completo"].apply(
-                lambda e: normalize_for_cache(normalize_base(e)) if e else ""
+            df["endereco_cache_key"] = df.apply(
+                lambda r: normalize_for_cache(
+                    normalize_base(
+                        f"{r.get('logradouro', '')} {r.get('numero', '')}, "
+                        f"{r.get('cidade', '')} - {r.get('uf', '')}"
+                    )
+                ),
+                axis=1,
             )
 
             atualizar_progresso(1, 1, 45, 55, "Montando endereços")
@@ -393,26 +503,34 @@ class PDVPreprocessingUseCase:
             df_validos["pdv_lon"] = None
             df_validos["status_geolocalizacao"] = None
 
-            enderecos = df_validos["pdv_endereco_completo"].tolist()
             atualizar_progresso(1, 1, 55, 85, "Geocodificando")
 
-            resultados_geo = self.geo_service.geocodificar_em_lote(enderecos)
+            resultados_geo = self._geocodificar_pdvs(df_validos)
 
-            for i, _ in enumerate(enderecos):
-                lat, lon, origem = resultados_geo.get(i, (None, None, "falha"))
-                idx = df_validos.index[i]
+            total_geo = len(df_validos)
+
+            for i, idx in enumerate(df_validos.index):
+                lat, lon, origem = resultados_geo.get(int(idx), (None, None, "falha"))
 
                 df_validos.at[idx, "pdv_lat"] = lat
                 df_validos.at[idx, "pdv_lon"] = lon
                 df_validos.at[idx, "status_geolocalizacao"] = origem
 
                 if i % 200 == 0:
-                    atualizar_progresso(i, len(enderecos), 55, 85, "Geocodificando")
+                    atualizar_progresso(i, total_geo, 55, 85, "Geocodificando")
+
+            status_counts = (
+                df_validos["status_geolocalizacao"]
+                .fillna("falha")
+                .astype(str)
+                .value_counts()
+                .to_dict()
+            )
 
             # ============================================================
             # UF BOUNDS
             # ============================================================
-            def validar_limites_uf(row):
+            def auditar_limites_uf(row):
                 if pd.isna(row["pdv_lat"]) or pd.isna(row["pdv_lon"]):
                     return "falha_geolocalizacao"
                 bounds = UF_BOUNDS.get(row["uf"])
@@ -425,10 +543,41 @@ class PDVPreprocessingUseCase:
                     return "coordenadas_fora_limites"
                 return "ok"
 
-            df_validos["motivo_invalidade"] = df_validos.apply(validar_limites_uf, axis=1)
+            df_validos["status_auditoria_geo"] = df_validos.apply(auditar_limites_uf, axis=1)
 
-            df_invalidos_geo = df_validos[df_validos["motivo_invalidade"] != "ok"]
-            df_validos = df_validos[df_validos["motivo_invalidade"] == "ok"]
+            df_invalidos_geo = df_validos[
+                df_validos["status_auditoria_geo"] == "falha_geolocalizacao"
+            ].copy()
+            if not df_invalidos_geo.empty:
+                df_invalidos_geo["motivo_invalidade"] = df_invalidos_geo[
+                    "status_geolocalizacao"
+                ].apply(self._normalizar_motivo_geocoding)
+
+            df_validos = df_validos[
+                df_validos["status_auditoria_geo"] != "falha_geolocalizacao"
+            ].copy()
+
+            df_auditoria_geo = df_validos[
+                df_validos["status_auditoria_geo"].isin(["uf_invalida", "coordenadas_fora_limites"])
+            ]
+            if not df_auditoria_geo.empty:
+                logger.warning(
+                    "[PDV_PREPROCESSING][AUDITORIA_GEO] "
+                    f"inconsistencias={len(df_auditoria_geo)}"
+                )
+
+            metricas_integracao = {
+                "payload_enviado": sum(1 for v in resultados_geo.values() if v[2] != self.STATUS_INPUT_GEOCODING_INVALIDO),
+                "payload_barrado": sum(1 for v in resultados_geo.values() if v[2] == self.STATUS_INPUT_GEOCODING_INVALIDO),
+                "falha_integracao": sum(1 for v in resultados_geo.values() if v[2] == STATUS_FALHA_INTEGRACAO),
+                "falha_geocodificacao": sum(1 for v in resultados_geo.values() if v[2] == "falha"),
+                "auditoria_geo": len(df_auditoria_geo),
+            }
+
+            logger.info(
+                "[PDV_PREPROCESSING][GEOCODING_RESUMO] "
+                f"status={status_counts} metricas={metricas_integracao}"
+            )
 
             df_invalidos_total = pd.concat(
                 [df_invalidos, df_invalidos_geo], ignore_index=True
@@ -469,6 +618,14 @@ class PDVPreprocessingUseCase:
                 validos=len(df_validos),
                 invalidos=len(df_invalidos_total),
                 inseridos=inseridos,
+                mensagem=(
+                    "geocoding="
+                    f"enviado:{metricas_integracao['payload_enviado']}|"
+                    f"barrado:{metricas_integracao['payload_barrado']}|"
+                    f"falha_integracao:{metricas_integracao['falha_integracao']}|"
+                    f"falha_geocodificacao:{metricas_integracao['falha_geocodificacao']}|"
+                    f"auditoria_geo:{metricas_integracao['auditoria_geo']}"
+                ),
                 descricao=self.descricao,
                 input_id=self.input_id
             )

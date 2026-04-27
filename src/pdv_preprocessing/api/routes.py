@@ -65,6 +65,40 @@ import re
 
 router = APIRouter()
 
+
+def parse_geocoding_metrics(message: str | None):
+    if not message or not str(message).startswith("geocoding="):
+        return None
+
+    metrics = {}
+
+    try:
+        raw_payload = str(message).split("=", 1)[1]
+        for chunk in raw_payload.split("|"):
+            if ":" not in chunk:
+                continue
+            key, value = chunk.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                continue
+            metrics[key] = int(value) if value.isdigit() else value
+    except Exception:
+        return None
+
+    return metrics or None
+
+
+def enrich_job_history_rows(jobs: list[dict]):
+    enriched = []
+
+    for job in jobs:
+        item = dict(job)
+        item["integration_metrics"] = parse_geocoding_metrics(item.get("mensagem"))
+        enriched.append(item)
+
+    return enriched
+
 def normalize_text(value: str | None):
     if not value:
         return value
@@ -623,6 +657,7 @@ def listar_ultimos_jobs(
     ]
 
     jobs = [dict(zip(colunas, row)) for row in rows]
+    jobs = enrich_job_history_rows(jobs)
 
     cur.close()
     conn.close()
@@ -708,6 +743,7 @@ def filtrar_jobs(
                 total_processados,
                 validos,
                 invalidos,
+                mensagem,
                 criado_em
             FROM historico_pdv_jobs
             WHERE {where_clause}
@@ -723,9 +759,11 @@ def filtrar_jobs(
 
     df = df.astype(object).replace({np.nan: None, np.inf: None, -np.inf: None})
 
+    jobs = enrich_job_history_rows(df.to_dict(orient="records"))
+
     return {
         "total": int(len(df)),
-        "jobs": df.to_dict(orient="records"),
+        "jobs": jobs,
     }
 
 
@@ -771,9 +809,11 @@ def listar_jobs(request: Request):
 
     df = df.astype(object).replace({np.nan: None, np.inf: None, -np.inf: None})
 
+    jobs = enrich_job_history_rows(df.to_dict(orient="records"))
+
     return {
         "total": int(len(df)),
-        "jobs": df.to_dict(orient="records"),
+        "jobs": jobs,
     }
 
 
