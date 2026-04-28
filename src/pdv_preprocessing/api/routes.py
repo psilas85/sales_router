@@ -66,6 +66,9 @@ import re
 router = APIRouter()
 
 
+PDV_PROGRESS_DEBUG = os.getenv("PDV_PROGRESS_DEBUG", "false").lower() == "true"
+
+
 def parse_geocoding_metrics(message: str | None):
     if not message or not str(message).startswith("geocoding="):
         return None
@@ -469,6 +472,31 @@ def gerar_mapa_pdv(
     except Exception as e:
         logger.error(f"❌ Erro ao gerar mapa de PDVs: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/mapa-status", dependencies=[Depends(verify_token)], tags=["Visualização"])
+def status_mapa_pdv(
+    request: Request,
+    input_id: str = Query(..., description="UUID do input de PDVs"),
+    uf: str = Query(None, description="UF opcional usada no nome do arquivo"),
+    cidade: str = Query(None, description="Cidade opcional usada no nome do arquivo"),
+):
+    user = request.state.user
+    tenant_id = user["tenant_id"]
+
+    nome_arquivo = f"pdvs_{input_id}_{cidade or uf or 'BR'}.html".replace(" ", "_")
+    caminho_arquivo = Path(f"/app/output/maps/{tenant_id}/{nome_arquivo}")
+    existe = caminho_arquivo.exists()
+
+    return {
+        "exists": existe,
+        "tenant_id": tenant_id,
+        "input_id": input_id,
+        "uf": uf,
+        "cidade": cidade,
+        "filename": nome_arquivo,
+        "url_relativa": f"/output/maps/{tenant_id}/{nome_arquivo}" if existe else None,
+    }
 
 
 # ==========================================================
@@ -894,6 +922,71 @@ def listar_locais(
     }
 
 
+@router.get("/mapa-locais", dependencies=[Depends(verify_token)], tags=["Locais"])
+def listar_locais_mapa(
+    request: Request,
+    input_id: str = Query(..., description="Input ID obrigatório"),
+    limit: int = Query(1000, ge=1, le=1000),
+):
+    user = request.state.user
+    tenant_id = user["tenant_id"]
+
+    try:
+        input_id_limpo = re.sub(r"[^a-fA-F0-9\-]", "", input_id)
+        input_id = str(UUID(input_id_limpo))
+    except Exception as e:
+        logger.error(f"input_id inválido: repr={repr(input_id)} erro={e}")
+        raise HTTPException(status_code=400, detail="input_id inválido")
+
+    conn = get_connection()
+
+    total_df = pd.read_sql_query(
+        """
+        SELECT COUNT(*) AS total
+        FROM pdvs
+        WHERE tenant_id = %s
+          AND input_id = %s
+          AND pdv_lat IS NOT NULL
+          AND pdv_lon IS NOT NULL;
+        """,
+        conn,
+        params=(tenant_id, input_id),
+    )
+
+    df = pd.read_sql_query(
+        """
+        SELECT
+            id,
+            cnpj,
+            pdv_lat AS lat,
+            pdv_lon AS lon,
+            cidade,
+            COALESCE(
+                NULLIF(TRIM(pdv_endereco_completo), ''),
+                CONCAT_WS(', ', logradouro, numero, bairro, cidade, uf, cep)
+            ) AS endereco
+        FROM pdvs
+        WHERE tenant_id = %s
+          AND input_id = %s
+          AND pdv_lat IS NOT NULL
+          AND pdv_lon IS NOT NULL
+        ORDER BY RANDOM()
+        LIMIT %s;
+        """,
+        conn,
+        params=(tenant_id, input_id, limit),
+    )
+
+    conn.close()
+
+    df = df.astype(object).replace({np.nan: None, np.inf: None, -np.inf: None})
+
+    return {
+        "total": int(total_df.iloc[0]["total"]) if not total_df.empty else 0,
+        "pontos": df.to_dict(orient="records"),
+    }
+
+
 # ============================================================
 # ✏️ Gestão de Locais — EDITAR COORDENADAS (FINAL)
 # PUT /pdv/locais/{pdv_id}
@@ -1113,33 +1206,53 @@ def progresso_job(request: Request, job_id: str):
         meta = job.meta or {}
         progresso = meta.get("progress", 0)
         etapa = meta.get("step", "Processando...")
+        job_status = job.get_status(refresh=True)
+
+        def log_progress(payload_status: str, payload_progress: int, payload_step: str):
+            if not PDV_PROGRESS_DEBUG:
+                return
+
+            logger.info(
+                "[PDV_PROGRESS_DEBUG] "
+                f"job_id={job_id} "
+                f"rq_status={job_status} "
+                f"payload_status={payload_status} "
+                f"progress={payload_progress} "
+                f"step={payload_step}"
+            )
 
         # -------------------------
         # STATUS PADRONIZADO
         # -------------------------
         if job.is_finished:
-            return {
+            payload = {
                 "job_id": job.id,
                 "status": "done",
                 "progress": 100,
                 "step": "Finalizado"
             }
+            log_progress(payload["status"], payload["progress"], payload["step"])
+            return payload
 
         if job.is_failed:
-            return {
+            payload = {
                 "job_id": job.id,
                 "status": "error",
                 "progress": progresso,
                 "step": etapa
             }
+            log_progress(payload["status"], payload["progress"], payload["step"])
+            return payload
 
         # Qualquer outro estado → sempre RUNNING
-        return {
+        payload = {
             "job_id": job.id,
             "status": "running",
             "progress": progresso,
             "step": etapa
         }
+        log_progress(payload["status"], payload["progress"], payload["step"])
+        return payload
 
     except Exception as e:
         logger.error(f"❌ Erro ao consultar progresso do job {job_id}: {e}", exc_info=True)

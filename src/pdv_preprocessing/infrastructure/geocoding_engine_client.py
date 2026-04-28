@@ -20,7 +20,7 @@ class GeocodingEngineClient:
         self.base_url = (base_url or os.getenv("GEOCODING_ENGINE_URL") or "").rstrip("/")
         self.timeout = timeout or int(os.getenv("GEOCODING_ENGINE_TIMEOUT", "60"))
         self.static_token = token or os.getenv("GEOCODING_ENGINE_TOKEN")
-        self.poll_interval = float(os.getenv("GEOCODING_ENGINE_POLL_INTERVAL", "2"))
+        self.poll_interval = float(os.getenv("GEOCODING_ENGINE_POLL_INTERVAL", "1"))
         self.job_timeout = int(os.getenv("GEOCODING_ENGINE_JOB_TIMEOUT", "3600"))
 
     @property

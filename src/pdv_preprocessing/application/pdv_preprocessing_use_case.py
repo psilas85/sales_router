@@ -57,10 +57,6 @@ def atualizar_progresso(atual, total, passo_min, passo_max, step):
     Converte progresso local em progresso global.
     A etapa ocupa o intervalo [passo_min, passo_max].
     """
-    job = get_current_job()
-    if not job:
-        return
-
     # Cálculo do percentual global
     if total <= 0:
         pct_global = passo_min
@@ -71,11 +67,14 @@ def atualizar_progresso(atual, total, passo_min, passo_max, step):
     # Nunca permitir 100% aqui
     pct_global = max(1, min(99, pct_global))
 
-    # Atualiza meta do Redis para o /progress
-    job.meta.update({"progress": pct_global, "step": step})
-    job.save_meta()
+    job = get_current_job()
+    if job:
+        # Atualiza meta do Redis quando o caso de uso estiver rodando dentro de um worker RQ.
+        job.meta.update({"progress": pct_global, "step": step})
+        job.save_meta()
 
-    # Emite no stdout se estiver em subprocesso (CLI)
+    # Emite no stdout para o worker pai capturar o progresso mesmo quando este processo
+    # não estiver associado diretamente a um job RQ.
     print(json.dumps({
         "event": "progress",
         "pct": pct_global,

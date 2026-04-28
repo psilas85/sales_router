@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import time
+import threading
 import unicodedata
 from uuid import uuid4
 
@@ -37,6 +38,52 @@ if not logger.handlers:
 
 redis_conn = redis.Redis(host="redis", port=6379)
 redis_str = redis.Redis(host="redis", port=6379, decode_responses=True)
+
+
+def _set_job_progress(job, progress: int, step: str, status: str = "started", **extra):
+    if not job:
+        return
+
+    current_progress = int(job.meta.get("progress", 0) or 0)
+    job.meta.update({
+        "progress": max(current_progress, progress),
+        "step": step,
+        "status": status,
+        **extra,
+    })
+    job.save_meta()
+
+
+def _start_progress_heartbeat(
+    job,
+    start: int,
+    end: int,
+    step: str,
+    interval: float = 3.0,
+):
+    if not job or start >= end:
+        return lambda: None
+
+    stop_event = threading.Event()
+
+    def run():
+        progress = max(int(job.meta.get("progress", 0) or 0), start)
+
+        while not stop_event.wait(interval):
+            if progress >= end - 1:
+                continue
+
+            progress += 1
+            _set_job_progress(job, progress, step)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+
+    def stop():
+        stop_event.set()
+        thread.join(timeout=0.1)
+
+    return stop
 
 
 def _chunk_list(items, size):
@@ -545,13 +592,7 @@ def processar_batch_json(payload: dict):
     redis_str.delete(redis_stats_key)
     redis_str.delete(redis_final_key)
 
-    if job:
-        job.meta.update({
-            "progress": 0,
-            "step": "Preparando seu processamento",
-            "status": "started",
-        })
-        job.save_meta()
+    _set_job_progress(job, 0, "Preparando seu processamento")
 
     if not addresses:
         result_payload = {
@@ -563,8 +604,21 @@ def processar_batch_json(payload: dict):
         redis_str.set(redis_final_key, json.dumps(result_payload, ensure_ascii=False), ex=86400)
         return result_payload
 
-    gdf_municipios = carregar_municipios_gdf()
-    addresses_validas, df_invalidos_cidade = _separar_cidades_invalidas(addresses, gdf_municipios)
+    _set_job_progress(job, 5, "Carregando malha municipal")
+    stop_loading_heartbeat = _start_progress_heartbeat(
+        job,
+        start=6,
+        end=18,
+        step="Validando municipios e cidades",
+        interval=4.0,
+    )
+    try:
+        gdf_municipios = carregar_municipios_gdf()
+        addresses_validas, df_invalidos_cidade = _separar_cidades_invalidas(addresses, gdf_municipios)
+    finally:
+        stop_loading_heartbeat()
+
+    _set_job_progress(job, 18, "Cidades validadas")
 
     if not df_invalidos_cidade.empty:
         logger.warning(f"[BATCH_JSON][CIDADE_INVALIDA] total={len(df_invalidos_cidade)}")
@@ -592,6 +646,8 @@ def processar_batch_json(payload: dict):
         )
         subjob_ids[chunk_id] = subjob.id
         chunk_sizes[chunk_id] = len(chunk)
+
+    _set_job_progress(job, 20, "Distribuindo lotes para geocodificacao")
 
     while True:
         done_chunks = {
@@ -635,39 +691,50 @@ def processar_batch_json(payload: dict):
         progress = 10 + int((finished_chunks / total_chunks) * 55) if total_chunks else 65
         progress = min(progress, 65)
 
-        if job:
-            job.meta.update({
-                "progress": progress,
-                "step": f"Localizando enderecos ({finished_chunks}/{total_chunks})",
-                "status": "started",
-            })
-            job.save_meta()
+        _set_job_progress(
+            job,
+            progress,
+            f"Localizando enderecos ({finished_chunks}/{total_chunks})",
+        )
 
         if finished_chunks >= total_chunks:
             break
 
         time.sleep(1)
 
-    if job:
-        job.meta.update({"progress": 70, "step": "Organizando os resultados"})
-        job.save_meta()
+    _set_job_progress(job, 70, "Organizando os resultados")
 
     raw_items = redis_str.lrange(redis_results_key, 0, -1)
+    _set_job_progress(job, 74, "Consolidando respostas recebidas")
+
     df_result = _dedup_results(_coerce_result_rows(raw_items))
+    _set_job_progress(job, 78, "Associando resultados aos enderecos")
+
     df_merged = _merge_original(addresses_validas, df_result)
 
+    _set_job_progress(job, 82, "Validando coordenadas retornadas")
     df_validos, df_invalidos = _validar_resultados(df_merged, gdf_municipios)
 
-    if job:
-        job.meta.update({"progress": 82, "step": "Fazendo uma nova conferencia dos casos pendentes"})
-        job.save_meta()
+    _set_job_progress(job, 86, "Fazendo uma nova conferencia dos casos pendentes")
 
-    df_recuperados, df_invalidos_final = _reprocessar_invalidos(df_invalidos)
-
-    df_recuperados_validos, df_recuperados_invalidos = _revalidar_recuperados_com_regra_principal(
-        df_recuperados,
-        gdf_municipios,
+    stop_reprocess_heartbeat = _start_progress_heartbeat(
+        job,
+        start=87,
+        end=91,
+        step="Reavaliando casos pendentes",
+        interval=4.0,
     )
+    try:
+        df_recuperados, df_invalidos_final = _reprocessar_invalidos(df_invalidos)
+
+        df_recuperados_validos, df_recuperados_invalidos = _revalidar_recuperados_com_regra_principal(
+            df_recuperados,
+            gdf_municipios,
+        )
+    finally:
+        stop_reprocess_heartbeat()
+
+    _set_job_progress(job, 91, "Validando recuperacoes aplicadas")
 
     df_validos_final = pd.concat([df_validos, df_recuperados_validos], ignore_index=True)
     if not df_validos_final.empty:
@@ -689,11 +756,19 @@ def processar_batch_json(payload: dict):
             ~df_invalidos_final["id"].isin(ids_validos)
         ].drop_duplicates(subset=["id"], keep="first")
 
-    if job:
-        job.meta.update({"progress": 92, "step": "Aplicando os ajustes finais"})
-        job.save_meta()
+    _set_job_progress(job, 94, "Aplicando os ajustes finais")
 
-    cache_saved = _persistir_cache_final(df_validos_final)
+    stop_finalize_heartbeat = _start_progress_heartbeat(
+        job,
+        start=95,
+        end=99,
+        step="Gravando ajustes finais",
+        interval=3.0,
+    )
+    try:
+        cache_saved = _persistir_cache_final(df_validos_final)
+    finally:
+        stop_finalize_heartbeat()
 
     results = _to_api_results(df_validos_final, df_invalidos_final)
     stats_live = _get_hash_stats(redis_stats_key)
@@ -721,15 +796,14 @@ def processar_batch_json(payload: dict):
 
     redis_str.set(redis_final_key, json.dumps(result_payload, ensure_ascii=False), ex=86400)
 
-    if job:
-        job.meta.update({
-            "progress": 100,
-            "step": "Processamento concluido",
-            "status": "finished",
-            "result": stats,
-            "result_key": redis_final_key,
-        })
-        job.save_meta()
+    _set_job_progress(
+        job,
+        100,
+        "Processamento concluido",
+        status="finished",
+        result=stats,
+        result_key=redis_final_key,
+    )
 
     logger.info(
         f"[BATCH_JSON][END] job_id={job_id} total={stats['total']} "
