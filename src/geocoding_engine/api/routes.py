@@ -1,8 +1,11 @@
 #sales_router/src/geocoding_engine/api/routes.py
 
+from typing import Optional
+
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel, Field
 
 from .dependencies import verify_token
 from .schemas import GeocodeBatchRequest, GeocodeRequest
@@ -14,6 +17,7 @@ from geocoding_engine.workers.geocode_jobs import processar_geocode
 from geocoding_engine.visualization.map_use_case import GenerateMapUseCase
 from geocoding_engine.infrastructure.database_reader import DatabaseReader
 from geocoding_engine.infrastructure.database_writer import DatabaseWriter
+from geocoding_engine.domain.cache_key_builder import build_cache_key, build_canonical_address
 
 from rq.job import Job
 from loguru import logger
@@ -26,6 +30,38 @@ import pandas as pd
 router = APIRouter()
 
 MAX_UPLOAD_MB = 50
+
+
+class CacheCreateSchema(BaseModel):
+    endereco: str = Field(..., min_length=5, max_length=255)
+    logradouro: str = Field(..., min_length=2, max_length=200)
+    numero: Optional[str] = Field(default="", max_length=40)
+    cidade: str = Field(..., min_length=2, max_length=120)
+    uf: str = Field(..., min_length=2, max_length=2)
+    lat: float
+    lon: float
+
+
+class CacheUpdateSchema(BaseModel):
+    endereco: Optional[str] = Field(default=None, min_length=5, max_length=255)
+    logradouro: Optional[str] = Field(default=None, min_length=2, max_length=200)
+    numero: Optional[str] = Field(default=None, max_length=40)
+    cidade: Optional[str] = Field(default=None, min_length=2, max_length=120)
+    uf: Optional[str] = Field(default=None, min_length=2, max_length=2)
+    lat: float
+    lon: float
+
+
+def validar_lat_lon(lat: float, lon: float):
+    if lat < -90 or lat > 90 or lon < -180 or lon > 180:
+        raise HTTPException(status_code=400, detail="Latitude/longitude fora da faixa válida")
+
+
+def montar_endereco_display(endereco: Optional[str], logradouro: str, numero: Optional[str], cidade: str, uf: str):
+    if logradouro and cidade and uf:
+        return build_canonical_address(logradouro, numero or "", cidade, uf)
+
+    return (endereco or "").strip()
 
 
 # ============================================================
@@ -477,10 +513,16 @@ def job_map(job_id: str):
 
 @router.get("/cache/search", dependencies=[Depends(verify_token)])
 def buscar_cache(
-    cidade: str,
-    uf: str,
-    endereco: str = None,
+    cidade: Optional[str] = None,
+    uf: Optional[str] = None,
+    endereco: Optional[str] = None,
+    origem: Optional[str] = None,
+    atualizado_de: Optional[str] = None,
+    atualizado_ate: Optional[str] = None,
     limit: int = 50,
+    offset: int = 0,
+    order_by: str = "atualizado_em",
+    order_dir: str = "desc",
 ):
     reader = DatabaseReader()
 
@@ -488,10 +530,58 @@ def buscar_cache(
         cidade=cidade,
         uf=uf,
         endereco=endereco,
-        limit=limit
+        origem=origem,
+        atualizado_de=atualizado_de,
+        atualizado_ate=atualizado_ate,
+        limit=limit,
+        offset=offset,
+        order_by=order_by,
+        order_dir=order_dir,
     )
 
     return results
+
+
+@router.post("/cache", dependencies=[Depends(verify_token)], status_code=201)
+def criar_cache(payload: CacheCreateSchema):
+
+    validar_lat_lon(payload.lat, payload.lon)
+
+    reader = DatabaseReader()
+    writer = DatabaseWriter(reader.conn)
+
+    endereco_normalizado = build_cache_key(
+        payload.logradouro,
+        payload.numero or "",
+        payload.cidade,
+        payload.uf,
+    )
+
+    endereco_display = montar_endereco_display(
+        payload.endereco,
+        payload.logradouro,
+        payload.numero,
+        payload.cidade,
+        payload.uf,
+    )
+
+    existente = reader.buscar_cache_por_chave_normalizada(endereco_normalizado)
+    if existente:
+        raise HTTPException(status_code=409, detail="Já existe um endereço cadastrado com essa chave de cache")
+
+    existente_endereco = reader.buscar_cache_por_endereco(endereco_display)
+    if existente_endereco:
+        raise HTTPException(status_code=409, detail="Já existe um endereço cadastrado com esse endereço canônico")
+
+    novo_id = writer.criar_cache_manual(
+        endereco=endereco_display,
+        endereco_normalizado=endereco_normalizado,
+        lat=payload.lat,
+        lon=payload.lon,
+    )
+
+    criado = reader.buscar_cache_por_id(novo_id)
+    return jsonable_encoder(criado)
 
 
 # ============================================================
@@ -499,17 +589,63 @@ def buscar_cache(
 # ============================================================
 
 @router.put("/cache/{id}", dependencies=[Depends(verify_token)])
-def atualizar_cache(id: int, payload: dict):
+def atualizar_cache(id: int, payload: CacheUpdateSchema):
 
-    lat = payload.get("lat")
-    lon = payload.get("lon")
-
-    if lat is None or lon is None:
-        raise HTTPException(400, "lat/lon obrigatórios")
+    validar_lat_lon(payload.lat, payload.lon)
 
     reader = DatabaseReader()
     writer = DatabaseWriter(reader.conn)
 
-    writer.atualizar_cache(id, lat, lon)
+    atual = reader.buscar_cache_por_id(id)
+    if not atual:
+        raise HTTPException(status_code=404, detail="Endereço não encontrado")
 
-    return {"status": "ok"}
+    if payload.logradouro and payload.cidade and payload.uf:
+        endereco_normalizado = build_cache_key(
+            payload.logradouro,
+            payload.numero or "",
+            payload.cidade,
+            payload.uf,
+        )
+        endereco_display = montar_endereco_display(
+            payload.endereco,
+            payload.logradouro,
+            payload.numero,
+            payload.cidade,
+            payload.uf,
+        )
+
+        existente = reader.buscar_cache_por_chave_normalizada(endereco_normalizado)
+        if existente and existente["id"] != id:
+            raise HTTPException(status_code=409, detail="Já existe outro endereço cadastrado com essa chave de cache")
+
+        existente_endereco = reader.buscar_cache_por_endereco(endereco_display)
+        if existente_endereco and existente_endereco["id"] != id:
+            raise HTTPException(status_code=409, detail="Já existe outro endereço cadastrado com esse endereço canônico")
+
+        writer.atualizar_cache(
+            id,
+            payload.lat,
+            payload.lon,
+            endereco=endereco_display,
+            endereco_normalizado=endereco_normalizado,
+        )
+    else:
+        writer.atualizar_cache(id, payload.lat, payload.lon)
+
+    atualizado = reader.buscar_cache_por_id(id)
+    return jsonable_encoder(atualizado)
+
+
+@router.delete("/cache/{id}", dependencies=[Depends(verify_token)], status_code=204)
+def excluir_cache(id: int):
+
+    reader = DatabaseReader()
+    writer = DatabaseWriter(reader.conn)
+
+    atual = reader.buscar_cache_por_id(id)
+    if not atual:
+        raise HTTPException(status_code=404, detail="Endereço não encontrado")
+
+    writer.excluir_cache(id)
+    return None

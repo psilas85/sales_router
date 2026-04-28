@@ -116,42 +116,173 @@ class DatabaseReader:
     # ---------------------------------------------------------
     # BUSCA FILTRADA (UI / edição manual)
     # ---------------------------------------------------------
-    def buscar_cache_filtrado(self, cidade, uf, endereco=None, limit=50):
+    def buscar_cache_filtrado(
+        self,
+        cidade=None,
+        uf=None,
+        endereco=None,
+        origem=None,
+        atualizado_de=None,
+        atualizado_ate=None,
+        limit=50,
+        offset=0,
+        order_by="atualizado_em",
+        order_dir="desc",
+    ):
 
         self._ensure_connection()
 
         try:
             termos = normalize_for_cache(
-                f"{cidade} {uf} {endereco or ''}"
+                " ".join(
+                    str(parte or "").strip()
+                    for parte in [cidade, uf, endereco]
+                    if str(parte or "").strip()
+                )
             ).split()
 
-            if not termos:
-                return []
+            where_clauses = []
+            params = []
+
+            for termo in termos:
+                where_clauses.append("COALESCE(endereco_normalizado, endereco) ILIKE %s")
+                params.append(f"%{termo}%")
+
+            if origem:
+                where_clauses.append("origem = %s")
+                params.append(origem)
+
+            if atualizado_de:
+                where_clauses.append("atualizado_em >= %s::timestamp")
+                params.append(atualizado_de)
+
+            if atualizado_ate:
+                where_clauses.append("atualizado_em <= %s::timestamp")
+                params.append(atualizado_ate)
+
+            if not where_clauses:
+                return {
+                    "items": [],
+                    "total": 0,
+                    "limit": limit,
+                    "offset": offset,
+                }
+
+            where_sql = " AND ".join(where_clauses)
+
+            order_map = {
+                "atualizado_em": "atualizado_em",
+                "endereco": "endereco",
+                "origem": "origem",
+                "lat": "lat",
+                "lon": "lon",
+            }
+            order_column = order_map.get(order_by, "atualizado_em")
+            order_direction = "ASC" if str(order_dir).lower() == "asc" else "DESC"
 
             with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
 
-                where_clauses = []
-                params = []
-
-                for termo in termos:
-                    where_clauses.append("endereco_normalizado ILIKE %s")
-                    params.append(f"%{termo}%")
-
-                where_sql = " AND ".join(where_clauses)
-
-                query = f"""
-                SELECT id, endereco, lat, lon, origem, atualizado_em
+                count_query = f"""
+                SELECT COUNT(*) AS total
                 FROM enderecos_cache
                 WHERE {where_sql}
-                ORDER BY atualizado_em DESC
-                LIMIT %s
                 """
 
-                params.append(limit)
+                cur.execute(count_query, tuple(params))
+                total_row = cur.fetchone() or {"total": 0}
 
-                cur.execute(query, tuple(params))
-                return cur.fetchall()
+                query = f"""
+                SELECT id, endereco, endereco_normalizado, lat, lon, origem, atualizado_em
+                FROM enderecos_cache
+                WHERE {where_sql}
+                ORDER BY {order_column} {order_direction}, id DESC
+                LIMIT %s OFFSET %s
+                """
+
+                page_params = [*params, limit, offset]
+
+                cur.execute(query, tuple(page_params))
+                return {
+                    "items": cur.fetchall(),
+                    "total": int(total_row["total"] or 0),
+                    "limit": limit,
+                    "offset": offset,
+                }
 
         except Exception as e:
             logger.warning(f"[CACHE_FILTRO][ERRO] {e}")
-            return []
+            return {
+                "items": [],
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+            }
+
+    def buscar_cache_por_id(self, cache_id: int):
+
+        self._ensure_connection()
+
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, endereco, endereco_normalizado, lat, lon, origem, criado_em, atualizado_em
+                    FROM enderecos_cache
+                    WHERE id = %s
+                    LIMIT 1
+                    """,
+                    (cache_id,),
+                )
+                return cur.fetchone()
+
+        except Exception as e:
+            logger.warning(f"[CACHE_BY_ID][ERRO] {e}")
+            return None
+
+    def buscar_cache_por_chave_normalizada(self, endereco_normalizado: str):
+
+        if not endereco_normalizado:
+            return None
+
+        self._ensure_connection()
+
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, endereco, endereco_normalizado, lat, lon, origem, criado_em, atualizado_em
+                    FROM enderecos_cache
+                    WHERE endereco_normalizado = %s
+                    LIMIT 1
+                    """,
+                    (endereco_normalizado,),
+                )
+                return cur.fetchone()
+
+        except Exception as e:
+            logger.warning(f"[CACHE_BY_KEY][ERRO] {e}")
+            return None
+
+    def buscar_cache_por_endereco(self, endereco: str):
+
+        if not endereco:
+            return None
+
+        self._ensure_connection()
+
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, endereco, endereco_normalizado, lat, lon, origem, criado_em, atualizado_em
+                    FROM enderecos_cache
+                    WHERE endereco = %s
+                    LIMIT 1
+                    """,
+                    (endereco,),
+                )
+                return cur.fetchone()
+
+        except Exception as e:
+            logger.warning(f"[CACHE_BY_ENDERECO][ERRO] {e}")
+            return None

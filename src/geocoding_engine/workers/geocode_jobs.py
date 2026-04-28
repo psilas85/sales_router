@@ -15,6 +15,7 @@ import pandas as pd
 import redis
 
 from rq import Queue
+from geocoding_engine.domain.utils_texto import fix_encoding
 from geocoding_engine.visualization.geojson_builder import GeoJSONBuilder
 from geocoding_engine.application.reprocess_invalids_service import geocode_google_direto
 
@@ -134,6 +135,112 @@ def _build_ibge_city_lookup(gdf_municipios):
 def chunk_list(lst, size):
     for i in range(0, len(lst), size):
         yield lst[i:i + size]
+
+
+def _normalize_column_name(column_name: str) -> str:
+    column_name = str(column_name or "").strip().lower()
+    column_name = unicodedata.normalize("NFKD", column_name)
+    column_name = "".join(ch for ch in column_name if not unicodedata.combining(ch))
+    return column_name
+
+
+def _extract_logradouro_numero(logradouro_raw: str):
+    if not logradouro_raw:
+        return "", ""
+
+    logradouro_raw = str(logradouro_raw).strip()
+    match = re.search(r"^(.*?)(?:\s*,?\s*)(\d{1,6})$", logradouro_raw)
+    if match:
+        return match.group(1).strip(), match.group(2)
+
+    return logradouro_raw, ""
+
+
+def _normalize_logradouro(logradouro_raw: str) -> str:
+    if not logradouro_raw:
+        return ""
+
+    logradouro = fix_encoding(str(logradouro_raw).strip())
+    logradouro = logradouro.split(",")[0].strip()
+    return " ".join(logradouro.split())
+
+
+def _normalize_numero(numero_raw: str) -> str:
+    numero = fix_encoding(str(numero_raw or "").strip()).upper()
+    if numero in ("", "0", "SN", "S/N", "SEM NUMERO", "SEM NÚMERO"):
+        return ""
+    return numero
+
+
+def _clean_bairro(bairro: str, cidade: str) -> str:
+    if not bairro:
+        return ""
+
+    bairro = fix_encoding(str(bairro).strip())
+    cidade = fix_encoding(str(cidade).strip())
+
+    if cidade and bairro.upper().endswith(" " + cidade.upper()):
+        return bairro[:-(len(cidade) + 1)].strip()
+
+    return bairro
+
+
+def _normalize_operational_input(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [_normalize_column_name(col) for col in df.columns]
+
+    text_columns = [
+        "cnpj",
+        "razao_social",
+        "nome_fantasia",
+        "logradouro",
+        "numero",
+        "bairro",
+        "cidade",
+        "uf",
+        "cep",
+        "consultor",
+        "setor",
+    ]
+
+    for column in text_columns:
+        if column in df.columns:
+            df[column] = (
+                df[column]
+                .fillna("")
+                .astype(str)
+                .map(lambda value: fix_encoding(value.strip()))
+                .replace({"nan": "", "None": ""})
+            )
+
+    if "cep" in df.columns:
+        df["cep"] = df["cep"].str.replace(r"[^0-9]", "", regex=True)
+
+    if "uf" in df.columns:
+        df["uf"] = df["uf"].str.upper().str.strip()
+
+    if "cidade" in df.columns:
+        df["cidade"] = df["cidade"].map(lambda value: fix_encoding(str(value)).upper().strip())
+
+    if "logradouro" in df.columns:
+        if "numero" not in df.columns:
+            df["numero"] = ""
+        if "bairro" not in df.columns:
+            df["bairro"] = ""
+        if "cidade" not in df.columns:
+            df["cidade"] = ""
+
+        for idx, row in df.iterrows():
+            logradouro_raw = row.get("logradouro", "")
+            numero_raw = row.get("numero", "")
+            logradouro_extraido, numero_extraido = _extract_logradouro_numero(logradouro_raw)
+            numero_final = numero_raw if str(numero_raw).strip() else numero_extraido
+
+            df.at[idx, "logradouro"] = _normalize_logradouro(logradouro_extraido)
+            df.at[idx, "numero"] = _normalize_numero(numero_final)
+            df.at[idx, "bairro"] = _clean_bairro(row.get("bairro", ""), row.get("cidade", ""))
+
+    return df
 
 def validar_input_basico(row):
 
@@ -319,7 +426,8 @@ def processar_geocode(file_path):
         if job:
             _update_job_meta(job, 5, "Lendo seu arquivo")
 
-        df = pd.read_excel(file_path)
+        df = pd.read_excel(file_path, dtype=str, engine="openpyxl")
+        df = _normalize_operational_input(df).fillna("")
         df = df.reset_index(drop=True)
 
         # 🔥 DEFINE ID GLOBAL (CRÍTICO)
