@@ -34,11 +34,11 @@ def main():
 
     args = parser.parse_args()
 
-    emit_progress(5, "Lendo arquivo")
+    emit_progress(5, "Lendo seu arquivo")
 
     df = pd.read_excel(args.arquivo)
 
-    emit_progress(20, "Geocodificando")
+    emit_progress(20, "Localizando enderecos")
 
     uc = GeocodeSpreadsheetUseCase()
 
@@ -47,7 +47,7 @@ def main():
     with open(args.saida, "wb") as f:
         f.write(excel_buffer.getvalue())
 
-    emit_progress(90, "Finalizando")
+    emit_progress(90, "Preparando sua entrega")
 
     emit_final({
         "status": "done",

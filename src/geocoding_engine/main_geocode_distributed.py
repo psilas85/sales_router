@@ -43,7 +43,7 @@ def main():
         # -----------------------------------------------------
         # LEITURA
         # -----------------------------------------------------
-        update_progress(5, "Lendo arquivo")
+        update_progress(5, "Lendo seu arquivo")
 
         logger.info(f"[JOB] lendo arquivo: {args.arquivo}")
 
@@ -57,7 +57,7 @@ def main():
         # -----------------------------------------------------
         # PROCESSAMENTO
         # -----------------------------------------------------
-        update_progress(20, "Geocodificando")
+        update_progress(20, "Localizando enderecos")
 
         uc = GeocodeSpreadsheetUseCase()
 
@@ -71,7 +71,7 @@ def main():
         # -----------------------------------------------------
         # SALVAR
         # -----------------------------------------------------
-        update_progress(90, "Salvando resultado")
+        update_progress(90, "Preparando sua entrega")
 
         try:
             with open(args.saida, "wb") as f:
@@ -86,7 +86,7 @@ def main():
         # -----------------------------------------------------
         # FINALIZAÇÃO
         # -----------------------------------------------------
-        update_progress(100, "Concluído")
+        update_progress(100, "Processamento concluido")
 
         if job:
             job.meta["result"] = stats
@@ -101,7 +101,7 @@ def main():
         logger.error(f"[JOB][ERRO] {erro}")
         logger.error(stack)
 
-        update_progress(100, "Erro")
+        update_progress(100, "Nao foi possivel concluir")
 
         if job:
             job.meta["status"] = "failed"

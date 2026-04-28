@@ -100,15 +100,37 @@ def _cidade_existe_ibge(cidade, uf, gdf_municipios):
     return not match.empty
 
 
+def _build_ibge_city_lookup(gdf_municipios):
+    if "cidade_norm" not in gdf_municipios.columns:
+        gdf_municipios["cidade_norm"] = [
+            _normalize_city_strict(cidade_ref, uf=uf_ref)
+            for cidade_ref, uf_ref in zip(gdf_municipios["cidade"], gdf_municipios["uf"])
+        ]
+
+    if "uf_norm" not in gdf_municipios.columns:
+        gdf_municipios["uf_norm"] = [_norm_uf(uf_ref) for uf_ref in gdf_municipios["uf"]]
+
+    return set(
+        zip(
+            gdf_municipios["cidade_norm"].astype(str),
+            gdf_municipios["uf_norm"].astype(str),
+        )
+    )
+
+
 def _separar_cidades_invalidas(addresses, gdf_municipios):
     if not addresses:
         return [], pd.DataFrame()
 
+    ibge_city_lookup = _build_ibge_city_lookup(gdf_municipios)
     validos = []
     invalidos = []
 
     for item in addresses:
-        if _cidade_existe_ibge(item.get("cidade"), item.get("uf"), gdf_municipios):
+        cidade_norm = _normalize_city_strict(item.get("cidade"), uf=item.get("uf"))
+        uf_norm = _norm_uf(item.get("uf"))
+
+        if cidade_norm and uf_norm and (cidade_norm, uf_norm) in ibge_city_lookup:
             validos.append(item)
             continue
 
@@ -504,7 +526,7 @@ def processar_batch_json(payload: dict):
     tenant_id = int(payload.get("tenant_id", 1))
     origem = str(payload.get("origem", "api_batch_json"))
 
-    default_chunk_size = int(os.getenv("GEOCODE_BATCH_JSON_CHUNK_SIZE", "25"))
+    default_chunk_size = int(os.getenv("GEOCODE_BATCH_JSON_CHUNK_SIZE", "100"))
     chunk_size = int(payload.get("chunk_size") or default_chunk_size)
     subjob_timeout = int(os.getenv("GEOCODE_SUBJOB_TIMEOUT", "1800"))
     total_chunks = (len(addresses) + chunk_size - 1) // chunk_size if addresses else 0
@@ -526,7 +548,7 @@ def processar_batch_json(payload: dict):
     if job:
         job.meta.update({
             "progress": 0,
-            "step": "Inicializando",
+            "step": "Preparando seu processamento",
             "status": "started",
         })
         job.save_meta()
@@ -616,7 +638,7 @@ def processar_batch_json(payload: dict):
         if job:
             job.meta.update({
                 "progress": progress,
-                "step": f"Geocodificando ({finished_chunks}/{total_chunks})",
+                "step": f"Localizando enderecos ({finished_chunks}/{total_chunks})",
                 "status": "started",
             })
             job.save_meta()
@@ -627,7 +649,7 @@ def processar_batch_json(payload: dict):
         time.sleep(1)
 
     if job:
-        job.meta.update({"progress": 70, "step": "Consolidando"})
+        job.meta.update({"progress": 70, "step": "Organizando os resultados"})
         job.save_meta()
 
     raw_items = redis_str.lrange(redis_results_key, 0, -1)
@@ -637,7 +659,7 @@ def processar_batch_json(payload: dict):
     df_validos, df_invalidos = _validar_resultados(df_merged, gdf_municipios)
 
     if job:
-        job.meta.update({"progress": 82, "step": "Reprocessando inválidos"})
+        job.meta.update({"progress": 82, "step": "Fazendo uma nova conferencia dos casos pendentes"})
         job.save_meta()
 
     df_recuperados, df_invalidos_final = _reprocessar_invalidos(df_invalidos)
@@ -668,7 +690,7 @@ def processar_batch_json(payload: dict):
         ].drop_duplicates(subset=["id"], keep="first")
 
     if job:
-        job.meta.update({"progress": 92, "step": "Persistindo cache"})
+        job.meta.update({"progress": 92, "step": "Aplicando os ajustes finais"})
         job.save_meta()
 
     cache_saved = _persistir_cache_final(df_validos_final)
@@ -702,7 +724,7 @@ def processar_batch_json(payload: dict):
     if job:
         job.meta.update({
             "progress": 100,
-            "step": "Concluído",
+            "step": "Processamento concluido",
             "status": "finished",
             "result": stats,
             "result_key": redis_final_key,

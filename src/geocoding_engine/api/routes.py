@@ -165,7 +165,7 @@ def geocode_batch_job(body: GeocodeBatchRequest):
             job_timeout=36000,
             meta={
                 "progress": 0,
-                "step": "Criado",
+                "step": "Recebemos sua solicitacao",
                 "origem": "api_batch_json",
             },
             description=f"geocode_batch_json:{uuid.uuid4()}"
@@ -229,7 +229,7 @@ async def geocode_upload(file: UploadFile = File(...)):
             job_timeout=36000,
             meta={
                 "progress": 0,
-                "step": "Criado"
+                "step": "Recebemos seu arquivo"
             },
             description=f"geocode:{file.filename}"
         )

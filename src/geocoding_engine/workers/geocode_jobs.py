@@ -111,6 +111,26 @@ def cidade_existe_ibge(cidade, uf, gdf_municipios):
     ]
 
     return not match.empty
+
+
+def _build_ibge_city_lookup(gdf_municipios):
+    if "cidade_norm" not in gdf_municipios.columns:
+        gdf_municipios["cidade_norm"] = [
+            _normalize_city_strict(cidade_ref, uf=uf_ref)
+            for cidade_ref, uf_ref in zip(gdf_municipios["cidade"], gdf_municipios["uf"])
+        ]
+
+    if "uf_norm" not in gdf_municipios.columns:
+        gdf_municipios["uf_norm"] = gdf_municipios["uf"].apply(_normalize_text)
+
+    return set(
+        zip(
+            gdf_municipios["cidade_norm"].astype(str),
+            gdf_municipios["uf_norm"].astype(str),
+        )
+    )
+
+
 def chunk_list(lst, size):
     for i in range(0, len(lst), size):
         yield lst[i:i + size]
@@ -267,7 +287,7 @@ def processar_geocode(file_path):
     redis_str = redis.Redis(host="redis", port=6379, decode_responses=True)
     subjob_queue = Queue("geocode_subjobs", connection=redis_conn)
 
-    CHUNK_SIZE = int(os.getenv("GEOCODE_BATCH_JSON_CHUNK_SIZE", "25"))
+    CHUNK_SIZE = int(os.getenv("GEOCODE_BATCH_JSON_CHUNK_SIZE", "100"))
     redis_results_key = f"geocode_result:{job_id}"
     redis_done_key = f"geocode_done:{job_id}"
     redis_stats_key = f"geocode_stats:{job_id}"
@@ -287,7 +307,7 @@ def processar_geocode(file_path):
             "output_file": output_file,
             "output_json": output_json,
             "progress": 0,
-            "step": "Inicializando",
+            "step": "Preparando seu processamento",
             "status": "started"
         })
         job.save_meta()
@@ -297,7 +317,7 @@ def processar_geocode(file_path):
         # LEITURA
         # =====================================================
         if job:
-            _update_job_meta(job, 5, "Lendo arquivo")
+            _update_job_meta(job, 5, "Lendo seu arquivo")
 
         df = pd.read_excel(file_path)
         df = df.reset_index(drop=True)
@@ -314,20 +334,29 @@ def processar_geocode(file_path):
         from geocoding_engine.domain.municipio_polygon_validator import carregar_municipios_gdf
 
         if job:
-            _update_job_meta(job, 8, "Carregando malha IBGE")
+            _update_job_meta(job, 8, "Conferindo seus dados")
 
         gdf_municipios = carregar_municipios_gdf()
 
         if job:
-            _update_job_meta(job, 12, "Validando cidades")
+            _update_job_meta(job, 12, "Validando informacoes do arquivo")
 
         df["cidade"] = df["cidade"].astype(str).str.upper().str.strip()
         df["uf"] = df["uf"].astype(str).str.upper().str.strip()
 
-        df["cidade_valida"] = df.apply(
-            lambda row: cidade_existe_ibge(row["cidade"], row["uf"], gdf_municipios),
-            axis=1
-        )
+        ibge_city_lookup = _build_ibge_city_lookup(gdf_municipios)
+        df["cidade_norm"] = [
+            _normalize_city_strict(cidade, uf=uf)
+            for cidade, uf in zip(df["cidade"], df["uf"])
+        ]
+        df["uf_norm"] = df["uf"].apply(_normalize_text)
+
+        df["cidade_valida"] = [
+            (cidade_norm, uf_norm) in ibge_city_lookup
+            if cidade_norm and uf_norm and len(uf_norm) == 2
+            else False
+            for cidade_norm, uf_norm in zip(df["cidade_norm"], df["uf_norm"])
+        ]
 
         df_invalidos_cidade = df[~df["cidade_valida"]].copy()
 
@@ -341,7 +370,7 @@ def processar_geocode(file_path):
         # 🔥 mantém separado
         df_validos_input = df[df["cidade_valida"]].copy()
 
-        df = df_validos_input.copy()
+        df = df_validos_input.drop(columns=["cidade_norm", "uf_norm"], errors="ignore").copy()
 
         for col in ["setor", "consultor", "cnpj", "razao_social", "nome_fantasia"]:
             if col not in df.columns:
@@ -381,7 +410,7 @@ def processar_geocode(file_path):
         # ENQUEUE
         # =====================================================
         if job:
-            _update_job_meta(job, 15, "Enfileirando subjobs")
+            _update_job_meta(job, 15, "Organizando as etapas do processamento")
 
         subjob_ids = []
         total_chunks = (len(addresses_validos) + CHUNK_SIZE - 1) // CHUNK_SIZE
@@ -423,7 +452,7 @@ def processar_geocode(file_path):
             progress = 20 + int((finished_chunks / total_chunks) * 60) if total_chunks else 80
             progress = min(progress, 80)
 
-            logger.info(
+            logger.debug(
                 f"[WAIT] finished_chunks={finished_chunks}/{total_chunks} "
                 f"pushed_items={pushed_items} stats={stats_live}"
             )
@@ -431,7 +460,7 @@ def processar_geocode(file_path):
             if job:
                 prev = job.meta.get("progress", 0)
                 job.meta["progress"] = max(prev, progress)
-                job.meta["step"] = f"Aguardando subjobs ({finished_chunks}/{total_chunks})"
+                job.meta["step"] = f"Localizando enderecos ({finished_chunks}/{total_chunks})"
                 job.meta["status"] = "started"
                 job.save_meta()
 
@@ -446,7 +475,7 @@ def processar_geocode(file_path):
         # CONSOLIDAR
         # =====================================================
         if job:
-            _update_job_meta(job, 85, "Consolidando resultados")
+            _update_job_meta(job, 85, "Organizando os resultados")
 
         raw = redis_str.lrange(redis_results_key, 0, -1)
         logger.info(f"[DEBUG] redis_items={len(raw)}")
@@ -456,7 +485,7 @@ def processar_geocode(file_path):
         for item in raw:
             try:
                 data = json.loads(item)
-                logger.info(f"[REDIS_RAW] {data}")
+                logger.debug(f"[REDIS_RAW] {data}")
             except Exception as e:
                 logger.warning(f"[REDIS][CORRUPTO] erro={e}")
                 continue
@@ -474,7 +503,7 @@ def processar_geocode(file_path):
             if results:
                 try:
                     df_part = pd.DataFrame(results)
-                    logger.info(f"[DF_PART] {df_part.to_dict(orient='records')}")
+                    logger.debug(f"[DF_PART] {df_part.to_dict(orient='records')}")
 
                     if "id" not in df_part.columns:
                         logger.warning(f"[DATAFRAME][SEM_ID] chunk_id={chunk_id}")
@@ -507,8 +536,8 @@ def processar_geocode(file_path):
         del raw
         gc.collect()
 
-        logger.info(f"[DEBUG] total_results_rows={len(df_result)}")
-        logger.info(f"[DEBUG] df_result_columns={df_result.columns.tolist()}")
+        logger.debug(f"[DEBUG] total_results_rows={len(df_result)}")
+        logger.debug(f"[DEBUG] df_result_columns={df_result.columns.tolist()}")
 
         # =====================================================
         # GARANTIAS E DEDUP
@@ -550,8 +579,8 @@ def processar_geocode(file_path):
             .copy()
         )
 
-        logger.info(f"[DEBUG] df_result_dedup={len(df_result)}")
-        logger.info(
+        logger.debug(f"[DEBUG] df_result_dedup={len(df_result)}")
+        logger.debug(
             f"[DEBUG] df_result_dedup_sample={df_result.head(10).to_dict(orient='records')}"
         )
 
@@ -559,8 +588,8 @@ def processar_geocode(file_path):
         # PREPARAR DF ORIGINAL
         # =====================================================
 
-        logger.info(f"[DEBUG] df_ids_sample={df['id'].head(10).tolist()}")
-        logger.info(f"[DEBUG] df_result_ids_sample={df_result['id'].head(10).tolist()}")
+        logger.debug(f"[DEBUG] df_ids_sample={df['id'].head(10).tolist()}")
+        logger.debug(f"[DEBUG] df_result_ids_sample={df_result['id'].head(10).tolist()}")
 
         cols_conflito = ["lat", "lon", "source"]
         cols_existentes = [c for c in cols_conflito if c in df.columns]
@@ -595,17 +624,17 @@ def processar_geocode(file_path):
         logger.info(f"[MERGE] lon_notnull={lon_notnull}")
 
         try:
-            logger.info(
+            logger.debug(
                 f"[MERGE_SAMPLE] {df_final[['id','lat','lon','source']].head(10).to_dict(orient='records')}"
             )
         except Exception as e:
-            logger.warning(f"[MERGE_SAMPLE][ERRO] {e}")
+            logger.debug(f"[MERGE_SAMPLE][ERRO] {e}")
 
         # =====================================================
         # PADRONIZAÇÃO
         # =====================================================
         if job:
-            _update_job_meta(job, 90, "Preparando resultados")
+            _update_job_meta(job, 90, "Conferindo a qualidade final")
 
         colunas_padrao = [
             "cnpj", "razao_social", "nome_fantasia",
@@ -646,7 +675,7 @@ def processar_geocode(file_path):
 
         if not df_validos.empty:
             if job:
-                _update_job_meta(job, 92, "Validando poligono")
+                _update_job_meta(job, 92, "Validando a consistencia dos resultados")
 
             logger.info("[POLIGONO] validação batch iniciada")
 
@@ -684,7 +713,7 @@ def processar_geocode(file_path):
         from geocoding_engine.infrastructure.database_reader import DatabaseReader
 
         if job:
-            _update_job_meta(job, 94, "Reprocessando invalidos")
+            _update_job_meta(job, 94, "Fazendo uma nova conferencia dos casos pendentes")
 
         logger.info("♻ Reprocessamento iniciado")
 
@@ -1107,7 +1136,7 @@ def processar_geocode(file_path):
         # EXCEL
         # =====================================================
         if job:
-            _update_job_meta(job, 97, "Salvando arquivos")
+            _update_job_meta(job, 97, "Preparando sua entrega")
 
         with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
             df_validos_final.to_excel(writer, sheet_name="geocodificados", index=False)
@@ -1186,11 +1215,6 @@ def processar_geocode(file_path):
         records = []
 
         for _, row in result.iterrows():
-
-            logger.info(
-                f"[FINAL_JSON_DEBUG] lat={row['lat']} lon={row['lon']} tipo_lat={type(row['lat'])}"
-            )
-
             records.append({
                 "lat": sanitize_all(row["lat"]),
                 "lon": sanitize_all(row["lon"]),
@@ -1203,8 +1227,7 @@ def processar_geocode(file_path):
         # JSON (ARRAY PARA FRONTEND)
         # =====================================================
 
-        # DEBUG
-        logger.info(f"[JSON_SAMPLE] {records[:3]}")
+        logger.debug(f"[JSON_SAMPLE] {records[:3]}")
 
         with open(output_json, "w", encoding="utf-8") as f:
             json.dump(records, f, ensure_ascii=False)
@@ -1262,7 +1285,7 @@ def processar_geocode(file_path):
         if job:
             job.meta.update({
                 "progress": 100,
-                "step": "Concluído",
+                "step": "Processamento concluido",
                 "status": "finished",
                 "result": {
                     "total": total,

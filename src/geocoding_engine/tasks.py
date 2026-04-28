@@ -32,7 +32,7 @@ def main():
             "tenant_id": args.tenant_id,
             "origem": args.origem,
             "progress": 0,
-            "step": "Criado"
+            "step": "Recebemos sua solicitacao"
         },
         description=f"geocode:{args.arquivo}"
     )

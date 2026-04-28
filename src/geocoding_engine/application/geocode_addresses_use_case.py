@@ -134,21 +134,26 @@ class GeocodeAddressesUseCase:
             to_geocode.append(e)
 
         if cache_candidates:
-            df_cache = pd.DataFrame(cache_candidates)
-            df_cache = validar_municipios_batch_fast(df_cache, None)
+            if validate_polygon:
+                df_cache = pd.DataFrame(cache_candidates)
+                df_cache = validar_municipios_batch_fast(df_cache, None)
 
-            valid_cache_keys = set(
-                df_cache.loc[df_cache["valido_municipio"], "cache_key"].astype(str)
-            )
+                valid_cache_keys = set(
+                    df_cache.loc[df_cache["valido_municipio"], "cache_key"].astype(str)
+                )
 
-            for row in df_cache[df_cache["valido_municipio"]].itertuples(index=False):
-                result_map[row.cache_key] = (row.lat, row.lon, "cache")
-                cache_hits += 1
+                for row in df_cache[df_cache["valido_municipio"]].itertuples(index=False):
+                    result_map[row.cache_key] = (row.lat, row.lon, "cache")
+                    cache_hits += 1
 
-            for e in unique_list:
-                key = e["cache_key"]
-                if key in cache_candidate_keys and key not in valid_cache_keys:
-                    to_geocode.append(e)
+                for e in unique_list:
+                    key = e["cache_key"]
+                    if key in cache_candidate_keys and key not in valid_cache_keys:
+                        to_geocode.append(e)
+            else:
+                for item in cache_candidates:
+                    result_map[item["cache_key"]] = (item["lat"], item["lon"], "cache")
+                    cache_hits += 1
 
         logger.info(f"[CACHE] hits={cache_hits} miss={len(to_geocode)}")
 
