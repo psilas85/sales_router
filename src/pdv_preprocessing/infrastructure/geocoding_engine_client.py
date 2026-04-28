@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Dict, Iterable, Tuple
+from typing import Callable, Dict, Iterable, Tuple
 
 import jwt
 import requests
@@ -138,6 +138,7 @@ class GeocodingEngineClient:
     def geocode_pdv_batch_job(
         self,
         items: Iterable[dict],
+        on_progress: Callable[[int, str | None], None] | None = None,
     ) -> Dict[int, Tuple[float | None, float | None, str]]:
         if not self.enabled:
             raise RuntimeError("GEOCODING_ENGINE_URL não configurada")
@@ -186,8 +187,12 @@ class GeocodingEngineClient:
 
             status_data = status_response.json()
             status = status_data.get("status")
+            progress = int(status_data.get("progress", 0) or 0)
+            step = status_data.get("step")
 
             if status == "finished":
+                if on_progress:
+                    on_progress(100, step or "Geocodificacao concluida")
                 break
 
             if status == "failed":
@@ -195,11 +200,14 @@ class GeocodingEngineClient:
                     f"geocoding_engine job falhou: {status_data.get('error')}"
                 )
 
+            if on_progress:
+                on_progress(progress, step)
+
             logger.info(
                 "[GEOCODING_ENGINE][JOB_WAIT] "
                 f"job_id={job_id} status={status} "
-                f"progress={status_data.get('progress', 0)} "
-                f"step={status_data.get('step', '')}"
+                f"progress={progress} "
+                f"step={step or ''}"
             )
             time.sleep(self.poll_interval)
         else:

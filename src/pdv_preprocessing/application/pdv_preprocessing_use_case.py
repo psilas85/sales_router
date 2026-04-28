@@ -287,7 +287,21 @@ class PDVPreprocessingUseCase:
 
         if self.geo_client.enabled:
             try:
-                resultados_remotos = self.geo_client.geocode_pdv_batch_job(payload)
+                def atualizar_progresso_geocoding_remoto(progress: int, step: str | None):
+                    atualizar_progresso(
+                        max(1, progress),
+                        100,
+                        58,
+                        82,
+                        step or "Geocodificando",
+                    )
+
+                atualizar_progresso(1, 1, 55, 58, "Preparando geocodificacao")
+
+                resultados_remotos = self.geo_client.geocode_pdv_batch_job(
+                    payload,
+                    on_progress=atualizar_progresso_geocoding_remoto,
+                )
                 resultados_remotos.update(resultados_locais)
                 return resultados_remotos
             except Exception as e:
@@ -503,11 +517,12 @@ class PDVPreprocessingUseCase:
             df_validos["pdv_lon"] = None
             df_validos["status_geolocalizacao"] = None
 
-            atualizar_progresso(1, 1, 55, 85, "Geocodificando")
+            atualizar_progresso(1, 1, 55, 58, "Preparando geocodificacao")
 
             resultados_geo = self._geocodificar_pdvs(df_validos)
 
             total_geo = len(df_validos)
+            atualizar_progresso(1, 1, 82, 85, "Consolidando resultados da geocodificacao")
 
             for i, idx in enumerate(df_validos.index):
                 lat, lon, origem = resultados_geo.get(int(idx), (None, None, "falha"))
@@ -516,8 +531,14 @@ class PDVPreprocessingUseCase:
                 df_validos.at[idx, "pdv_lon"] = lon
                 df_validos.at[idx, "status_geolocalizacao"] = origem
 
-                if i % 200 == 0:
-                    atualizar_progresso(i, total_geo, 55, 85, "Geocodificando")
+                if i % 100 == 0:
+                    atualizar_progresso(
+                        i + 1,
+                        total_geo,
+                        82,
+                        85,
+                        "Consolidando resultados da geocodificacao",
+                    )
 
             status_counts = (
                 df_validos["status_geolocalizacao"]
