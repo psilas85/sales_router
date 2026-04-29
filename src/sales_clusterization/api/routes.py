@@ -309,11 +309,11 @@ def listar_historico_clusterizacao(
     where_params = [tenant_id]
 
     if data_inicio:
-        filtros.append("DATE(h.criado_em) >= %s")
+        filtros.append("DATE(h.criado_em AT TIME ZONE 'America/Sao_Paulo') >= %s")
         where_params.append(data_inicio)
 
     if data_fim:
-        filtros.append("DATE(h.criado_em) <= %s")
+        filtros.append("DATE(h.criado_em AT TIME ZONE 'America/Sao_Paulo') <= %s")
         where_params.append(data_fim)
 
     if descricao:
