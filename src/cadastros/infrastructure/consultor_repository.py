@@ -10,8 +10,38 @@ from database.db_connection import get_connection
 
 class ConsultorRepository:
 
+    def _ensure_ativo_column(self, conn) -> None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                ALTER TABLE consultores
+                ADD COLUMN IF NOT EXISTS ativo BOOLEAN
+                """
+            )
+            cur.execute(
+                """
+                UPDATE consultores
+                   SET ativo = TRUE
+                 WHERE ativo IS NULL
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE consultores
+                ALTER COLUMN ativo SET DEFAULT FALSE
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE consultores
+                ALTER COLUMN ativo SET NOT NULL
+                """
+            )
+        conn.commit()
+
     def criar(self, consultor: Consultor) -> Consultor:
         conn = get_connection()
+        self._ensure_ativo_column(conn)
         cur = conn.cursor()
 
         consultor_id = consultor.id or uuid.uuid4()
@@ -20,6 +50,7 @@ class ConsultorRepository:
             INSERT INTO consultores (
                 id,
                 tenant_id,
+                ativo,
                 setor,
                 consultor,
                 cpf,
@@ -38,9 +69,9 @@ class ConsultorRepository:
                 atualizado_em
             )
             VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW()
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW()
             )
-            RETURNING id, tenant_id, setor, consultor, cpf, logradouro, numero, complemento,
+            RETURNING id, tenant_id, ativo, setor, consultor, cpf, logradouro, numero, complemento,
                       bairro, cidade, uf, cep, celular, email, lat, lon, criado_em, atualizado_em
         """
 
@@ -49,6 +80,7 @@ class ConsultorRepository:
             (
                 str(consultor_id),
                 consultor.tenant_id,
+                consultor.ativo,
                 consultor.setor,
                 consultor.consultor,
                 consultor.cpf,
@@ -76,11 +108,12 @@ class ConsultorRepository:
 
     def listar(self, tenant_id: int) -> List[Consultor]:
         conn = get_connection()
+        self._ensure_ativo_column(conn)
         cur = conn.cursor()
 
         query = """
-            SELECT id, tenant_id, setor, consultor, cpf, logradouro, numero, complemento,
-                   bairro, cidade, uf, cep, celular, email, lat, lon, criado_em, atualizado_em
+                 SELECT id, tenant_id, ativo, setor, consultor, cpf, logradouro, numero, complemento,
+                     bairro, cidade, uf, cep, celular, email, lat, lon, criado_em, atualizado_em
             FROM consultores
             WHERE tenant_id = %s
             ORDER BY consultor
@@ -96,11 +129,12 @@ class ConsultorRepository:
 
     def buscar_por_id(self, consultor_id: UUID, tenant_id: int) -> Optional[Consultor]:
         conn = get_connection()
+        self._ensure_ativo_column(conn)
         cur = conn.cursor()
 
         query = """
-            SELECT id, tenant_id, setor, consultor, cpf, logradouro, numero, complemento,
-                   bairro, cidade, uf, cep, celular, email, lat, lon, criado_em, atualizado_em
+                 SELECT id, tenant_id, ativo, setor, consultor, cpf, logradouro, numero, complemento,
+                     bairro, cidade, uf, cep, celular, email, lat, lon, criado_em, atualizado_em
             FROM consultores
             WHERE id = %s
               AND tenant_id = %s
@@ -116,11 +150,13 @@ class ConsultorRepository:
 
     def atualizar(self, consultor: Consultor) -> Optional[Consultor]:
         conn = get_connection()
+        self._ensure_ativo_column(conn)
         cur = conn.cursor()
 
         query = """
             UPDATE consultores
-               SET setor = %s,
+               SET ativo = %s,
+                   setor = %s,
                    consultor = %s,
                    cpf = %s,
                    logradouro = %s,
@@ -137,13 +173,14 @@ class ConsultorRepository:
                    atualizado_em = NOW()
              WHERE id = %s
                AND tenant_id = %s
-         RETURNING id, tenant_id, setor, consultor, cpf, logradouro, numero, complemento,
+         RETURNING id, tenant_id, ativo, setor, consultor, cpf, logradouro, numero, complemento,
                    bairro, cidade, uf, cep, celular, email, lat, lon, criado_em, atualizado_em
         """
 
         cur.execute(
             query,
             (
+                consultor.ativo,
                 consultor.setor,
                 consultor.consultor,
                 consultor.cpf,
@@ -173,6 +210,7 @@ class ConsultorRepository:
 
     def excluir(self, consultor_id: UUID, tenant_id: int) -> bool:
         conn = get_connection()
+        self._ensure_ativo_column(conn)
         cur = conn.cursor()
 
         query = """
@@ -195,20 +233,21 @@ class ConsultorRepository:
         return Consultor(
             id=row[0],
             tenant_id=row[1],
-            setor=row[2],
-            consultor=row[3],
-            cpf=row[4],
-            logradouro=row[5],
-            numero=row[6],
-            complemento=row[7],
-            bairro=row[8],
-            cidade=row[9],
-            uf=row[10],
-            cep=row[11],
-            celular=row[12],
-            email=row[13],
-            lat=row[14],
-            lon=row[15],
-            criado_em=row[16],
-            atualizado_em=row[17],
+            ativo=row[2],
+            setor=row[3],
+            consultor=row[4],
+            cpf=row[5],
+            logradouro=row[6],
+            numero=row[7],
+            complemento=row[8],
+            bairro=row[9],
+            cidade=row[10],
+            uf=row[11],
+            cep=row[12],
+            celular=row[13],
+            email=row[14],
+            lat=row[15],
+            lon=row[16],
+            criado_em=row[17],
+            atualizado_em=row[18],
         )

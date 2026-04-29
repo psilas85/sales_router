@@ -10,6 +10,7 @@ from uuid import UUID
 class Consultor:
     id: Optional[UUID]
     tenant_id: int
+    ativo: bool
     setor: Optional[str]
     consultor: str
     cpf: str

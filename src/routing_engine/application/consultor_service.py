@@ -8,6 +8,36 @@ class ConsultorService:
     def __init__(self, tenant_id: int):
         self.conn = get_db_connection()
         self.tenant_id = tenant_id
+        self._ensure_ativo_column()
+
+    def _ensure_ativo_column(self):
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                ALTER TABLE consultores
+                ADD COLUMN IF NOT EXISTS ativo BOOLEAN
+                """
+            )
+            cur.execute(
+                """
+                UPDATE consultores
+                   SET ativo = TRUE
+                 WHERE ativo IS NULL
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE consultores
+                ALTER COLUMN ativo SET DEFAULT FALSE
+                """
+            )
+            cur.execute(
+                """
+                ALTER TABLE consultores
+                ALTER COLUMN ativo SET NOT NULL
+                """
+            )
+        self.conn.commit()
 
     def get_base(self, consultor: str):
 
@@ -16,6 +46,7 @@ class ConsultorService:
             FROM consultores
             WHERE tenant_id = %s
               AND consultor = %s
+                            AND ativo = TRUE
         """
 
         with self.conn.cursor() as cur:
@@ -38,6 +69,7 @@ class ConsultorService:
             SELECT DISTINCT UPPER(consultor)
             FROM consultores
             WHERE tenant_id = %s
+                            AND ativo = TRUE
         """
 
         with self.conn.cursor() as cur:

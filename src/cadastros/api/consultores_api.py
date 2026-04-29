@@ -6,6 +6,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, EmailStr
+from psycopg2.errors import UniqueViolation
 
 from cadastros.application.consultor_use_case import ConsultorUseCase
 from cadastros.entities.consultor_entity import Consultor
@@ -25,6 +26,7 @@ use_case = ConsultorUseCase()
 # ============================================================
 
 class ConsultorCreateSchema(BaseModel):
+    ativo: bool = False
     setor: Optional[str] = Field(default=None, max_length=10)
     consultor: str = Field(..., min_length=2, max_length=120)
     cpf: str = Field(..., regex=r"^\d{11}$")
@@ -43,6 +45,7 @@ class ConsultorCreateSchema(BaseModel):
 
 
 class ConsultorUpdateSchema(BaseModel):
+    ativo: Optional[bool] = None
     setor: Optional[str] = Field(default=None, max_length=10)
     consultor: Optional[str] = Field(default=None, min_length=2, max_length=120)
     logradouro: Optional[str] = Field(default=None, max_length=200)
@@ -62,6 +65,7 @@ class ConsultorUpdateSchema(BaseModel):
 class ConsultorResponseSchema(BaseModel):
     id: UUID
     tenant_id: int
+    ativo: bool
     setor: Optional[str]
     consultor: str
     cpf: Optional[str]
@@ -110,6 +114,7 @@ def criar_consultor(payload: ConsultorCreateSchema, request: Request):
     consultor = Consultor(
         id=None,
         tenant_id=tenant_id,
+        ativo=payload.ativo,
         setor=payload.setor,
         consultor=payload.consultor,
         cpf=payload.cpf,
@@ -126,7 +131,13 @@ def criar_consultor(payload: ConsultorCreateSchema, request: Request):
         lon=payload.lon,
     )
 
-    criado = use_case.criar(consultor)
+    try:
+        criado = use_case.criar(consultor)
+    except UniqueViolation as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Ja existe um consultor com este CPF neste tenant."
+        ) from exc
 
     return to_schema(criado)
 
@@ -201,6 +212,7 @@ def atualizar_consultor(
     consultor = Consultor(
         id=consultor_id,
         tenant_id=tenant_id,
+        ativo=payload.ativo if payload.ativo is not None else existente.ativo,
         setor=payload.setor or existente.setor,
         consultor=payload.consultor or existente.consultor,
         cpf=existente.cpf,
