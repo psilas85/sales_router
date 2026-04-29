@@ -1,6 +1,5 @@
 # sales_router/src/routing_engine/routing_task_parallel.py
 
-import json
 import time
 from rq import get_current_job
 from loguru import logger
@@ -17,10 +16,12 @@ from routing_engine.domain.entities import RouteGroup, PDVData
 # 🔥 SUBJOB (1 GRUPO = 1 WORKER)
 # =========================================================
 def executar_routing_subjob(payload: dict):
-
     grupo_id = payload["grupo_id"]
     lista_pdvs = payload["pdvs"]
     params = payload["params"]
+    group_type = payload.get("group_type", "consultor")
+    centro_lat = payload.get("centro_lat")
+    centro_lon = payload.get("centro_lon")
 
     # 🔒 isolamento total
     distance_service = RouteDistanceService()
@@ -29,29 +30,30 @@ def executar_routing_subjob(payload: dict):
         v_kmh=params.get("v_kmh", 60.0),
         service_min=params.get("service_min", 30.0),
         alpha_path=params.get("alpha_path", 1.3),
+        preserve_sequence=params.get("preserve_sequence", False),
         distance_service=distance_service
     )
 
-    consultor_service = ConsultorService(params.get("tenant_id", 1))
+    if centro_lat is None or centro_lon is None:
+        consultor_service = ConsultorService(params["tenant_id"])
+        consultor = str(grupo_id).strip().upper()
 
-    consultor = str(grupo_id).strip().upper()
-
-    try:
-        base_lat, base_lon = consultor_service.get_base(consultor)
-    except Exception as e:
-        return {
-            "erro": f"Consultor não encontrado: {consultor}",
-            "grupo_id": grupo_id,
-            "qtd_pdvs": len(lista_pdvs)
-        }
+        try:
+            centro_lat, centro_lon = consultor_service.get_base(consultor)
+        except Exception:
+            return {
+                "erro": f"Consultor não encontrado: {consultor}",
+                "grupo_id": grupo_id,
+                "qtd_pdvs": len(lista_pdvs)
+            }
 
     pdvs = [PDVData(**p) for p in lista_pdvs]
 
     route_group = RouteGroup(
         group_id=grupo_id,
-        group_type="consultor",
-        centro_lat=base_lat,
-        centro_lon=base_lon,
+        group_type=group_type,
+        centro_lat=float(centro_lat),
+        centro_lon=float(centro_lon),
         n_pdvs=len(pdvs),
         pdvs=pdvs
     )
@@ -64,6 +66,7 @@ def executar_routing_subjob(payload: dict):
         aplicar_two_opt=params.get("aplicar_two_opt", True),
         min_pdvs_rota=params.get("min_pdvs_rota", 8),
         max_pdvs_rota=params.get("max_pdvs_rota", 12),
+        modo_calculo=params.get("modo_calculo", "frequencia"),
     )
     stats = distance_service.get_stats()
 
@@ -76,27 +79,46 @@ def executar_routing_subjob(payload: dict):
 # =========================================================
 # 🚀 JOB PRINCIPAL (ORQUESTRADOR)
 # =========================================================
-from rq import get_current_job
-import time
-
 def executar_routing_job(grupos_dict, params):
-
     job = get_current_job()
     queue = get_queue("routing_subjobs")
 
     jobs = []
 
-    total = len(grupos_dict)
+    if isinstance(grupos_dict, dict):
+        prepared_groups = [
+            {
+                "grupo_id": grupo_id,
+                "group_type": "consultor",
+                "pdvs": [p.__dict__ for p in lista_pdvs],
+            }
+            for grupo_id, lista_pdvs in grupos_dict.items()
+        ]
+    else:
+        prepared_groups = [
+            {
+                "grupo_id": group["group_id"],
+                "group_type": group.get("group_type", "cluster"),
+                "centro_lat": group.get("centro_lat"),
+                "centro_lon": group.get("centro_lon"),
+                "pdvs": group["pdvs"],
+            }
+            for group in grupos_dict
+        ]
+
+    total = len(prepared_groups)
     enviados = 0
 
     # =====================================================
     # DISPARA SUBJOBS
     # =====================================================
-    for grupo_id, lista_pdvs in grupos_dict.items():
-
+    for group in prepared_groups:
         payload = {
-            "grupo_id": grupo_id,
-            "pdvs": [p.__dict__ for p in lista_pdvs],
+            "grupo_id": group["grupo_id"],
+            "group_type": group.get("group_type", "consultor"),
+            "centro_lat": group.get("centro_lat"),
+            "centro_lon": group.get("centro_lon"),
+            "pdvs": group["pdvs"],
             "params": params
         }
 

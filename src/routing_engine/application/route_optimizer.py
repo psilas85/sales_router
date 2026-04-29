@@ -15,11 +15,13 @@ class RouteOptimizer:
         v_kmh: float,
         service_min: float,
         alpha_path: float,
+        preserve_sequence: bool = False,
         distance_service: RouteDistanceService | None = None,
     ):
         self.v_kmh = float(v_kmh)
         self.service_min = float(service_min)
         self.alpha_path = float(alpha_path)
+        self.preserve_sequence = bool(preserve_sequence)
 
         self.distance_service = distance_service or RouteDistanceService(
             v_kmh=v_kmh,
@@ -126,7 +128,13 @@ class RouteOptimizer:
         # 4) calcula geometria final de forma consistente
         try:
             result = self.distance_service.get_full_route(coords_list)
-
+            if self.preserve_sequence:
+                result = self.distance_service.get_full_route(
+                    coords_list,
+                    preserve_sequence=True,
+                )
+            else:
+                result = self.distance_service.get_full_route(coords_list)
             rota_coords = result.get("rota_coord", [])
             total_km = float(result.get("distancia_km", 0.0))
             total_min = float(result.get("tempo_min", 0.0))

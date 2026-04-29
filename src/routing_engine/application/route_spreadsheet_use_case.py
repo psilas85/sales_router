@@ -4,23 +4,16 @@ from __future__ import annotations
 
 import time
 import uuid
-import os
 from typing import List, Dict
-import math
 
 import pandas as pd
 from loguru import logger
 
-from routing_engine.routing_task_parallel import executar_routing_job
-
 from routing_engine.services.spreadsheet_loader_service import SpreadsheetLoaderService
 from routing_engine.domain.spreadsheet_validator import SpreadsheetValidator
-from routing_engine.domain.entities import PDVData, RouteGroup
-
-from routing_engine.application.balanced_subcluster_splitter import dividir_grupo_em_rotas_balanceadas
-from routing_engine.application.route_optimizer import RouteOptimizer
-from routing_engine.application.route_distance_service import RouteDistanceService
+from routing_engine.domain.entities import PDVData
 from routing_engine.application.consultor_service import ConsultorService
+from routing_engine.application.prepared_groups_routing_use_case import PreparedGroupsRoutingUseCase
 
 from routing_engine.infrastructure.routing_history_repository import RoutingHistoryRepository
 from routing_engine.utils.excel_exporter import ExcelExporter
@@ -29,52 +22,11 @@ from routing_engine.utils.excel_exporter import ExcelExporter
 class RouteSpreadsheetUseCase:
 
     def __init__(self):
-
         self.loader = SpreadsheetLoaderService()
         self.validator = None
-
-        
         self.history_repo = RoutingHistoryRepository()
         self.exporter = ExcelExporter()
-
-    def _processar_grupo(
-        self,
-        grupo_id,
-        lista_pdvs,
-        consultor_service,
-        dias_uteis,
-        freq_visita,
-        aplicar_two_opt,
-        min_pdvs_rota,
-        max_pdvs_rota
-    ):
-        fonte = lista_pdvs[0].fonte_grupo
-
-        if fonte != "consultor":
-            raise ValueError("Modo atual exige agrupamento por consultor")
-
-        consultor = str(grupo_id).strip().upper()
-
-        base_lat, base_lon = consultor_service.get_base(consultor)
-
-        route_group = RouteGroup(
-            group_id=grupo_id,
-            group_type=fonte,
-            centro_lat=base_lat,
-            centro_lon=base_lon,
-            n_pdvs=len(lista_pdvs),
-            pdvs=lista_pdvs
-        )
-
-        return dividir_grupo_em_rotas_balanceadas(
-            route_group=route_group,
-            dias_uteis=dias_uteis,
-            freq_padrao=freq_visita,
-            route_optimizer=self.route_optimizer,
-            aplicar_two_opt=aplicar_two_opt,
-            min_pdvs_rota=min_pdvs_rota,
-            max_pdvs_rota=max_pdvs_rota
-        )
+        self.prepared_groups_use_case = PreparedGroupsRoutingUseCase()
 
     def execute(
         self,
@@ -143,20 +95,40 @@ class RouteSpreadsheetUseCase:
 
         total_grupos = len(grupos_dict)
 
+        consultor_service = ConsultorService(tenant_id)
+        prepared_groups = []
+
+        for grupo_id, lista_pdvs in grupos_dict.items():
+            consultor = str(grupo_id).strip().upper()
+            base_lat, base_lon = consultor_service.get_base(consultor)
+
+            prepared_groups.append(
+                {
+                    "group_id": grupo_id,
+                    "group_type": "consultor",
+                    "centro_lat": base_lat,
+                    "centro_lon": base_lon,
+                    "pdvs": [p.__dict__ for p in lista_pdvs],
+                }
+            )
+
         # =========================================================
         # EXECUÇÃO PARALELA
         # =========================================================
-        resultados, stats, falhados = executar_routing_job(grupos_dict, {
-            "tenant_id": tenant_id,
-            "dias_uteis": dias_uteis,
-            "freq_visita": freq_visita,
-            "min_pdvs_rota": min_pdvs_rota,
-            "max_pdvs_rota": max_pdvs_rota,
-            "aplicar_two_opt": aplicar_two_opt,
-            "v_kmh": 60.0,
-            "service_min": 30.0,
-            "alpha_path": 1.3
-        })
+        resultados, stats, falhados = self.prepared_groups_use_case.execute(
+            prepared_groups,
+            tenant_id=tenant_id,
+            dias_uteis=dias_uteis,
+            freq_visita=freq_visita,
+            min_pdvs_rota=min_pdvs_rota,
+            max_pdvs_rota=max_pdvs_rota,
+            aplicar_two_opt=aplicar_two_opt,
+            modo_calculo="frequencia",
+            preserve_sequence=False,
+            v_kmh=60.0,
+            service_min=30.0,
+            alpha_path=1.3,
+        )
 
         stats = stats or {}
 

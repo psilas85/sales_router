@@ -169,6 +169,7 @@ def dividir_grupo_em_rotas_balanceadas(
     aplicar_two_opt: bool = False,
     min_pdvs_rota: int = 8,
     max_pdvs_rota: int = 12,
+    modo_calculo: str = "frequencia",
 ) -> Dict[str, Any]:
     pdvs_group = route_group.pdvs
 
@@ -187,14 +188,32 @@ def dividir_grupo_em_rotas_balanceadas(
         p.freq_visita = getattr(p, "freq_visita", freq_padrao)
 
     total_pdvs = len(pdvs_group)
-    freq = max(1, int(freq_padrao or 1))
-    k_inicial = max(1, dias_uteis // freq)
-    k_inicial = min(k_inicial, total_pdvs)
+    visitas_totais = sum(float(p.freq_visita) for p in pdvs_group)
 
-    logger.info(
-        f"📦 Grupo={route_group.group_id} | tipo={route_group.group_type} | "
-        f"PDVs={total_pdvs} | dias_uteis={dias_uteis} | freq={freq} | k_inicial={k_inicial}"
-    )
+    if modo_calculo == "frequencia":
+        freq = max(1, int(freq_padrao or 1))
+        k_inicial = max(1, dias_uteis // freq)
+        logger.info(
+            f"📦 Grupo={route_group.group_id} | tipo={route_group.group_type} | "
+            f"modo=freq | PDVs={total_pdvs} | dias_uteis={dias_uteis} | freq={freq} | "
+            f"k_inicial={k_inicial}"
+        )
+    elif modo_calculo == "proporcional":
+        k_inicial = max(1, math.ceil(visitas_totais / dias_uteis))
+        logger.info(
+            f"📦 Grupo={route_group.group_id} | tipo={route_group.group_type} | "
+            f"modo=proporcional | visitas_totais={visitas_totais:.1f} | dias_uteis={dias_uteis} | "
+            f"k_inicial={k_inicial}"
+        )
+    else:
+        k_inicial = max(1, math.ceil(total_pdvs / max_pdvs_rota))
+        logger.info(
+            f"📦 Grupo={route_group.group_id} | tipo={route_group.group_type} | "
+            f"modo=capacidade | PDVs={total_pdvs} | max_pdvs_rota={max_pdvs_rota} | "
+            f"k_inicial={k_inicial}"
+        )
+
+    k_inicial = min(k_inicial, total_pdvs)
 
     coords = _coord_array(pdvs_group)
     kmeans = KMeans(n_clusters=k_inicial, random_state=42, n_init="auto").fit(coords)

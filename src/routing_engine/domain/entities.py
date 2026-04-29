@@ -7,28 +7,29 @@ from typing import Optional, List, Dict
 @dataclass
 class PDVData:
     pdv_id: int
-    cnpj: str
-    nome_fantasia: Optional[str]
-    logradouro: str
-    numero: Optional[str]
-    bairro: Optional[str]
     cidade: str
     uf: str
-    cep: Optional[str]
-    grupo_utilizado: str
-    fonte_grupo: str  # "setor" ou "consultor"
     lat: float
     lon: float
+    cnpj: Optional[str] = None
+    nome_fantasia: Optional[str] = None
+    logradouro: Optional[str] = None
+    numero: Optional[str] = None
+    bairro: Optional[str] = None
+    cep: Optional[str] = None
+    grupo_utilizado: Optional[str] = None
+    fonte_grupo: Optional[str] = None  # "setor" ou "consultor"
     freq_visita: float = 1.0
 
     @property
     def endereco_completo(self) -> str:
+        logradouro = (self.logradouro or "Endereco nao informado").strip()
         numero = (self.numero or "").strip() or "S/N"
         bairro = (self.bairro or "").strip()
         cep = (self.cep or "").strip()
 
         partes = [
-            f"{self.logradouro}, {numero}",
+            f"{logradouro}, {numero}",
             bairro if bairro else None,
             f"{self.cidade} - {self.uf}",
             cep if cep else None,

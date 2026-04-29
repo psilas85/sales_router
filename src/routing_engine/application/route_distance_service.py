@@ -119,7 +119,11 @@ class RouteDistanceService:
     # =========================================================
     # 🧭 Rota completa híbrida
     # =========================================================
-    def get_full_route(self, coords: list[tuple[float, float]]) -> dict:
+    def get_full_route(
+        self,
+        coords: list[tuple[float, float]],
+        preserve_sequence: bool = False,
+    ) -> dict:
         coords = self._normalize_input_coords(coords)
 
         if len(coords) < 2:
@@ -129,6 +133,26 @@ class RouteDistanceService:
                 "rota_coord": [],
                 "fonte": "empty",
             }
+
+        # 1) tenta rota completa preservando a ordem calculada
+        if preserve_sequence:
+            try:
+                result = self._from_osrm_route(coords)
+                if self._is_valid_full_route(result):
+                    self.req_count += 1
+                    self.req_osrm += 1
+                    if self.req_count % 50 == 0:
+                        self._log_progresso()
+
+                    return {
+                        "distancia_km": round(float(result["distancia_km"]), 3),
+                        "tempo_min": round(float(result["tempo_min"]), 1),
+                        "rota_coord": self._clean_coords(result["rota_coord"]),
+                        "fonte": "osrm_route",
+                    }
+                raise Exception("Route inválida")
+            except Exception as e:
+                logger.warning(f"⚠️ OSRM route falhou ({e}) — fallback segmentado")
 
         # 1) tenta trip otimizado
         try:
@@ -216,6 +240,46 @@ class RouteDistanceService:
         rota_coord = [
             {"lat": lat, "lon": lon}
             for lon, lat in trip["geometry"]["coordinates"]
+        ]
+
+        return {
+            "distancia_km": dist_km,
+            "tempo_min": tempo_min,
+            "rota_coord": rota_coord,
+        }
+
+    def _from_osrm_route(
+        self,
+        coords: list[tuple[float, float]],
+    ) -> dict:
+        coords_str = ";".join([f"{lon},{lat}" for lat, lon in coords])
+
+        url = (
+            f"{self.osrm_url}/route/v1/driving/"
+            f"{coords_str}?overview=full&geometries=geojson"
+        )
+
+        resp = requests.get(url, timeout=12)
+        if resp.status_code != 200:
+            raise Exception(f"HTTP {resp.status_code}")
+
+        data = resp.json()
+
+        if data.get("code") != "Ok" or not data.get("routes"):
+            raise Exception("OSRM route sem rota válida")
+
+        route = data["routes"][0]
+        dist_km = route["distance"] / 1000
+        tempo_min = route["duration"] / 60
+
+        if dist_km < 0.05 or tempo_min < 0.05:
+            raise Exception(
+                f"Route nula OSRM ({dist_km:.2f} km / {tempo_min:.2f} min)"
+            )
+
+        rota_coord = [
+            {"lat": lat, "lon": lon}
+            for lon, lat in route["geometry"]["coordinates"]
         ]
 
         return {
