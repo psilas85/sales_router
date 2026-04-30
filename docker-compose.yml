@@ -236,38 +236,6 @@ services:
     restart: always
 
   # ======================
-  # Motor de Roteirização (Routing Engine)
-  # ======================
-  routing_engine:
-    build:
-      context: .
-      dockerfile: ./src/routing_engine/Dockerfile.routing
-    container_name: routing_engine
-    env_file:
-      - .env
-    environment:
-      - PYTHONPATH=/app/src
-      - DB_HOST=sales_router_db
-      - DB_PORT=5432
-    depends_on:
-      - sales_router_db
-      - redis
-    volumes:
-      - ./src/routing_engine:/app/src/routing_engine
-      - ./src/database:/app/src/database
-      - ./output:/app/output
-      - ./data:/app/data
-    expose:
-      - "8008"
-    ports:
-      - "8015:8008"
-    networks:
-      - sales_router_net
-    restart: always
-
-
-
-  # ======================
   # Banco de Dados (PostgreSQL + PostGIS)
   # ======================
   sales_router_db:
@@ -315,7 +283,7 @@ services:
       - authentication_service
       - pdv_preprocessing
       - sales_routing
-      - routing_engine
+      - sales_router_frontend
     volumes:
       - ./src/api_gateway/nginx.conf:/etc/nginx/conf.d/sales_router.conf:ro
       - ./output:/app/output
@@ -414,6 +382,8 @@ services:
     command: >
       sh -c "rq worker -u redis://redis:6379/0 routing_subjobs"
     restart: always
+    deploy:
+      replicas: 2
 
   # ======================
   # Routing Engine Prepared Groups Worker (RQ)
@@ -433,7 +403,6 @@ services:
     depends_on:
       - redis
       - sales_router_db
-      - routing_engine
     volumes:
       - ./src/routing_engine:/app/src/routing_engine
       - ./src/database:/app/src/database

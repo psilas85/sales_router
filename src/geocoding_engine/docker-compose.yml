@@ -110,6 +110,9 @@ services:
 
     restart: always
 
+    deploy:
+      replicas: 2
+
 networks:
 
   sales_router_net:

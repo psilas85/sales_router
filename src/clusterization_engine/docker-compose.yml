@@ -1,0 +1,90 @@
+#sales_router/src/clusterization_engine/docker-compose.yml
+
+services:
+
+  clusterization_engine:
+
+    build:
+      context: ../..
+      dockerfile: ./src/clusterization_engine/Dockerfile.clusterization_engine
+
+    container_name: clusterization_engine
+
+    env_file:
+      - ../../.env
+
+    environment:
+      - PYTHONPATH=/app/src
+      - DB_HOST=sales_router_db
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-sales_routing_db}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_URL=redis://redis:6379/0
+
+    volumes:
+      - ../../src/clusterization_engine:/app/src/clusterization_engine
+      - ../../src/database:/app/src/database
+      - ../../data:/app/data
+      - ../../output:/app/output
+
+    ports:
+      - "8016:8009"
+
+    networks:
+      - sales_router_net
+
+    restart: always
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8009/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+
+  clusterization_jobs_engine:
+
+    build:
+      context: ../..
+      dockerfile: ./src/clusterization_engine/Dockerfile.clusterization_engine
+
+    container_name: clusterization_jobs_engine
+
+    env_file:
+      - ../../.env
+
+    environment:
+      - PYTHONPATH=/app/src
+      - DB_HOST=sales_router_db
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-sales_routing_db}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_URL=redis://redis:6379/0
+      - CLUSTERIZATION_ENGINE_JOB_TIMEOUT=${CLUSTERIZATION_ENGINE_JOB_TIMEOUT:-1800}
+
+    depends_on:
+      - clusterization_engine
+
+    volumes:
+      - ../../src/clusterization_engine:/app/src/clusterization_engine
+      - ../../src/database:/app/src/database
+      - ../../data:/app/data
+      - ../../output:/app/output
+
+    networks:
+      - sales_router_net
+
+    command: >
+      rq worker -v -u redis://redis:6379/0 clusterization_engine_jobs
+
+    restart: always
+
+networks:
+  sales_router_net:
+    external: true

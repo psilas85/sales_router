@@ -1,0 +1,24 @@
+FROM psilas85/sales_router-base:latest
+
+WORKDIR /app
+
+ENV PYTHONPATH=/app/src
+
+# ----------------------------------------------------
+# dependências
+# ----------------------------------------------------
+
+COPY ./requirements.txt /tmp/requirements.txt
+
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# ----------------------------------------------------
+# código
+# ----------------------------------------------------
+
+COPY src/clusterization_engine ./src/clusterization_engine
+COPY src/database ./src/database
+
+EXPOSE 8009
+
+CMD ["uvicorn", "clusterization_engine.api.main:app", "--host", "0.0.0.0", "--port", "8009"]
