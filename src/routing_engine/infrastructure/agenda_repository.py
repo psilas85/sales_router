@@ -52,8 +52,18 @@ CREATE TABLE IF NOT EXISTS agenda_visita (
     cidade          VARCHAR,
     uf              VARCHAR,
     lat             DOUBLE PRECISION,
-    lon             DOUBLE PRECISION
+    lon             DOUBLE PRECISION,
+    status          VARCHAR(20) NOT NULL DEFAULT 'a_realizar',
+    data_realizacao DATE,
+    data_prevista   DATE
 );
+"""
+
+# Idempotent migrations for tables that already exist without the new columns
+_MIGRATIONS = """
+ALTER TABLE agenda_visita ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'a_realizar';
+ALTER TABLE agenda_visita ADD COLUMN IF NOT EXISTS data_realizacao DATE;
+ALTER TABLE agenda_visita ADD COLUMN IF NOT EXISTS data_prevista DATE;
 """
 
 
@@ -62,6 +72,7 @@ def ensure_schema() -> None:
     try:
         with conn.cursor() as cur:
             cur.execute(_DDL)
+            cur.execute(_MIGRATIONS)
         conn.commit()
     finally:
         conn.close()
@@ -155,7 +166,7 @@ def criar_agenda(
 
 
 # ─────────────────────────────────────────────
-# READ
+# READ — agenda + rotas + visitas (nested)
 # ─────────────────────────────────────────────
 
 def buscar_agenda(agenda_id: str, tenant_id: int) -> Optional[dict]:
@@ -234,45 +245,70 @@ def buscar_agenda(agenda_id: str, tenant_id: int) -> Optional[dict]:
 
 
 # ─────────────────────────────────────────────
-# PATCH DATE
+# READ — flat visita list with effective status
 # ─────────────────────────────────────────────
 
-def atualizar_data_rota(
-    rota_id: str,
-    tenant_id: int,
-    nova_data: date,
-) -> Optional[dict]:
+def _effective_status(stored_status: str, data_efetiva: date, today: date) -> str:
+    """Computes display status from stored value and effective planned date."""
+    if stored_status in ("realizada", "cancelada"):
+        return stored_status
+    return "vencida" if data_efetiva < today else "a_realizar"
+
+
+def listar_visitas_flat(agenda_id: str, tenant_id: int) -> list[dict]:
+    """Returns all PDVs as a flat list. Status is effective: 'vencida' when a_realizar + date past."""
     ensure_schema()
+    today = date.today()
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE agenda_rota
-                SET data = %s, data_alterada_manualmente = TRUE
-                WHERE id = %s AND tenant_id = %s
-                RETURNING id, consultor, rota_id, data, data_alterada_manualmente,
-                          distancia_km, tempo_min, qtd_pdvs
+                SELECT
+                    v.id, v.agenda_rota_id, v.consultor, v.sequencia,
+                    v.cnpj, v.nome_fantasia, v.cidade, v.uf,
+                    v.status, v.data_realizacao, v.data_prevista,
+                    r.rota_id, r.data AS data_rota
+                FROM agenda_visita v
+                JOIN agenda_rota r ON r.id = v.agenda_rota_id
+                WHERE v.agenda_id = %s AND v.tenant_id = %s
+                ORDER BY v.consultor, r.data, v.sequencia
                 """,
-                (nova_data, rota_id, tenant_id),
+                (agenda_id, tenant_id),
             )
-            row = cur.fetchone()
-            if not row:
-                return None
-        conn.commit()
-        return {
-            "id": str(row[0]),
-            "consultor": row[1],
-            "rota_id": row[2],
-            "data": row[3].isoformat(),
-            "data_alterada_manualmente": row[4],
-            "distancia_km": row[5],
-            "tempo_min": row[6],
-            "qtd_pdvs": row[7],
-        }
+            rows = cur.fetchall()
+
+        result = []
+        for row in rows:
+            stored_status = row[8]
+            data_prevista: Optional[date] = row[10]
+            data_rota: date = row[12]
+            data_efetiva = data_prevista if data_prevista else data_rota
+
+            result.append({
+                "id": str(row[0]),
+                "agenda_rota_id": str(row[1]),
+                "consultor": row[2],
+                "sequencia": row[3],
+                "cnpj": row[4],
+                "nome_fantasia": row[5],
+                "cidade": row[6],
+                "uf": row[7],
+                "status": _effective_status(stored_status, data_efetiva, today),
+                "data_realizacao": row[9].isoformat() if row[9] else None,
+                "data_prevista": data_prevista.isoformat() if data_prevista else None,
+                "rota_id": row[11],
+                "data_rota": data_rota.isoformat(),
+                "data_efetiva": data_efetiva.isoformat(),
+            })
+        return result
     finally:
         conn.close()
 
+
+# ─────────────────────────────────────────────
+# LIST agendas
+# ─────────────────────────────────────────────
 
 def listar_agendas(tenant_id: int) -> list[dict]:
     ensure_schema()
@@ -312,6 +348,197 @@ def listar_agendas(tenant_id: int) -> list[dict]:
     finally:
         conn.close()
 
+
+# ─────────────────────────────────────────────
+# PATCH — rota date
+# ─────────────────────────────────────────────
+
+def atualizar_data_rota(
+    rota_id: str,
+    tenant_id: int,
+    nova_data: date,
+) -> Optional[dict]:
+    ensure_schema()
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE agenda_rota
+                SET data = %s, data_alterada_manualmente = TRUE
+                WHERE id = %s AND tenant_id = %s
+                RETURNING id, consultor, rota_id, data, data_alterada_manualmente,
+                          distancia_km, tempo_min, qtd_pdvs
+                """,
+                (nova_data, rota_id, tenant_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+        conn.commit()
+        return {
+            "id": str(row[0]),
+            "consultor": row[1],
+            "rota_id": row[2],
+            "data": row[3].isoformat(),
+            "data_alterada_manualmente": row[4],
+            "distancia_km": row[5],
+            "tempo_min": row[6],
+            "qtd_pdvs": row[7],
+        }
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────
+# PATCH — visita status (single)
+# ─────────────────────────────────────────────
+
+def atualizar_status_visita(
+    visita_id: str,
+    tenant_id: int,
+    status: Optional[str] = None,
+    data_realizacao: Optional[date] = None,
+    data_prevista: Optional[date] = None,
+    limpar_data_prevista: bool = False,
+) -> Optional[dict]:
+    """Updates any combination of status, data_realizacao, and data_prevista for a single visita."""
+    ensure_schema()
+    today = date.today()
+
+    set_parts: list[str] = []
+    params: list = []
+
+    if status is not None:
+        set_parts.append("status = %s")
+        params.append(status)
+        # Clear realization date when un-doing a visit
+        if status in ("a_realizar", "cancelada"):
+            set_parts.append("data_realizacao = NULL")
+    if data_realizacao is not None:
+        set_parts.append("data_realizacao = %s")
+        params.append(data_realizacao)
+    if limpar_data_prevista:
+        set_parts.append("data_prevista = NULL")
+    elif data_prevista is not None:
+        set_parts.append("data_prevista = %s")
+        params.append(data_prevista)
+
+    if not set_parts:
+        return None
+
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE agenda_visita
+                SET {", ".join(set_parts)}
+                WHERE id = %s AND tenant_id = %s
+                RETURNING id, agenda_rota_id, consultor, sequencia,
+                          cnpj, nome_fantasia, cidade, uf,
+                          status, data_realizacao, data_prevista
+                """,
+                [*params, visita_id, tenant_id],
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            cur.execute(
+                "SELECT rota_id, data FROM agenda_rota WHERE id = %s",
+                (str(row[1]),),
+            )
+            rota_row = cur.fetchone()
+        conn.commit()
+
+        if not rota_row:
+            return None
+
+        data_prevista_val: Optional[date] = row[10]
+        data_rota_val: date = rota_row[1]
+        data_efetiva = data_prevista_val if data_prevista_val else data_rota_val
+
+        return {
+            "id": str(row[0]),
+            "agenda_rota_id": str(row[1]),
+            "consultor": row[2],
+            "sequencia": row[3],
+            "cnpj": row[4],
+            "nome_fantasia": row[5],
+            "cidade": row[6],
+            "uf": row[7],
+            "status": _effective_status(row[8], data_efetiva, today),
+            "data_realizacao": row[9].isoformat() if row[9] else None,
+            "data_prevista": data_prevista_val.isoformat() if data_prevista_val else None,
+            "rota_id": rota_row[0],
+            "data_rota": data_rota_val.isoformat(),
+            "data_efetiva": data_efetiva.isoformat(),
+        }
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────
+# PATCH — visita status / date (bulk)
+# ─────────────────────────────────────────────
+
+def atualizar_status_visitas_lote(
+    agenda_id: str,
+    tenant_id: int,
+    visita_ids: list[str],
+    status: Optional[str] = None,
+    data_realizacao: Optional[date] = None,
+    data_prevista: Optional[date] = None,
+    limpar_data_prevista: bool = False,
+) -> int:
+    """Bulk-updates status/dates for multiple visitas. Returns number of rows updated."""
+    if not visita_ids:
+        return 0
+
+    set_parts: list[str] = []
+    params: list = []
+
+    if status is not None:
+        set_parts.append("status = %s")
+        params.append(status)
+        if status in ("a_realizar", "cancelada"):
+            set_parts.append("data_realizacao = NULL")
+    if data_realizacao is not None:
+        set_parts.append("data_realizacao = %s")
+        params.append(data_realizacao)
+    if limpar_data_prevista:
+        set_parts.append("data_prevista = NULL")
+    elif data_prevista is not None:
+        set_parts.append("data_prevista = %s")
+        params.append(data_prevista)
+
+    if not set_parts:
+        return 0
+
+    ensure_schema()
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE agenda_visita
+                SET {", ".join(set_parts)}
+                WHERE id = ANY(%s::uuid[])
+                  AND agenda_id = %s
+                  AND tenant_id = %s
+                """,
+                [*params, visita_ids, agenda_id, tenant_id],
+            )
+            updated = cur.rowcount
+        conn.commit()
+        return updated
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────
+# READ — occupied dates per consultant
+# ─────────────────────────────────────────────
 
 def datas_ocupadas_consultor(agenda_id: str, consultor: str, tenant_id: int) -> list[str]:
     """Returns ISO dates already assigned to a consultant in an agenda."""

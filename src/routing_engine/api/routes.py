@@ -18,6 +18,7 @@ from routing_engine.infrastructure.agenda_repository import (
     AgendaRotaRow, AgendaVisitaRow,
     criar_agenda, buscar_agenda, listar_agendas,
     atualizar_data_rota, datas_ocupadas_consultor,
+    listar_visitas_flat, atualizar_status_visita, atualizar_status_visitas_lote,
 )
 
 from rq.job import Job
@@ -90,6 +91,24 @@ class CriarAgendaRequest(BaseModel):
 
 class AtualizarDataRotaRequest(BaseModel):
     nova_data: date
+
+
+_STATUS_VALIDOS = {"a_realizar", "realizada", "cancelada"}
+
+
+class AtualizarStatusVisitaRequest(BaseModel):
+    status: Optional[str] = None          # 'a_realizar' | 'realizada' | 'cancelada'
+    data_realizacao: Optional[date] = None
+    data_prevista: Optional[date] = None  # reschedule override for planned date
+    limpar_data_prevista: bool = False    # set True to clear the override
+
+
+class AtualizarStatusVisitasLoteRequest(BaseModel):
+    visita_ids: list[str]
+    status: Optional[str] = None
+    data_realizacao: Optional[date] = None
+    data_prevista: Optional[date] = None
+    limpar_data_prevista: bool = False
 
 
 # ============================================================
@@ -533,6 +552,62 @@ def exportar_agenda_route(agenda_id: str, request: Request):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="agenda_{nome_arquivo}.xlsx"'},
     )
+
+
+@router.get(
+    "/agenda/{agenda_id}/visitas",
+    dependencies=[Depends(verify_token)],
+)
+def listar_visitas_route(agenda_id: str, request: Request):
+    user = request.state.user
+    tenant_id = int(user.get("tenant_id", 0))
+    return listar_visitas_flat(agenda_id, tenant_id)
+
+
+@router.patch(
+    "/agenda/visita/{visita_id}/status",
+    dependencies=[Depends(verify_token)],
+)
+def atualizar_status_visita_route(visita_id: str, body: AtualizarStatusVisitaRequest, request: Request):
+    if body.status is not None and body.status not in _STATUS_VALIDOS:
+        raise HTTPException(status_code=400, detail=f"Status inválido. Use: {', '.join(_STATUS_VALIDOS)}.")
+    if not any([body.status, body.data_realizacao, body.data_prevista, body.limpar_data_prevista]):
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar.")
+    user = request.state.user
+    tenant_id = int(user.get("tenant_id", 0))
+    updated = atualizar_status_visita(
+        visita_id, tenant_id,
+        status=body.status,
+        data_realizacao=body.data_realizacao,
+        data_prevista=body.data_prevista,
+        limpar_data_prevista=body.limpar_data_prevista,
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Visita não encontrada")
+    return updated
+
+
+@router.patch(
+    "/agenda/{agenda_id}/visitas/lote",
+    dependencies=[Depends(verify_token)],
+)
+def atualizar_status_lote_route(agenda_id: str, body: AtualizarStatusVisitasLoteRequest, request: Request):
+    if body.status is not None and body.status not in _STATUS_VALIDOS:
+        raise HTTPException(status_code=400, detail=f"Status inválido. Use: {', '.join(_STATUS_VALIDOS)}.")
+    if not body.visita_ids:
+        raise HTTPException(status_code=400, detail="Nenhuma visita informada.")
+    if not any([body.status, body.data_realizacao, body.data_prevista, body.limpar_data_prevista]):
+        raise HTTPException(status_code=400, detail="Nenhum campo para atualizar.")
+    user = request.state.user
+    tenant_id = int(user.get("tenant_id", 0))
+    updated = atualizar_status_visitas_lote(
+        agenda_id, tenant_id, body.visita_ids,
+        status=body.status,
+        data_realizacao=body.data_realizacao,
+        data_prevista=body.data_prevista,
+        limpar_data_prevista=body.limpar_data_prevista,
+    )
+    return {"updated": updated}
 
 
 @router.get(
