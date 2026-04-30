@@ -480,6 +480,62 @@ def atualizar_data_rota_route(rota_id: str, body: AtualizarDataRotaRequest, requ
 
 
 @router.get(
+    "/agenda/{agenda_id}/export",
+    dependencies=[Depends(verify_token)],
+)
+def exportar_agenda_route(agenda_id: str, request: Request):
+    import io
+    user = request.state.user
+    tenant_id = int(user.get("tenant_id", 0))
+    agenda = buscar_agenda(agenda_id, tenant_id)
+    if not agenda:
+        raise HTTPException(status_code=404, detail="Agenda não encontrada")
+
+    rotas_rows = []
+    visitas_rows = []
+    for rota in agenda["rotas"]:
+        rotas_rows.append({
+            "Consultor": rota["consultor"],
+            "Rota": rota["rota_id"],
+            "Data": rota["data"],
+            "PDVs": rota["qtd_pdvs"],
+            "Distância (km)": rota["distancia_km"],
+            "Tempo (min)": rota["tempo_min"],
+            "Data alterada manualmente": "Sim" if rota["data_alterada_manualmente"] else "Não",
+        })
+        for v in rota["visitas"]:
+            visitas_rows.append({
+                "Consultor": rota["consultor"],
+                "Rota": rota["rota_id"],
+                "Data": rota["data"],
+                "Sequência": v["sequencia"],
+                "CNPJ": v["cnpj"],
+                "Nome fantasia": v["nome_fantasia"],
+                "Cidade": v["cidade"],
+                "UF": v["uf"],
+                "Latitude": v["lat"],
+                "Longitude": v["lon"],
+            })
+
+    df_rotas = pd.DataFrame(rotas_rows)
+    df_visitas = pd.DataFrame(visitas_rows)
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df_rotas.to_excel(writer, sheet_name="Rotas", index=False)
+        df_visitas.to_excel(writer, sheet_name="Visitas", index=False)
+    buf.seek(0)
+
+    from fastapi.responses import StreamingResponse
+    nome_arquivo = agenda["nome"].replace(" ", "_").lower()
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="agenda_{nome_arquivo}.xlsx"'},
+    )
+
+
+@router.get(
     "/agenda/{agenda_id}/consultor/{consultor}/datas-ocupadas",
     dependencies=[Depends(verify_token)],
 )
