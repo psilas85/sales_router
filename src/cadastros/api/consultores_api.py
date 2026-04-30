@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, EmailStr
 from psycopg2.errors import UniqueViolation
 
@@ -151,12 +151,14 @@ def criar_consultor(payload: ConsultorCreateSchema, request: Request):
     response_model=List[ConsultorResponseSchema],
     dependencies=[Depends(verify_token)]
 )
-def listar_consultores(request: Request):
-
+def listar_consultores(
+    request: Request,
+    ativo: Optional[bool] = Query(default=None),
+    uf: Optional[str] = Query(default=None),
+    cidade: Optional[str] = Query(default=None),
+):
     tenant_id = request.state.user["tenant_id"]
-
-    dados = use_case.listar(tenant_id)
-
+    dados = use_case.listar(tenant_id, ativo=ativo, uf=uf, cidade=cidade)
     return [to_schema(item) for item in dados]
 
 

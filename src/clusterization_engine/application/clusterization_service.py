@@ -15,6 +15,7 @@ from rq import Queue
 
 from clusterization_engine.application import parser
 from clusterization_engine.domain import custom, kmeans, sweep
+from clusterization_engine.domain.consultor_nearest import clusterizar_consultor_nearest
 
 
 OUTPUT_ROOT = Path("/app/output/clusterization_engine")
@@ -41,6 +42,9 @@ class ClusterizationParams:
     excluir_outliers: bool = False
     z_thresh: float = 3.0
     k_forcado: int | None = None
+    # consultor_nearest params
+    consultores: list | None = None
+    permitir_excedente: bool = True
 
 
 @dataclass
@@ -102,6 +106,17 @@ def _run_algorithm(df, params: ClusterizationParams):
     if algoritmo == "sweep":
         algoritmo = "capacitated_sweep"
 
+    if algoritmo == "consultor_nearest":
+        if not params.consultores:
+            raise ValueError("Algoritmo 'consultor_nearest' requer a lista de consultores.")
+        return clusterizar_consultor_nearest(
+            df,
+            consultores=params.consultores,
+            max_pdv_por_consultor=params.max_pdv_cluster,
+            permitir_excedente=params.permitir_excedente,
+            latitude_col=params.latitude_col,
+            longitude_col=params.longitude_col,
+        )
     if algoritmo == "kmeans":
         return kmeans.clusterizar_kmeans(
             df,
@@ -129,7 +144,7 @@ def _run_algorithm(df, params: ClusterizationParams):
             latitude_col=params.latitude_col,
             longitude_col=params.longitude_col,
         )
-    raise ValueError("Algoritmo invalido. Use: kmeans, capacitated_sweep, sweep ou dense_subset.")
+    raise ValueError("Algoritmo invalido. Use: consultor_nearest, kmeans, capacitated_sweep ou dense_subset.")
 
 
 def normalize_params(raw: dict[str, Any] | None, algoritmo: str | None = None) -> ClusterizationParams:
@@ -148,6 +163,7 @@ def normalize_params(raw: dict[str, Any] | None, algoritmo: str | None = None) -
         "random_state", "max_pdv_cluster", "dias_uteis", "freq", "workday_min",
         "route_km_max", "service_min", "v_kmh", "alpha_path", "max_iter",
         "excluir_outliers", "z_thresh", "k_forcado",
+        "consultores", "permitir_excedente",
     }
     clean = {k: v for k, v in data.items() if k in allowed}
     params = ClusterizationParams(**clean)
@@ -160,8 +176,9 @@ def validate_params(params: ClusterizationParams) -> None:
     if algo == "sweep":
         algo = "capacitated_sweep"
         params.algoritmo = algo
-    if algo not in {"kmeans", "capacitated_sweep", "dense_subset"}:
-        raise ValueError("Algoritmo invalido. Use: kmeans, capacitated_sweep, sweep ou dense_subset.")
+    valid_algos = {"kmeans", "capacitated_sweep", "dense_subset", "consultor_nearest"}
+    if algo not in valid_algos:
+        raise ValueError(f"Algoritmo invalido. Use: {', '.join(sorted(valid_algos))}.")
     if params.max_pdv_cluster <= 0:
         raise ValueError("max_pdv_cluster deve ser maior que zero.")
     if params.dias_uteis <= 0:
@@ -253,6 +270,7 @@ def process_job(job_id: str) -> None:
 
         elapsed = round(time.time() - start_time, 1)
         total_setores = result["consultor"].nunique() if "consultor" in result.columns else 0
+        total_excedente = int(result["excedente"].sum()) if "excedente" in result.columns else 0
 
         finished_job = get_job(job_id)
         if finished_job:
@@ -261,6 +279,7 @@ def process_job(job_id: str) -> None:
                 "total_registros": len(result),
                 "total_setores": total_setores,
                 "tempo_execucao_s": elapsed,
+                "total_excedente": total_excedente,
             }
             finished_job.status = "finished"
             finished_job.progress = 100

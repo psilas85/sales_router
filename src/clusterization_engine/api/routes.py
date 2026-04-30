@@ -1,6 +1,8 @@
 import json
+import math
 from pathlib import Path
 
+import pandas as pd
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
@@ -139,6 +141,48 @@ def baixar_resultado(job_id: str):
 @router.get("/cluster/jobs/{job_id}/resultado")
 def baixar_resultado_legacy(job_id: str):
     return baixar_resultado(job_id)
+
+
+@router.get("/api/v1/job/{job_id}/result")
+def resultado_json(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job nao encontrado.")
+    if job.status != "finished":
+        raise HTTPException(status_code=409, detail="Resultado ainda nao disponivel.")
+    if not job.output_path or not Path(job.output_path).exists():
+        raise HTTPException(status_code=404, detail="Arquivo de resultado nao encontrado.")
+
+    df = pd.read_excel(job.output_path)
+
+    lat_col = next((c for c in df.columns if c.lower() in ("lat", "latitude")), None)
+    lon_col = next((c for c in df.columns if c.lower() in ("lon", "longitude", "lng")), None)
+
+    if not lat_col or not lon_col:
+        raise HTTPException(status_code=422, detail="Colunas de latitude/longitude nao encontradas no resultado.")
+
+    rows = []
+    for _, row in df.iterrows():
+        lat = row.get(lat_col)
+        lon = row.get(lon_col)
+        if lat is None or lon is None:
+            continue
+        try:
+            lat_f = float(lat)
+            lon_f = float(lon)
+        except (ValueError, TypeError):
+            continue
+        if math.isnan(lat_f) or math.isnan(lon_f):
+            continue
+
+        entry: dict = {"lat": lat_f, "lon": lon_f}
+        for col in ("consultor", "razao_social", "cnpj", "cidade", "uf", "excedente", "setor"):
+            if col in df.columns:
+                val = row.get(col)
+                entry[col] = None if (isinstance(val, float) and math.isnan(val)) else val
+        rows.append(entry)
+
+    return {"job_id": job_id, "total": len(rows), "rows": rows}
 
 
 @router.post("/cluster/executar-clusterizacao")

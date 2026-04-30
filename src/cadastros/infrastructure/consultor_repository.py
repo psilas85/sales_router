@@ -106,20 +106,42 @@ class ConsultorRepository:
 
         return self._row_to_entity(row)
 
-    def listar(self, tenant_id: int) -> List[Consultor]:
+    def listar(
+        self,
+        tenant_id: int,
+        ativo: Optional[bool] = None,
+        uf: Optional[str] = None,
+        cidade: Optional[str] = None,
+    ) -> List[Consultor]:
         conn = get_connection()
         self._ensure_ativo_column(conn)
         cur = conn.cursor()
 
-        query = """
-                 SELECT id, tenant_id, ativo, setor, consultor, cpf, logradouro, numero, complemento,
-                     bairro, cidade, uf, cep, celular, email, lat, lon, criado_em, atualizado_em
+        conditions = ["tenant_id = %s"]
+        params: list = [tenant_id]
+
+        if ativo is not None:
+            conditions.append("ativo = %s")
+            params.append(ativo)
+
+        if uf:
+            conditions.append("uf = %s")
+            params.append(uf.strip().upper()[:2])
+
+        if cidade:
+            conditions.append("cidade = %s")
+            params.append(cidade.strip().upper())
+
+        where = " AND ".join(conditions)
+        query = f"""
+            SELECT id, tenant_id, ativo, setor, consultor, cpf, logradouro, numero, complemento,
+                   bairro, cidade, uf, cep, celular, email, lat, lon, criado_em, atualizado_em
             FROM consultores
-            WHERE tenant_id = %s
+            WHERE {where}
             ORDER BY consultor
         """
 
-        cur.execute(query, (tenant_id,))
+        cur.execute(query, params)
         rows = cur.fetchall()
 
         cur.close()
