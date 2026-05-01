@@ -26,7 +26,8 @@ REQUIRED_COLUMNS_BASE = [
 
 OPTIONAL_COLUMNS = [
     "nome_fantasia",
-    "setor",  # opcional
+    "razao_social",  # opcional
+    "setor",         # opcional
 ]
 
 
@@ -102,10 +103,14 @@ class SpreadsheetValidator:
         # =========================================================
         # 🔥 COLUNAS FINAIS
         # =========================================================
-        df["nome_fantasia"] = df["nome_fantasia"] if "nome_fantasia" in df.columns else None
+        # Ensure optional columns exist (None when absent in input)
+        for opt_col in ("nome_fantasia", "razao_social"):
+            if opt_col not in df.columns:
+                df[opt_col] = None
 
         ordered_cols = [
             "cnpj",
+            "razao_social",
             "nome_fantasia",
             "logradouro",
             "numero",

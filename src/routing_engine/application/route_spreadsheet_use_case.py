@@ -70,6 +70,7 @@ class RouteSpreadsheetUseCase:
                 PDVData(
                     pdv_id=idx,
                     cnpj=row["cnpj"],
+                    razao_social=row.get("razao_social"),
                     nome_fantasia=row.get("nome_fantasia"),
                     logradouro=row["logradouro"],
                     numero=row.get("numero"),
@@ -180,9 +181,14 @@ class RouteSpreadsheetUseCase:
 
                     df_detalhe.append({
                         "cnpj": p["cnpj"],
+                        "razao_social": p.get("razao_social"),
                         "nome_fantasia": p.get("nome_fantasia"),
+                        "logradouro": p.get("logradouro"),
+                        "numero": p.get("numero"),
+                        "bairro": p.get("bairro"),
                         "cidade": p.get("cidade"),
                         "uf": p.get("uf"),
+                        "cep": p.get("cep"),
                         "grupo_utilizado": p.get("grupo_utilizado"),
                         "rota_id": rota_id,
                         "sequencia": seq,

@@ -19,6 +19,7 @@ from routing_engine.infrastructure.agenda_repository import (
     criar_agenda, buscar_agenda, listar_agendas,
     atualizar_data_rota, datas_ocupadas_consultor,
     listar_visitas_flat, atualizar_status_visita, atualizar_status_visitas_lote,
+    listar_backlog_para_export, toggle_agenda_ativo,
 )
 
 from rq.job import Job
@@ -109,6 +110,10 @@ class AtualizarStatusVisitasLoteRequest(BaseModel):
     data_realizacao: Optional[date] = None
     data_prevista: Optional[date] = None
     limpar_data_prevista: bool = False
+
+
+class AtualizarAtivoRequest(BaseModel):
+    ativo: bool
 
 
 # ============================================================
@@ -358,6 +363,19 @@ def listar_agendas_route(request: Request):
     return listar_agendas(tenant_id)
 
 
+@router.patch(
+    "/agenda/{agenda_id}/ativo",
+    dependencies=[Depends(verify_token)],
+)
+def toggle_agenda_ativo_route(agenda_id: str, body: AtualizarAtivoRequest, request: Request):
+    user = request.state.user
+    tenant_id = int(user.get("tenant_id", 0))
+    result = toggle_agenda_ativo(agenda_id, tenant_id, body.ativo)
+    if not result:
+        raise HTTPException(status_code=404, detail="Agenda não encontrada")
+    return result
+
+
 @router.post(
     "/job/{job_id}/agenda",
     dependencies=[Depends(verify_token)],
@@ -426,15 +444,23 @@ def criar_agenda_route(job_id: str, body: CriarAgendaRequest, request: Request):
             data_rota = dias[idx]
             metricas = resumo_idx.get((consultor, rota_id), {})
 
+            def _str(val) -> Optional[str]:
+                return str(val).strip() if pd.notna(val) and str(val).strip() else None
+
             pdvs = [
                 AgendaVisitaRow(
                     sequencia=int(r.get("sequencia", 0)),
-                    cnpj=str(r["cnpj"]) if pd.notna(r.get("cnpj")) else None,
-                    nome_fantasia=str(r["nome_fantasia"]) if pd.notna(r.get("nome_fantasia")) else None,
-                    cidade=str(r["cidade"]) if pd.notna(r.get("cidade")) else None,
-                    uf=str(r["uf"]) if pd.notna(r.get("uf")) else None,
+                    cnpj=_str(r.get("cnpj")),
+                    nome_fantasia=_str(r.get("nome_fantasia")),
+                    cidade=_str(r.get("cidade")),
+                    uf=_str(r.get("uf")),
                     lat=float(r["lat"]) if pd.notna(r.get("lat")) else None,
                     lon=float(r["lon"]) if pd.notna(r.get("lon")) else None,
+                    logradouro=_str(r.get("logradouro")),
+                    numero=_str(r.get("numero")),
+                    bairro=_str(r.get("bairro")),
+                    cep=_str(r.get("cep")),
+                    razao_social=_str(r.get("razao_social")),
                 )
                 for r in rotas_dict[rota_id]
             ]
@@ -551,6 +577,67 @@ def exportar_agenda_route(agenda_id: str, request: Request):
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="agenda_{nome_arquivo}.xlsx"'},
+    )
+
+
+@router.get(
+    "/agenda/{agenda_id}/backlog/export",
+    dependencies=[Depends(verify_token)],
+)
+def exportar_backlog_route(agenda_id: str, request: Request):
+    import io
+    user = request.state.user
+    tenant_id = int(user.get("tenant_id", 0))
+
+    agenda = buscar_agenda(agenda_id, tenant_id)
+    if not agenda:
+        raise HTTPException(status_code=404, detail="Agenda não encontrada")
+
+    rows = listar_backlog_para_export(agenda_id, tenant_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="Nenhuma visita não realizada nesta agenda.")
+
+    COLUNAS = [
+        "cnpj", "razao_social", "nome_fantasia",
+        "logradouro", "numero", "bairro",
+        "cidade", "uf", "cep",
+        "consultor", "setor",
+        "lat", "lon",
+        "data_planejada_visita", "status",
+    ]
+
+    df = pd.DataFrame([
+        {
+            "cnpj": r["cnpj"],
+            "razao_social": r["razao_social"],
+            "nome_fantasia": r["nome_fantasia"],
+            "logradouro": r["logradouro"],
+            "numero": r["numero"],
+            "bairro": r["bairro"],
+            "cidade": r["cidade"],
+            "uf": r["uf"],
+            "cep": r["cep"],
+            "consultor": r["consultor"],
+            "setor": None,
+            "lat": r["lat"],
+            "lon": r["lon"],
+            "data_planejada_visita": r["data_planejada_visita"],
+            "status": r["status"],
+        }
+        for r in rows
+    ], columns=COLUNAS)
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="backlog", index=False)
+    buf.seek(0)
+
+    from fastapi.responses import StreamingResponse
+    nome_arquivo = agenda["nome"].replace(" ", "_").lower()
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="backlog_{nome_arquivo}.xlsx"'},
     )
 
 

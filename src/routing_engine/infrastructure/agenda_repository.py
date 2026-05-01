@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS agenda (
     data_inicio     DATE NOT NULL,
     data_fim        DATE NOT NULL,
     dias_uteis      INTEGER NOT NULL,
+    ativo           BOOLEAN NOT NULL DEFAULT TRUE,
     criado_em       TIMESTAMP DEFAULT NOW()
 );
 
@@ -53,6 +54,11 @@ CREATE TABLE IF NOT EXISTS agenda_visita (
     uf              VARCHAR,
     lat             DOUBLE PRECISION,
     lon             DOUBLE PRECISION,
+    logradouro      VARCHAR,
+    numero          VARCHAR,
+    bairro          VARCHAR,
+    cep             VARCHAR,
+    razao_social    VARCHAR,
     status          VARCHAR(20) NOT NULL DEFAULT 'a_realizar',
     data_realizacao DATE,
     data_prevista   DATE
@@ -64,6 +70,12 @@ _MIGRATIONS = """
 ALTER TABLE agenda_visita ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'a_realizar';
 ALTER TABLE agenda_visita ADD COLUMN IF NOT EXISTS data_realizacao DATE;
 ALTER TABLE agenda_visita ADD COLUMN IF NOT EXISTS data_prevista DATE;
+ALTER TABLE agenda_visita ADD COLUMN IF NOT EXISTS logradouro VARCHAR;
+ALTER TABLE agenda_visita ADD COLUMN IF NOT EXISTS numero VARCHAR;
+ALTER TABLE agenda_visita ADD COLUMN IF NOT EXISTS bairro VARCHAR;
+ALTER TABLE agenda_visita ADD COLUMN IF NOT EXISTS cep VARCHAR;
+ALTER TABLE agenda_visita ADD COLUMN IF NOT EXISTS razao_social VARCHAR;
+ALTER TABLE agenda ADD COLUMN IF NOT EXISTS ativo BOOLEAN NOT NULL DEFAULT TRUE;
 """
 
 
@@ -102,6 +114,11 @@ class AgendaVisitaRow:
     uf: Optional[str]
     lat: Optional[float]
     lon: Optional[float]
+    logradouro: Optional[str] = None
+    numero: Optional[str] = None
+    bairro: Optional[str] = None
+    cep: Optional[str] = None
+    razao_social: Optional[str] = None
 
 
 # ─────────────────────────────────────────────
@@ -150,13 +167,15 @@ def criar_agenda(
                         """
                         INSERT INTO agenda_visita
                             (agenda_rota_id, agenda_id, tenant_id, consultor,
-                             sequencia, cnpj, nome_fantasia, cidade, uf, lat, lon)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                             sequencia, cnpj, nome_fantasia, cidade, uf, lat, lon,
+                             logradouro, numero, bairro, cep, razao_social)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             rota_id_db, agenda_id, tenant_id, rota.consultor,
                             pdv.sequencia, pdv.cnpj, pdv.nome_fantasia,
                             pdv.cidade, pdv.uf, pdv.lat, pdv.lon,
+                            pdv.logradouro, pdv.numero, pdv.bairro, pdv.cep, pdv.razao_social,
                         ),
                     )
         conn.commit()
@@ -319,7 +338,7 @@ def listar_agendas(tenant_id: int) -> list[dict]:
                 """
                 SELECT
                     a.id, a.nome, a.job_id, a.data_inicio, a.data_fim,
-                    a.dias_uteis, a.criado_em,
+                    a.dias_uteis, a.criado_em, a.ativo,
                     COUNT(DISTINCT r.id)       AS total_rotas,
                     COUNT(DISTINCT r.consultor) AS total_consultores
                 FROM agenda a
@@ -340,11 +359,39 @@ def listar_agendas(tenant_id: int) -> list[dict]:
                 "data_fim": r[4].isoformat(),
                 "dias_uteis": r[5],
                 "criado_em": r[6].isoformat(),
-                "total_rotas": r[7],
-                "total_consultores": r[8],
+                "ativo": r[7],
+                "total_rotas": r[8],
+                "total_consultores": r[9],
             }
             for r in rows
         ]
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────
+# PATCH — agenda ativo
+# ─────────────────────────────────────────────
+
+def toggle_agenda_ativo(agenda_id: str, tenant_id: int, ativo: bool) -> Optional[dict]:
+    ensure_schema()
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE agenda
+                SET ativo = %s
+                WHERE id = %s AND tenant_id = %s
+                RETURNING id, nome, ativo
+                """,
+                (ativo, agenda_id, tenant_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+        conn.commit()
+        return {"id": str(row[0]), "nome": row[1], "ativo": row[2]}
     finally:
         conn.close()
 
@@ -532,6 +579,65 @@ def atualizar_status_visitas_lote(
             updated = cur.rowcount
         conn.commit()
         return updated
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────
+# READ — backlog export (non-realized visits)
+# ─────────────────────────────────────────────
+
+def listar_backlog_para_export(agenda_id: str, tenant_id: int) -> list[dict]:
+    """Returns all non-realized visits ready for routing re-upload."""
+    ensure_schema()
+    today = date.today()
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    v.cnpj, v.razao_social, v.nome_fantasia,
+                    v.logradouro, v.numero, v.bairro,
+                    v.cidade, v.uf, v.cep,
+                    v.consultor, v.lat, v.lon,
+                    v.status, v.data_prevista,
+                    r.data AS data_rota
+                FROM agenda_visita v
+                JOIN agenda_rota r ON r.id = v.agenda_rota_id
+                WHERE v.agenda_id = %s AND v.tenant_id = %s
+                  AND v.status != 'realizada'
+                ORDER BY v.consultor, COALESCE(v.data_prevista, r.data), v.sequencia
+                """,
+                (agenda_id, tenant_id),
+            )
+            rows = cur.fetchall()
+
+        result = []
+        for row in rows:
+            stored_status = row[12]
+            data_prevista: Optional[date] = row[13]
+            data_rota: date = row[14]
+            data_efetiva = data_prevista if data_prevista else data_rota
+            effective_status = _effective_status(stored_status, data_efetiva, today)
+
+            result.append({
+                "cnpj": row[0],
+                "razao_social": row[1],
+                "nome_fantasia": row[2],
+                "logradouro": row[3],
+                "numero": row[4],
+                "bairro": row[5],
+                "cidade": row[6],
+                "uf": row[7],
+                "cep": row[8],
+                "consultor": row[9],
+                "lat": row[10],
+                "lon": row[11],
+                "status": effective_status,
+                "data_planejada_visita": data_efetiva.isoformat(),
+            })
+        return result
     finally:
         conn.close()
 

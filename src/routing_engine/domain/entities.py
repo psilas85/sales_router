@@ -12,6 +12,7 @@ class PDVData:
     lat: float
     lon: float
     cnpj: Optional[str] = None
+    razao_social: Optional[str] = None
     nome_fantasia: Optional[str] = None
     logradouro: Optional[str] = None
     numero: Optional[str] = None
