@@ -19,14 +19,16 @@ from routing_engine.infrastructure.agenda_repository import (
     criar_agenda, buscar_agenda, listar_agendas,
     atualizar_data_rota, datas_ocupadas_consultor,
     listar_visitas_flat, atualizar_status_visita, atualizar_status_visitas_lote,
-    listar_backlog_para_export, toggle_agenda_ativo,
+    listar_backlog_para_export, toggle_agenda_ativo, buscar_roteiro_por_data,
 )
+from routing_engine.services.whatsapp_service import enviar_roteiro
 
 from rq.job import Job
 from redis import Redis
 import os
 import uuid
 import json
+from loguru import logger
 
 router = APIRouter()
 
@@ -114,6 +116,12 @@ class AtualizarStatusVisitasLoteRequest(BaseModel):
 
 class AtualizarAtivoRequest(BaseModel):
     ativo: bool
+
+
+class DispararRoteiroRequest(BaseModel):
+    data_inicio: Optional[date] = None
+    data_fim: Optional[date] = None
+    instancia: Optional[str] = None
 
 
 # ============================================================
@@ -374,6 +382,59 @@ def toggle_agenda_ativo_route(agenda_id: str, body: AtualizarAtivoRequest, reque
     if not result:
         raise HTTPException(status_code=404, detail="Agenda não encontrada")
     return result
+
+
+@router.post(
+    "/agenda/{agenda_id}/disparar-roteiro",
+    dependencies=[Depends(verify_token)],
+)
+def disparar_roteiro_route(agenda_id: str, body: DispararRoteiroRequest, request: Request):
+    from datetime import date as date_type
+    user = request.state.user
+    tenant_id = int(user.get("tenant_id", 0))
+
+    hoje = date_type.today()
+    data_inicio = body.data_inicio or hoje
+    data_fim = body.data_fim or hoje
+
+    roteiros = buscar_roteiro_por_data(agenda_id, tenant_id, data_inicio, data_fim)
+
+    if not roteiros:
+        return {"total_consultores": 0, "enviados": [], "sem_celular": [], "erros": []}
+
+    enviados, sem_celular, erros = [], [], []
+
+    for consultor, dados in roteiros.items():
+        celular = dados.get("celular")
+        if not celular:
+            sem_celular.append(consultor)
+            continue
+
+        for rota_data, rota_info in dados["datas"].items():
+            try:
+                enviar_roteiro(
+                    consultor_nome=consultor,
+                    celular=celular,
+                    rota_data=rota_data,
+                    visitas=rota_info["visitas"],
+                    distancia_km=rota_info.get("distancia_km"),
+                    instancia=body.instancia,
+                )
+                enviados.append({
+                    "consultor": consultor,
+                    "data": rota_data.isoformat(),
+                    "qtd_visitas": len(rota_info["visitas"]),
+                })
+            except Exception as exc:
+                logger.error(f"[WA] Erro ao enviar para {consultor}: {exc}")
+                erros.append({"consultor": consultor, "data": rota_data.isoformat(), "erro": str(exc)})
+
+    return {
+        "total_consultores": len(roteiros),
+        "enviados": enviados,
+        "sem_celular": sem_celular,
+        "erros": erros,
+    }
 
 
 @router.post(

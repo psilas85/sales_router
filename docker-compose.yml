@@ -415,6 +415,41 @@ services:
     restart: always
   
   
+  # ======================
+  # 📱 Evolution API (WhatsApp)
+  # ======================
+  evolution_api:
+    image: atendai/evolution-api:latest
+    container_name: evolution_api
+    environment:
+      - SERVER_URL=http://34.227.175.23:8020
+      - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY}
+      - AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES=true
+      - LANGUAGE=pt-BR
+      - DATABASE_ENABLED=true
+      - DATABASE_PROVIDER=postgresql
+      - DATABASE_CONNECTION_URI=postgresql://postgres:${DB_PASSWORD}@sales_router_db:5432/evolution_db
+      - DATABASE_CONNECTION_CLIENT_NAME=evolution_api
+      - CACHE_REDIS_ENABLED=true
+      - CACHE_REDIS_URI=redis://redis:6379/2
+      - CACHE_REDIS_PREFIX_KEY=evolution
+      - DEL_INSTANCE=false
+      - LOG_LEVEL=ERROR
+      - CONFIG_SESSION_PHONE_CLIENT=SalesRouter
+      - CONFIG_SESSION_PHONE_NAME=Chrome
+    volumes:
+      - evolution_data:/evolution/instances
+    ports:
+      - "8020:8080"
+    depends_on:
+      - sales_router_db
+      - redis
+    dns:
+      - 172.31.0.2
+    networks:
+      - sales_router_net
+    restart: always
+
   sales_router_frontend:
     build:
       context: ../sales_router_frontend
@@ -440,6 +475,7 @@ services:
 # ======================
 volumes:
   pg_data:
+  evolution_data:
 
 # ======================
 # Rede compartilhada

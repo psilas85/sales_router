@@ -370,6 +370,96 @@ def listar_agendas(tenant_id: int) -> list[dict]:
 
 
 # ─────────────────────────────────────────────
+# READ — roteiro por período (para disparo WA)
+# ─────────────────────────────────────────────
+
+def buscar_roteiro_por_data(
+    agenda_id: str,
+    tenant_id: int,
+    data_inicio: date,
+    data_fim: date,
+) -> list[dict]:
+    """
+    Returns visits grouped by consultor → date → ordered visits.
+    Also joins consultores table to get celular.
+    """
+    ensure_schema()
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    ar.consultor,
+                    ar.data          AS rota_data,
+                    ar.distancia_km,
+                    av.sequencia,
+                    av.nome_fantasia,
+                    av.razao_social,
+                    av.cnpj,
+                    av.logradouro,
+                    av.numero,
+                    av.bairro,
+                    av.cidade,
+                    av.uf,
+                    av.lat,
+                    av.lon,
+                    av.status,
+                    c.celular
+                FROM agenda_rota ar
+                JOIN agenda_visita av ON av.agenda_rota_id = ar.id
+                LEFT JOIN consultores c
+                    ON UPPER(TRIM(c.consultor)) = UPPER(TRIM(ar.consultor))
+                    AND c.tenant_id = ar.tenant_id
+                WHERE ar.agenda_id = %s
+                  AND ar.tenant_id = %s
+                  AND ar.data BETWEEN %s AND %s
+                ORDER BY ar.consultor, ar.data, av.sequencia
+                """,
+                (agenda_id, tenant_id, data_inicio, data_fim),
+            )
+            rows = cur.fetchall()
+
+        # group: consultor → { celular, datas: { date → { distancia_km, visitas[] } } }
+        resultado: dict[str, dict] = {}
+        for row in rows:
+            (
+                consultor, rota_data, distancia_km,
+                sequencia, nome_fantasia, razao_social, cnpj,
+                logradouro, numero, bairro, cidade, uf,
+                lat, lon, status, celular,
+            ) = row
+
+            if consultor not in resultado:
+                resultado[consultor] = {"celular": celular, "datas": {}}
+
+            if rota_data not in resultado[consultor]["datas"]:
+                resultado[consultor]["datas"][rota_data] = {
+                    "distancia_km": distancia_km,
+                    "visitas": [],
+                }
+
+            resultado[consultor]["datas"][rota_data]["visitas"].append({
+                "sequencia": sequencia,
+                "nome_fantasia": nome_fantasia,
+                "razao_social": razao_social,
+                "cnpj": cnpj,
+                "logradouro": logradouro,
+                "numero": numero,
+                "bairro": bairro,
+                "cidade": cidade,
+                "uf": uf,
+                "lat": lat,
+                "lon": lon,
+                "status": status,
+            })
+
+        return resultado
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────
 # PATCH — agenda ativo
 # ─────────────────────────────────────────────
 
