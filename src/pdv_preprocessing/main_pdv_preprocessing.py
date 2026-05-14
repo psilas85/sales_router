@@ -167,6 +167,20 @@ def main():
         total_invalidos = len(df_invalidos)
         total = total_validos + total_invalidos
 
+        # PDVs cuja cidade/UF foi corrigida via CEP (fallback de divergência)
+        corrigidos_cep = 0
+        if "status_geolocalizacao" in df_validos.columns:
+            corrigidos_cep = int(
+                (df_validos["status_geolocalizacao"] == "cidade_corrigida_por_cep").sum()
+            )
+
+        # PDVs válidos sem número (geocodificados no nível da rua)
+        sem_numero = 0
+        if "numero" in df_validos.columns:
+            sem_numero = int(
+                df_validos["numero"].fillna("").astype(str).str.strip().eq("").sum()
+            )
+
         # --------------------------------------------------------
         # Salvar inválidos
         # --------------------------------------------------------
@@ -194,8 +208,11 @@ def main():
             "validos": total_validos,
             "invalidos": total_invalidos,
             "inseridos": inseridos,
+            "corrigidos_cep": corrigidos_cep,
+            "sem_numero": sem_numero,
             "arquivo_invalidos": arquivo_invalidos,
-            "duracao_segundos": duracao
+            "duracao_segundos": duracao,
+            "mensagem": f"corrigidos_cep:{corrigidos_cep}|sem_numero:{sem_numero}",
         })
 
     except Exception as e:

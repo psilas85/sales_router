@@ -19,8 +19,10 @@ from pdv_preprocessing.entities.pdv_entity import PDV
 from pdv_preprocessing.domain.pdv_validation_service import PDVValidationService
 from pdv_preprocessing.domain.geolocation_service import GeolocationService as LocalGeolocationService
 from pdv_preprocessing.config.uf_bounds import UF_BOUNDS
+from pdv_preprocessing.config.cep_bounds import ufs_possiveis_do_cep
 from pdv_preprocessing.domain.utils_texto import fix_encoding
 from pdv_preprocessing.infrastructure.geocoding_engine_client import GeocodingEngineClient
+from pdv_preprocessing.infrastructure.cep_resolver import CepResolver
 
 # ✅ NOVO: normalizador (mesma regra do pipeline)
 from pdv_preprocessing.domain.address_normalizer import (
@@ -345,6 +347,124 @@ class PDVPreprocessingUseCase:
         return resultados_finais
 
     # ------------------------------------------------------------
+    # FALLBACK CIDADE×UF VIA CEP
+    # ------------------------------------------------------------
+    def _corrigir_cidade_uf_por_cep(self, df_validos, resultados_geo):
+        """
+        Fallback para divergência cidade×UF: linhas rejeitadas pelo
+        geocoding_engine como 'cidade_invalida' são corrigidas via CEP
+        (ViaCEP → BrasilAPI) e reenviadas ao engine.
+        Sobrescreve cidade/uf em df_validos.
+        Retorna (resultados_geo, total_recuperados).
+        """
+        alvos = [
+            idx for idx in df_validos.index
+            if str(resultados_geo.get(int(idx), (None, None, ""))[2]) == "cidade_invalida"
+        ]
+        if not alvos:
+            return resultados_geo, 0
+
+        cep_por_idx = {}
+        for idx in alvos:
+            cep = re.sub(r"[^0-9]", "", str(df_validos.at[idx, "cep"] or ""))
+            if len(cep) == 8:
+                cep_por_idx[idx] = cep
+
+        if not cep_por_idx:
+            logger.info("[PDV_PREPROCESSING][CEP_FALLBACK] nenhum alvo com CEP válido")
+            return resultados_geo, 0
+
+        resolver = CepResolver(reader=self.reader, writer=self.writer)
+        resolvidos = resolver.resolver_em_lote(list(set(cep_por_idx.values())))
+
+        corrigidos = []
+        for idx, cep in cep_por_idx.items():
+            info = resolvidos.get(cep)
+            if not info:
+                continue
+
+            cidade_nova = fix_encoding(str(info.get("cidade") or "")).upper().strip()
+            uf_nova = str(info.get("uf") or "").upper().strip()
+            if not cidade_nova or len(uf_nova) != 2:
+                continue
+
+            # guarda de sanidade: UF resolvida compatível com a faixa do CEP
+            ufs_faixa = ufs_possiveis_do_cep(cep)
+            if ufs_faixa and uf_nova not in ufs_faixa:
+                logger.warning(
+                    "[PDV_PREPROCESSING][CEP_FALLBACK][DESCARTADO] "
+                    f"cep={cep} uf_resolvida={uf_nova} fora_da_faixa={ufs_faixa}"
+                )
+                continue
+
+            cidade_atual = str(df_validos.at[idx, "cidade"] or "").upper().strip()
+            uf_atual = str(df_validos.at[idx, "uf"] or "").upper().strip()
+            if (cidade_nova, uf_nova) == (cidade_atual, uf_atual):
+                continue
+
+            df_validos.at[idx, "cidade"] = cidade_nova
+            df_validos.at[idx, "uf"] = uf_nova
+
+            logradouro = fix_encoding(str(df_validos.at[idx, "logradouro"] or "")).strip()
+            numero = fix_encoding(str(df_validos.at[idx, "numero"] or "")).strip()
+            bairro = fix_encoding(str(df_validos.at[idx, "bairro"] or "")).strip()
+            cep_fmt = f"{cep[:5]}-{cep[5:]}"
+            base = (
+                f"{logradouro} {numero}, {bairro}, {cidade_nova} - {uf_nova}"
+                if numero else
+                f"{logradouro}, {bairro}, {cidade_nova} - {uf_nova}"
+            )
+            df_validos.at[idx, "pdv_endereco_completo"] = f"{base}, {cep_fmt}, Brasil"
+            df_validos.at[idx, "endereco_cache_key"] = normalize_for_cache(
+                normalize_base(f"{logradouro} {numero}, {cidade_nova} - {uf_nova}")
+            )
+
+            logger.info(
+                "[PDV_PREPROCESSING][CEP_FALLBACK][CORRIGIDO] "
+                f"cep={cep} de='{cidade_atual}/{uf_atual}' para='{cidade_nova}/{uf_nova}'"
+            )
+            corrigidos.append(idx)
+
+        if not corrigidos:
+            return resultados_geo, 0
+
+        # reenvia somente o subconjunto corrigido ao geocoding_engine
+        df_sub = df_validos.loc[corrigidos]
+        payload, resultados_locais = self._preparar_payload_geocoding(df_sub)
+
+        if payload and self.geo_client.enabled:
+            try:
+                novos = self.geo_client.geocode_pdv_batch_job(payload)
+            except Exception as e:
+                logger.error(
+                    f"[PDV_PREPROCESSING][CEP_FALLBACK][REENVIO_ERRO] erro={e}",
+                    exc_info=True,
+                )
+                novos = {}
+            novos.update(resultados_locais)
+        else:
+            novos = resultados_locais
+
+        total_recuperados = 0
+        for idx in corrigidos:
+            novo = novos.get(int(idx))
+            if not novo:
+                continue
+            lat, lon, _ = novo
+            if lat is not None and lon is not None:
+                resultados_geo[idx] = (lat, lon, "cidade_corrigida_por_cep")
+                total_recuperados += 1
+            else:
+                resultados_geo[idx] = novo
+
+        logger.info(
+            "[PDV_PREPROCESSING][CEP_FALLBACK] "
+            f"alvos={len(alvos)} com_cep={len(cep_por_idx)} "
+            f"corrigidos={len(corrigidos)} recuperados={total_recuperados}"
+        )
+        return resultados_geo, total_recuperados
+
+    # ------------------------------------------------------------
     # EXECUTE COM PROGRESSO + HISTÓRICO + TRATAMENTO COMPLETO
     # ------------------------------------------------------------
     def execute(self, input_path: str, sep=";"):
@@ -426,6 +546,10 @@ class PDVPreprocessingUseCase:
                     return bairro[:-(len(cidade) + 1)].strip()
                 return bairro
 
+            # 'numero' é opcional — garante a coluna mesmo se ausente no arquivo
+            if "numero" not in df.columns:
+                df["numero"] = ""
+
             for i, row in df.iterrows():
                 log_raw = row.get("logradouro", "")
                 num_raw = row.get("numero", "")
@@ -443,9 +567,9 @@ class PDVPreprocessingUseCase:
                     atualizar_progresso(i, total_linhas, 30, 45, "Normalizando endereços")
 
             # ============================================================
-            # VALIDAÇÃO DE COLUNAS
+            # VALIDAÇÃO DE COLUNAS  ('numero' é opcional)
             # ============================================================
-            colunas_esperadas = ["cnpj", "logradouro", "numero", "cidade", "uf", "cep"]
+            colunas_esperadas = ["cnpj", "logradouro", "cidade", "uf", "cep"]
             faltantes = [c for c in colunas_esperadas if c not in df.columns]
             if faltantes:
                 raise ValueError(f"❌ Colunas ausentes: {', '.join(faltantes)}")
@@ -520,8 +644,14 @@ class PDVPreprocessingUseCase:
 
             resultados_geo = self._geocodificar_pdvs(df_validos)
 
+            # Fallback: corrige divergência cidade×UF via CEP e reenvia
+            atualizar_progresso(1, 1, 82, 83, "Corrigindo cidade/UF por CEP")
+            resultados_geo, total_corrigidos_cep = self._corrigir_cidade_uf_por_cep(
+                df_validos, resultados_geo
+            )
+
             total_geo = len(df_validos)
-            atualizar_progresso(1, 1, 82, 85, "Consolidando resultados da geocodificacao")
+            atualizar_progresso(1, 1, 83, 85, "Consolidando resultados da geocodificacao")
 
             for i, idx in enumerate(df_validos.index):
                 lat, lon, origem = resultados_geo.get(int(idx), (None, None, "falha"))
@@ -586,12 +716,19 @@ class PDVPreprocessingUseCase:
                     f"inconsistencias={len(df_auditoria_geo)}"
                 )
 
+            # PDVs válidos geocodificados sem número (precisão de rua)
+            sem_numero = int(
+                df_validos["numero"].fillna("").astype(str).str.strip().eq("").sum()
+            ) if "numero" in df_validos.columns else 0
+
             metricas_integracao = {
                 "payload_enviado": sum(1 for v in resultados_geo.values() if v[2] != self.STATUS_INPUT_GEOCODING_INVALIDO),
                 "payload_barrado": sum(1 for v in resultados_geo.values() if v[2] == self.STATUS_INPUT_GEOCODING_INVALIDO),
                 "falha_integracao": sum(1 for v in resultados_geo.values() if v[2] == STATUS_FALHA_INTEGRACAO),
                 "falha_geocodificacao": sum(1 for v in resultados_geo.values() if v[2] == "falha"),
                 "auditoria_geo": len(df_auditoria_geo),
+                "corrigidos_cep": total_corrigidos_cep,
+                "sem_numero": sem_numero,
             }
 
             logger.info(
@@ -644,7 +781,9 @@ class PDVPreprocessingUseCase:
                     f"barrado:{metricas_integracao['payload_barrado']}|"
                     f"falha_integracao:{metricas_integracao['falha_integracao']}|"
                     f"falha_geocodificacao:{metricas_integracao['falha_geocodificacao']}|"
-                    f"auditoria_geo:{metricas_integracao['auditoria_geo']}"
+                    f"auditoria_geo:{metricas_integracao['auditoria_geo']}|"
+                    f"corrigidos_cep:{metricas_integracao['corrigidos_cep']}|"
+                    f"sem_numero:{metricas_integracao['sem_numero']}"
                 ),
                 descricao=self.descricao,
                 input_id=self.input_id

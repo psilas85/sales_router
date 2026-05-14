@@ -1162,6 +1162,58 @@ class DatabaseWriter:
 
 
     @retry_on_failure()
+    def salvar_cache_geocoding(
+        self,
+        endereco: str,
+        endereco_normalizado: str,
+        lat: float,
+        lon: float,
+        origem: str = "manual_insert",
+    ) -> bool:
+        """
+        Grava no enderecos_cache pela chave que o geocoding_engine usa
+        (endereco_normalizado). Mantém o cache compatível com o pipeline
+        normal de geocodificação.
+        """
+        if not endereco_normalizado or lat is None or lon is None:
+            return False
+
+        if coordenada_generica(lat, lon):
+            return False
+
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO enderecos_cache (
+                        endereco, endereco_normalizado, lat, lon, origem, atualizado_em
+                    )
+                    VALUES (%s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (endereco_normalizado)
+                    DO UPDATE SET
+                        lat = EXCLUDED.lat,
+                        lon = EXCLUDED.lon,
+                        origem = EXCLUDED.origem,
+                        atualizado_em = NOW()
+                    """,
+                    (endereco, endereco_normalizado, lat, lon, origem),
+                )
+            conn.commit()
+            return True
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(
+                f"[CACHE_GEOCODING][ERRO] endereco_norm='{endereco_normalizado}' erro={e}",
+                exc_info=True,
+            )
+            return False
+
+        finally:
+            POOL.putconn(conn)
+
+    @retry_on_failure()
     def buscar_cache_key_pdv(self, pdv_id: int, tenant_id: int) -> str | None:
         conn = POOL.getconn()
         try:

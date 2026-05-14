@@ -21,7 +21,8 @@ class PDVValidationService:
         """
         self.db_reader = db_reader
 
-    CAMPOS_OBRIGATORIOS = ["cnpj", "logradouro", "numero", "cidade", "uf"]
+    # 'numero' é opcional: PDV sem número geocodifica no nível da rua.
+    CAMPOS_OBRIGATORIOS = ["cnpj", "logradouro", "cidade", "uf"]
 
     MOTIVOS_CAMPOS_OBRIGATORIOS = {
         "cnpj": "campo_obrigatorio_cnpj",

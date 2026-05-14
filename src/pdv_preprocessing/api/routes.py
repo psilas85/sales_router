@@ -15,7 +15,7 @@ from fastapi import (
     Body,
     File,
 )
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 
 # Pydantic
 from pydantic import BaseModel
@@ -30,10 +30,7 @@ from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
 
 # Entidades e domínio
 from pdv_preprocessing.entities.pdv_entity import PDV
-from pdv_preprocessing.domain.address_normalizer import (
-    normalize_base,
-    normalize_for_cache,
-)
+from pdv_preprocessing.domain.address_normalizer import normalize_for_cache
 from pdv_preprocessing.domain.utils_geo import coordenada_generica
 
 # Jobs / filas
@@ -54,13 +51,14 @@ from .dependencies import verify_token
 
 # Utils padrão
 from datetime import datetime, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 import pandas as pd
 import numpy as np
 import unicodedata
 import shutil
 import os
 import re
+import io
 
 
 router = APIRouter()
@@ -101,6 +99,61 @@ def enrich_job_history_rows(jobs: list[dict]):
         enriched.append(item)
 
     return enriched
+
+
+def enrich_jobs_with_live_counts(jobs: list[dict], tenant_id: int):
+    """
+    Recalcula os números do card a partir do estado atual da tabela pdvs:
+    - validos      = total de PDVs do input
+    - manuais      = PDVs adicionados manualmente (status_geolocalizacao=manual_insert)
+    - total_processados = validos + invalidos (invalidos vem do histórico original)
+    Mantém o card sempre coerente com adições/exclusões manuais.
+    """
+    if not jobs:
+        return jobs
+
+    input_ids = [str(j["input_id"]) for j in jobs if j.get("input_id")]
+    if not input_ids:
+        for job in jobs:
+            job["manuais"] = 0
+        return jobs
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT input_id::text,
+                   COUNT(*) AS validos,
+                   COUNT(*) FILTER (
+                       WHERE status_geolocalizacao = 'manual_insert'
+                   ) AS manuais
+            FROM pdvs
+            WHERE tenant_id = %s
+              AND input_id::text = ANY(%s)
+            GROUP BY input_id;
+            """,
+            (tenant_id, input_ids),
+        )
+        counts = {
+            row[0]: {"validos": int(row[1]), "manuais": int(row[2])}
+            for row in cur.fetchall()
+        }
+    finally:
+        conn.close()
+
+    for job in jobs:
+        contagem = counts.get(str(job.get("input_id")))
+        invalidos = int(job.get("invalidos") or 0)
+
+        if contagem:
+            job["validos"] = contagem["validos"]
+            job["manuais"] = contagem["manuais"]
+            job["total_processados"] = contagem["validos"] + invalidos
+        else:
+            job["manuais"] = 0
+
+    return jobs
 
 def normalize_text(value: str | None):
     if not value:
@@ -690,6 +743,8 @@ def listar_ultimos_jobs(
     cur.close()
     conn.close()
 
+    jobs = enrich_jobs_with_live_counts(jobs, tenant_id)
+
     return {
         "total": total,
         "jobs": jobs,
@@ -788,6 +843,7 @@ def filtrar_jobs(
     df = df.astype(object).replace({np.nan: None, np.inf: None, -np.inf: None})
 
     jobs = enrich_job_history_rows(df.to_dict(orient="records"))
+    jobs = enrich_jobs_with_live_counts(jobs, tenant_id)
 
     return {
         "total": int(len(df)),
@@ -838,6 +894,7 @@ def listar_jobs(request: Request):
     df = df.astype(object).replace({np.nan: None, np.inf: None, -np.inf: None})
 
     jobs = enrich_job_history_rows(df.to_dict(orient="records"))
+    jobs = enrich_jobs_with_live_counts(jobs, tenant_id)
 
     return {
         "total": int(len(df)),
@@ -1310,3 +1367,536 @@ def download_invalidos(request: Request, job_id: str):
         media_type="text/csv",
         filename=os.path.basename(caminho_arquivo),
     )
+
+
+# ==========================================================
+# 🧰 Helpers — gestão de carregamento (input_id)
+# ==========================================================
+
+def _normalizar_input_id(input_id: str) -> str:
+    try:
+        input_id_limpo = re.sub(r"[^a-fA-F0-9\-]", "", input_id or "")
+        return str(UUID(input_id_limpo))
+    except Exception as e:
+        logger.error(f"input_id inválido: repr={repr(input_id)} erro={e}")
+        raise HTTPException(status_code=400, detail="input_id inválido")
+
+
+def _normalizar_nome_coluna(coluna: str) -> str:
+    coluna = str(coluna or "").strip().lower()
+    coluna = unicodedata.normalize("NFKD", coluna)
+    return "".join(ch for ch in coluna if not unicodedata.combining(ch))
+
+
+def _normalizar_prefixo_logradouro(logradouro: str) -> str:
+    """Replica geocoding_engine.domain.cache_key_builder._normalize_street_prefix."""
+    if not logradouro:
+        return ""
+    normalized = str(logradouro).strip().upper()
+    normalized = re.sub(r"^AV\.?\s+", "AVENIDA ", normalized)
+    normalized = re.sub(r"^R\.?\s+", "RUA ", normalized)
+    normalized = re.sub(r"^ROD\.?\s+", "RODOVIA ", normalized)
+    normalized = re.sub(r"^AL\.?\s+", "ALAMEDA ", normalized)
+    normalized = re.sub(r"^EST\.?\s+", "ESTRADA ", normalized)
+    normalized = re.sub(r"^TRAV\.?\s+", "TRAVESSA ", normalized)
+    normalized = re.sub(r"^PCA\.?\s+", "PRACA ", normalized)
+    normalized = re.sub(r"^PC\.?\s+", "PRACA ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _cache_keys_geocoding(logradouro: str, numero: str, cidade: str, uf: str):
+    """
+    Gera (endereco_canonico, endereco_normalizado) compatível com o
+    geocoding_engine — que indexa enderecos_cache por endereco_normalizado.
+    """
+    log = _normalizar_prefixo_logradouro(logradouro)
+    numero = str(numero or "").strip()
+    cidade = str(cidade or "").strip().upper()
+    uf = str(uf or "").strip().upper()
+
+    endereco_canonico = re.sub(
+        r"\s+", " ", f"{log} {numero}, {cidade} - {uf}".replace(" ,", ",")
+    ).strip()
+    endereco_normalizado = normalize_for_cache(endereco_canonico)
+    return endereco_canonico, endereco_normalizado
+
+
+def _carregamento_descricao(tenant_id: int, input_id: str) -> str | None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT descricao
+            FROM historico_pdv_jobs
+            WHERE tenant_id = %s AND input_id = %s AND descricao IS NOT NULL
+            ORDER BY criado_em DESC
+            LIMIT 1;
+            """,
+            (tenant_id, input_id),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+# ==========================================================
+# 📥 Download XLSX de PDVs válidos (gerado sob demanda do banco)
+# GET /pdv/processamentos/{input_id}/download-validos
+# ==========================================================
+
+@router.get(
+    "/processamentos/{input_id}/download-validos",
+    dependencies=[Depends(verify_token)],
+    tags=["Jobs"],
+)
+def download_validos(request: Request, input_id: str):
+    user = request.state.user
+    tenant_id = user["tenant_id"]
+
+    input_id = _normalizar_input_id(input_id)
+
+    conn = get_connection()
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT
+                cnpj, logradouro, numero, bairro, cidade, uf, cep,
+                pdv_vendas, pdv_lat, pdv_lon,
+                status_geolocalizacao, pdv_endereco_completo,
+                descricao, criado_em, atualizado_em
+            FROM pdvs
+            WHERE tenant_id = %s AND input_id = %s
+            ORDER BY cidade, bairro, logradouro;
+            """,
+            conn,
+            params=(tenant_id, input_id),
+        )
+    finally:
+        conn.close()
+
+    if df.empty:
+        raise HTTPException(
+            status_code=404,
+            detail="Nenhum PDV válido encontrado para este carregamento.",
+        )
+
+    df = df.astype(object).replace({np.nan: None, np.inf: None, -np.inf: None})
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="validos")
+    buffer.seek(0)
+
+    filename = f"pdvs_validos_{input_id}.xlsx"
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ==========================================================
+# 📥 Download XLSX de inválidos por carregamento (input_id)
+# GET /pdv/processamentos/{input_id}/download-invalidos
+# ==========================================================
+
+@router.get(
+    "/processamentos/{input_id}/download-invalidos",
+    dependencies=[Depends(verify_token)],
+    tags=["Jobs"],
+)
+def download_invalidos_por_input(request: Request, input_id: str):
+    user = request.state.user
+    tenant_id = user["tenant_id"]
+
+    input_id = _normalizar_input_id(input_id)
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT arquivo_invalidos
+            FROM historico_pdv_jobs
+            WHERE tenant_id = %s
+              AND input_id = %s
+              AND arquivo_invalidos IS NOT NULL
+            ORDER BY criado_em DESC
+            LIMIT 1;
+            """,
+            (tenant_id, input_id),
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Arquivo de inválidos não encontrado para este carregamento.",
+        )
+
+    caminho_arquivo = row[0]
+
+    if not os.path.exists(caminho_arquivo):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Arquivo não existe no disco: {caminho_arquivo}",
+        )
+
+    return FileResponse(
+        path=caminho_arquivo,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=os.path.basename(caminho_arquivo),
+    )
+
+
+# ==========================================================
+# 📍 Listar PDVs de um carregamento (paginado, com filtros)
+# GET /pdv/processamentos/{input_id}/pdvs
+# ==========================================================
+
+@router.get(
+    "/processamentos/{input_id}/pdvs",
+    dependencies=[Depends(verify_token)],
+    tags=["Locais"],
+)
+def listar_pdvs_do_carregamento(
+    request: Request,
+    input_id: str,
+    cnpj: str = Query(None),
+    cidade: str = Query(None),
+    uf: str = Query(None),
+    bairro: str = Query(None),
+    logradouro: str = Query(None),
+    cep: str = Query(None),
+    status_geolocalizacao: str = Query(None),
+    limit: int = Query(1000, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    user = request.state.user
+    tenant_id = user["tenant_id"]
+
+    input_id = _normalizar_input_id(input_id)
+
+    filtros = ["tenant_id = %s", "input_id = %s"]
+    params: list = [tenant_id, input_id]
+
+    if cnpj:
+        filtros.append("cnpj = %s")
+        params.append(re.sub(r"[^0-9]", "", cnpj))
+
+    if cidade:
+        filtros.append("cidade LIKE %s")
+        params.append(f"%{normalize_text(cidade)}%")
+
+    if uf:
+        filtros.append("uf = %s")
+        params.append(uf.strip().upper())
+
+    if bairro:
+        filtros.append("bairro LIKE %s")
+        params.append(f"%{normalize_text(bairro)}%")
+
+    if logradouro:
+        filtros.append("logradouro LIKE %s")
+        params.append(f"%{normalize_text(logradouro)}%")
+
+    if cep:
+        filtros.append("cep = %s")
+        params.append(re.sub(r"[^0-9]", "", cep))
+
+    if status_geolocalizacao:
+        filtros.append("status_geolocalizacao = %s")
+        params.append(status_geolocalizacao.strip())
+
+    where_clause = " AND ".join(filtros)
+
+    conn = get_connection()
+    try:
+        total_df = pd.read_sql_query(
+            f"SELECT COUNT(*) AS total FROM pdvs WHERE {where_clause};",
+            conn,
+            params=tuple(params),
+        )
+        total = int(total_df.iloc[0]["total"]) if not total_df.empty else 0
+
+        df = pd.read_sql_query(
+            f"""
+            SELECT
+                id, tenant_id, input_id, descricao,
+                cnpj, logradouro, numero, bairro, cidade, uf, cep,
+                pdv_lat, pdv_lon, pdv_endereco_completo,
+                status_geolocalizacao, pdv_vendas,
+                criado_em, atualizado_em
+            FROM pdvs
+            WHERE {where_clause}
+            ORDER BY cidade, bairro, logradouro
+            LIMIT %s OFFSET %s;
+            """,
+            conn,
+            params=tuple(params) + (limit, offset),
+        )
+
+        manuais_df = pd.read_sql_query(
+            """
+            SELECT COUNT(*) AS manuais
+            FROM pdvs
+            WHERE tenant_id = %s
+              AND input_id = %s
+              AND status_geolocalizacao = 'manual_insert';
+            """,
+            conn,
+            params=(tenant_id, input_id),
+        )
+        manuais = int(manuais_df.iloc[0]["manuais"]) if not manuais_df.empty else 0
+    finally:
+        conn.close()
+
+    df = df.astype(object).replace({np.nan: None, np.inf: None, -np.inf: None})
+
+    return {
+        "total": total,
+        "manuais": manuais,
+        "limit": limit,
+        "offset": offset,
+        "pdvs": df.to_dict(orient="records"),
+    }
+
+
+# ==========================================================
+# ➕ Inserção manual de PDVs já geocodificados (upload XLSX)
+# POST /pdv/processamentos/{input_id}/pdvs-manuais
+#
+# REGRAS:
+# - Planilha já vem com pdv_lat / pdv_lon — NÃO geocodifica
+# - Unicidade por CNPJ dentro do carregamento (input_id)
+# - Atualiza enderecos_cache pela chave canônica
+# - Registra linha em historico_pdv_jobs (status=manual_insert)
+# ==========================================================
+
+@router.post(
+    "/processamentos/{input_id}/pdvs-manuais",
+    dependencies=[Depends(verify_token)],
+    tags=["Locais"],
+)
+def inserir_pdvs_manuais(
+    request: Request,
+    input_id: str,
+    file: UploadFile = File(...),
+):
+    user = request.state.user
+    tenant_id = user["tenant_id"]
+
+    if user.get("role") not in [
+        "sales_router_adm",
+        "tenant_adm",
+        "tenant_operacional",
+    ]:
+        raise HTTPException(status_code=403, detail="Usuário sem permissão.")
+
+    input_id = _normalizar_input_id(input_id)
+
+    # ------------------------------------------------------
+    # Carregamento precisa existir para este tenant
+    # ------------------------------------------------------
+    descricao = _carregamento_descricao(tenant_id, input_id)
+    if descricao is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Carregamento não encontrado para este tenant.",
+        )
+
+    # ------------------------------------------------------
+    # Leitura do arquivo
+    # ------------------------------------------------------
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in [".xlsx", ".xls"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Formato inválido. Envie um arquivo XLSX.",
+        )
+
+    try:
+        conteudo = file.file.read()
+        df = pd.read_excel(io.BytesIO(conteudo), dtype=str, engine="openpyxl").fillna("")
+    except Exception as e:
+        logger.error(f"❌ Erro ao ler planilha manual: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Falha ao ler a planilha: {e}")
+
+    if df.empty:
+        raise HTTPException(status_code=400, detail="Planilha vazia.")
+
+    df.columns = [_normalizar_nome_coluna(c) for c in df.columns]
+
+    colunas_obrigatorias = [
+        "cnpj", "logradouro", "numero", "bairro",
+        "cidade", "uf", "cep", "pdv_lat", "pdv_lon",
+    ]
+    faltantes = [c for c in colunas_obrigatorias if c not in df.columns]
+    if faltantes:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Colunas ausentes na planilha: {', '.join(faltantes)}",
+        )
+
+    tem_vendas = "pdv_vendas" in df.columns
+
+    # ------------------------------------------------------
+    # Helpers de parsing
+    # ------------------------------------------------------
+    def _parse_coord(valor):
+        texto = str(valor or "").strip().replace(",", ".")
+        if not texto:
+            return None
+        try:
+            numero = float(texto)
+        except Exception:
+            return None
+        return numero if np.isfinite(numero) else None
+
+    def _parse_vendas(valor):
+        texto = str(valor or "").strip()
+        if not texto:
+            return None
+        texto = texto.replace("R$", "").replace("r$", "").strip()
+        if "," in texto:
+            texto = texto.replace(".", "").replace(",", ".")
+        texto = re.sub(r"[^0-9.]", "", texto)
+        try:
+            numero = float(texto)
+        except Exception:
+            return None
+        return numero if np.isfinite(numero) and numero <= 1_000_000_000 else None
+
+    # ------------------------------------------------------
+    # CNPJs já existentes no carregamento
+    # ------------------------------------------------------
+    reader = DatabaseReader()
+    cnpjs_existentes = set(reader.buscar_cnpjs_existentes(tenant_id, input_id))
+
+    pdvs_para_inserir: list[PDV] = []
+    cache_updates: list[tuple[str, str, float, float]] = []
+    cnpjs_no_lote: set[str] = set()
+
+    invalidos: list[dict] = []
+    duplicados: list[str] = []
+
+    total_linhas = len(df)
+
+    for posicao, (_, row) in enumerate(df.iterrows(), start=2):  # linha 1 = cabeçalho
+        cnpj = re.sub(r"[^0-9]", "", str(row.get("cnpj", "") or ""))
+        logradouro = str(row.get("logradouro", "") or "").strip()
+        numero = str(row.get("numero", "") or "").strip()
+        bairro = str(row.get("bairro", "") or "").strip()
+        cidade = str(row.get("cidade", "") or "").strip().upper()
+        uf = str(row.get("uf", "") or "").strip().upper()
+        cep = re.sub(r"[^0-9]", "", str(row.get("cep", "") or ""))
+        lat = _parse_coord(row.get("pdv_lat"))
+        lon = _parse_coord(row.get("pdv_lon"))
+        vendas = _parse_vendas(row.get("pdv_vendas")) if tem_vendas else None
+
+        # Validações
+        motivo = None
+        if not cnpj:
+            motivo = "cnpj_invalido"
+        elif not logradouro:
+            motivo = "logradouro_invalido"
+        elif not cidade:
+            motivo = "cidade_invalida"
+        elif len(uf) != 2:
+            motivo = "uf_invalida"
+        elif lat is None or lon is None:
+            motivo = "coordenadas_invalidas"
+        elif coordenada_generica(lat, lon):
+            motivo = "coordenadas_genericas"
+
+        if motivo:
+            invalidos.append({"linha": posicao, "cnpj": cnpj, "motivo": motivo})
+            continue
+
+        # Chaves de cache compatíveis com o geocoding_engine
+        endereco_canonico, endereco_normalizado = _cache_keys_geocoding(
+            logradouro, numero, cidade, uf
+        )
+
+        # O cache é indexado por endereço — vale para qualquer linha válida,
+        # inclusive CNPJ duplicado (mesmo endereço continua útil no cache).
+        cache_updates.append((endereco_canonico, endereco_normalizado, lat, lon))
+
+        # Unicidade por CNPJ dentro do carregamento
+        if cnpj in cnpjs_existentes or cnpj in cnpjs_no_lote:
+            duplicados.append(cnpj)
+            continue
+
+        cnpjs_no_lote.add(cnpj)
+
+        cep_fmt = f"{cep[:5]}-{cep[5:]}" if len(cep) == 8 else ""
+        base_endereco = (
+            f"{logradouro} {numero}, {bairro}, {cidade} - {uf}"
+            if numero else
+            f"{logradouro}, {bairro}, {cidade} - {uf}"
+        )
+        if cep_fmt:
+            base_endereco = f"{base_endereco}, {cep_fmt}"
+        endereco_completo = f"{base_endereco}, Brasil"
+
+        pdvs_para_inserir.append(
+            PDV(
+                cnpj=cnpj,
+                logradouro=logradouro,
+                numero=numero,
+                bairro=bairro,
+                cidade=cidade,
+                uf=uf,
+                cep=cep,
+                pdv_vendas=vendas,
+                input_id=input_id,
+                descricao=descricao,
+                pdv_endereco_completo=endereco_completo,
+                endereco_cache_key=endereco_normalizado,
+                pdv_lat=lat,
+                pdv_lon=lon,
+                status_geolocalizacao="manual_insert",
+                tenant_id=tenant_id,
+            )
+        )
+
+    # ------------------------------------------------------
+    # Persistência
+    # ------------------------------------------------------
+    writer = DatabaseWriter()
+
+    inseridos = 0
+    if pdvs_para_inserir:
+        inseridos = writer.inserir_pdvs(pdvs_para_inserir) or 0
+
+    # Atualiza o cache (endereco_normalizado) para todas as linhas válidas
+    for endereco_canonico, endereco_normalizado, lat, lon in cache_updates:
+        writer.salvar_cache_geocoding(
+            endereco_canonico,
+            endereco_normalizado,
+            lat,
+            lon,
+            origem="manual_insert",
+        )
+
+    # Inserção manual NÃO cria linha própria no histórico — apenas atualiza o
+    # input de destino. O card do histórico é recalculado ao vivo da tabela pdvs.
+    logger.info(
+        f"➕ Inserção manual | tenant={tenant_id} input_id={input_id} "
+        f"inseridos={inseridos} duplicados={len(duplicados)} invalidos={len(invalidos)}"
+    )
+
+    return {
+        "status": "success",
+        "input_id": input_id,
+        "total_linhas": total_linhas,
+        "inseridos": inseridos,
+        "ignorados_duplicados": len(duplicados),
+        "invalidos": len(invalidos),
+        "detalhes_duplicados": duplicados[:50],
+        "detalhes_invalidos": invalidos[:50],
+    }

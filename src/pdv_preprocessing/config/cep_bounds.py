@@ -27,3 +27,19 @@ CEP_BOUNDS = {
     "SE": ("49000000", "49999999"),
     "TO": ("77000000", "77999999"),
 }
+
+
+def ufs_possiveis_do_cep(cep: str) -> set[str]:
+    """
+    Retorna o conjunto de UFs cuja faixa de CEP contém o CEP informado.
+    As faixas têm sobreposições (ex.: DF/GO), por isso retorna um conjunto.
+    Uso: guarda de sanidade — checagem offline, sem chamada externa.
+    """
+    digitos = "".join(ch for ch in str(cep or "") if ch.isdigit())
+    if len(digitos) != 8:
+        return set()
+    return {
+        uf
+        for uf, (inicio, fim) in CEP_BOUNDS.items()
+        if inicio <= digitos <= fim
+    }
