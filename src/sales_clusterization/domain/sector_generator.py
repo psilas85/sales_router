@@ -231,6 +231,67 @@ def dbscan_setores(
 # ==========================================================
 # ⚖️ KMEANS balanceado com refinamento adaptativo por limites
 # ==========================================================
+def kmeans_fixo(pdvs: List[PDV], k: int):
+    """
+    Roda KMeans simples com K fixo definido pelo usuário (modo "Número fixo").
+    Sem balanceamento, sem subdivisão, sem refinamento — entrega exatamente K
+    setores, com tamanhos que podem variar livremente conforme a geografia.
+    """
+    import numpy as np
+    from sklearn.cluster import KMeans
+    import math  # noqa: F401
+
+    n = len(pdvs)
+    if n == 0:
+        return []
+
+    k_efetivo = max(1, min(int(k), n))
+    if k_efetivo != k:
+        logger.warning(
+            f"⚠️ K solicitado={k} ajustado para {k_efetivo} "
+            f"(precisa estar entre 1 e N={n})."
+        )
+
+    logger.info(f"🎯 KMeans fixo | N={n}, K={k_efetivo}")
+
+    coords = np.array([[p.lat, p.lon] for p in pdvs])
+    km = KMeans(n_clusters=k_efetivo, random_state=42, n_init=10)
+    labels = km.fit_predict(coords)
+
+    setores = []
+    for cid in range(k_efetivo):
+        mask = labels == cid
+        if not mask.any():
+            continue
+        subset = coords[mask]
+        centro = tuple(map(float, np.mean(subset, axis=0)))
+        pts = [(float(x[0]), float(x[1])) for x in subset]
+        med, p95 = _raios_cluster(centro, pts)
+        pdvs_sub = [p for p, m in zip(pdvs, mask) if m]
+        for p in pdvs_sub:
+            p.cluster_label = cid
+
+        setores.append(
+            Setor(
+                cluster_label=cid,
+                centro_lat=centro[0],
+                centro_lon=centro[1],
+                n_pdvs=len(pdvs_sub),
+                raio_med_km=med,
+                raio_p95_km=p95,
+                pdvs=pdvs_sub,
+                coords=pts,
+                metrics={"modo": "fixo"},
+            )
+        )
+
+    logger.success(
+        f"✅ KMeans fixo concluído | K={len(setores)} | "
+        f"tamanhos={[s.n_pdvs for s in setores]}"
+    )
+    return setores
+
+
 def kmeans_balanceado(
     pdvs: List[PDV],
     max_pdv_cluster: int,
@@ -238,13 +299,17 @@ def kmeans_balanceado(
     max_dist_km: float,
     max_time_min: float,
     tempo_servico_min: float,
+    redistribuir: bool = False,
 ):
     """
     Executa KMeans balanceado com controle de tamanho máximo de cluster.
     1️⃣ Calcula K inicial = ceil(N / max_pdv_cluster)
     2️⃣ Executa KMeans normal
-    3️⃣ Subdivide clusters que excederem o limite de PDVs
-    4️⃣ Só depois calcula rotas simuladas (Haversine) e tempos
+    3️⃣ Se redistribuir=True, tenta redistribuir pontos excedentes do
+        cluster cheio pros vizinhos com folga antes de subdividir
+        (preserva o K mínimo teórico — pedido no modo "capacidade").
+    4️⃣ Subdivide clusters que ainda excedam o limite de PDVs
+    5️⃣ Só depois calcula rotas simuladas (Haversine) e tempos
     """
     import numpy as np
     from sklearn.cluster import KMeans
@@ -313,6 +378,81 @@ def kmeans_balanceado(
     coords = np.array([[p.lat, p.lon] for p in pdvs])
     kmeans = KMeans(n_clusters=k_inicial, random_state=42, n_init=10)
     labels = kmeans.fit_predict(coords)
+
+    # ==========================================================
+    # 🔹 Etapa 1.5: Redistribuição (modo capacidade)
+    # ----------------------------------------------------------
+    # Sem isso: clusters cheios são subdivididos → K final cresce.
+    # Com isso: pontos mais distantes do centro do cluster cheio
+    # migram pra clusters vizinhos com folga, preservando K mínimo.
+    # Repete até convergir ou não conseguir mais mover (safety:
+    # max_pdv_cluster * k_inicial iterações).
+    # ==========================================================
+    if redistribuir:
+        centros = kmeans.cluster_centers_.copy()
+        labels = labels.copy()
+
+        # Razão máxima dist(destino)/dist(origem) tolerada pra mover um ponto.
+        # Se passar disso, o ponto "pertence" geograficamente ao cluster cheio
+        # e movê-lo deixaria buraco visível no mapa (ilha laranja dentro do
+        # azul). Aborta o rebalanceamento e cai pro fallback de subdivisão.
+        LIMITE_RAZAO = 2.0
+
+        # Cap = N (cada iteração move 1 ponto).
+        for _ in range(len(pdvs)):
+            sizes = np.bincount(labels, minlength=k_inicial)
+            if sizes.max() <= max_pdv_cluster:
+                break
+
+            k_full = int(np.argmax(sizes))
+            idxs_full = np.where(labels == k_full)[0]
+
+            # Pra cada cluster vizinho com folga, acha o ponto do cheio
+            # mais PRÓXIMO do centro do vizinho (= ponto na fronteira).
+            # Esse é o melhor candidato a migrar — preserva coesão visual.
+            melhor_idx = None
+            melhor_k_dest = None
+            melhor_razao = float("inf")
+
+            for k_cand in range(k_inicial):
+                if k_cand == k_full or sizes[k_cand] >= max_pdv_cluster:
+                    continue
+                d_destino = np.linalg.norm(
+                    coords[idxs_full] - centros[k_cand], axis=1
+                )
+                i_fronteira = int(np.argmin(d_destino))
+                idx_global = idxs_full[i_fronteira]
+                d_origem = np.linalg.norm(coords[idx_global] - centros[k_full])
+                razao = d_destino[i_fronteira] / max(d_origem, 1e-9)
+                if razao < melhor_razao:
+                    melhor_razao = razao
+                    melhor_idx = idx_global
+                    melhor_k_dest = k_cand
+
+            if melhor_idx is None:
+                logger.info(
+                    "♻️ Redistribuição parou: nenhum cluster com folga. "
+                    "Vai cair no fallback de subdivisão."
+                )
+                break
+
+            if melhor_razao > LIMITE_RAZAO:
+                logger.info(
+                    f"♻️ Redistribuição abortada: melhor candidato tem "
+                    f"razão={melhor_razao:.2f} (>{LIMITE_RAZAO}) — moveria "
+                    f"ponto pra cluster geograficamente distante. "
+                    f"Vai cair no fallback de subdivisão."
+                )
+                break
+
+            labels[melhor_idx] = melhor_k_dest
+
+        sizes_final = np.bincount(labels, minlength=k_inicial)
+        if sizes_final.max() <= max_pdv_cluster:
+            logger.info(
+                f"♻️ Redistribuição OK | K preservado={k_inicial} | "
+                f"tamanhos={sizes_final.tolist()}"
+            )
 
     # ==========================================================
     # 🔹 Etapa 2: Rebalanceamento por tamanho (AGORA COM ÍNDICES REAIS)

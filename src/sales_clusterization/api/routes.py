@@ -150,15 +150,8 @@ async def clusterizar(request: Request):
         raise HTTPException(400, "JSON inválido no body.")
 
     algo = body.get("algo", "kmeans")
-    cidade = body.get("cidade")
-
-    if algo == "capacitated_sweep":
-        if not cidade or not str(cidade).strip():
-            raise HTTPException(
-                status_code=400,
-                detail="Para o algoritmo capacitated_sweep (DIVISOR), o parâmetro 'cidade' é obrigatório."
-            )
-
+    # Cidade é opcional em todos os algoritmos. Quando omitida, o algoritmo
+    # roda sobre todos os PDVs da UF (pode incluir várias cidades).
     params = {
         "tenant_id": tenant_id,
         "uf": body["uf"],
@@ -168,6 +161,9 @@ async def clusterizar(request: Request):
         "input_id": body["input_id"],
 
         "max_pdv_cluster": body.get("max_pdv_cluster", 200),
+        # "operacional" (default, atual): kmeans_balanceado + refinador de rotas diárias
+        # "capacidade": só kmeans_balanceado (respeita teto de PDVs, ignora workday/route)
+        "modo_refinamento": body.get("modo_refinamento", "operacional"),
         "dias_uteis": body.get("dias_uteis", 20),
         "freq": body.get("freq", 1),
         "workday_min": body.get("workday_min", 500),

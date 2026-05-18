@@ -182,12 +182,41 @@ class DatabaseWriter:
                 )
                 historico_excluido = cur.rowcount
 
+                # ----------------------------------------------------
+                # 🗑 4. Exclui PDVs inválidos
+                # ----------------------------------------------------
+                # Tabela criada no refactor de 2026-05-18 (DB = fonte da
+                # verdade). Antes os inválidos viviam só em XLSX no disco;
+                # agora ficam aqui e precisam ser limpos junto.
+                # to_regclass evita crash caso a tabela ainda não exista
+                # (nenhum upload novo após o refactor → lazy migration via
+                # salvar_invalidos_batch nunca rodou).
+                cur.execute("SELECT to_regclass('pdv_invalidos');")
+                tabela_existe = cur.fetchone()[0] is not None
+
+                if tabela_existe:
+                    cur.execute(
+                        """
+                        DELETE FROM pdv_invalidos
+                        WHERE tenant_id = %s
+                        AND input_id = %s;
+                        """,
+                        (tenant_id, input_id)
+                    )
+                    invalidos_excluidos = cur.rowcount
+                else:
+                    invalidos_excluidos = 0
+
             conn.commit()
 
             # ----------------------------------------------------
             # 📊 Logs
             # ----------------------------------------------------
-            if pdvs_excluidos == 0 and historico_excluido == 0:
+            if (
+                pdvs_excluidos == 0
+                and historico_excluido == 0
+                and invalidos_excluidos == 0
+            ):
                 logging.warning(
                     f"⚠️ Nenhum registro encontrado para exclusão "
                     f"(tenant={tenant_id}, input_id={input_id})"
@@ -197,7 +226,8 @@ class DatabaseWriter:
                     f"🗑 Processamento excluído com sucesso "
                     f"(tenant={tenant_id}, input_id={input_id}) | "
                     f"PDVs removidos={pdvs_excluidos} | "
-                    f"Histórico removido={historico_excluido}"
+                    f"Histórico removido={historico_excluido} | "
+                    f"Inválidos removidos={invalidos_excluidos}"
                 )
 
             return True
@@ -210,6 +240,237 @@ class DatabaseWriter:
                 exc_info=True
             )
             return False
+
+        finally:
+            POOL.putconn(conn)
+
+    # ============================================================
+    # 🧨 Exclusão em CASCATA (input + setorizações + roteirizações)
+    # ============================================================
+    # Cuidado: destrutivo. Use só quando o usuário pediu explicitamente
+    # via ?cascade=true. Permissão validada em camada superior (routes.py).
+    #
+    # Schema audit (2026-05-18) revelou:
+    # - Algumas FKs JÁ cascateiam ao deletar cluster_run:
+    #     sales_subcluster, sales_subcluster_pdv, sales_routing_resumo
+    # - Outras precisam DELETE manual ANTES de cluster_run:
+    #     cluster_setor, cluster_setor_pdv (NO ACTION)
+    # - Tabelas sem FK pra cluster_run (filtradas por routing_id /
+    #     clusterization_id / assign_id):
+    #     historico_subcluster_jobs (+ historico_assign_jobs via CASCADE),
+    #     sales_pdv_vendedor, sales_subcluster_vendedor, sales_vendedor_base,
+    #     sales_clusterization_outliers
+    # - sales_routing_snapshot NÃO é cascateada (snapshots manuais).
+    #
+    # NÃO usa @retry_on_failure: o decorator engole exceções não-operacionais
+    # e retorna None, fazendo o endpoint reportar sucesso silencioso em caso
+    # de SQL inválido. Cascade é destrutivo — falhas têm que propagar.
+    def excluir_processamento_cascata(
+        self,
+        tenant_id: int,
+        input_id: str,
+    ) -> dict:
+        input_id = str(input_id)
+        contagens: dict = {}
+
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+
+                # ------------------------------------------------
+                # Coleta IDs upstream usados em filtros downstream
+                # ------------------------------------------------
+                cur.execute(
+                    """
+                    SELECT id, clusterization_id
+                    FROM cluster_run
+                    WHERE tenant_id = %s AND input_id = %s
+                    """,
+                    (tenant_id, input_id),
+                )
+                cluster_runs = cur.fetchall()
+                cluster_run_ids = [r[0] for r in cluster_runs]
+                clusterization_ids = [r[1] for r in cluster_runs if r[1] is not None]
+
+                routing_ids: list = []
+                assign_ids: list = []
+                if cluster_run_ids:
+                    cur.execute(
+                        """
+                        SELECT DISTINCT routing_id
+                        FROM sales_subcluster
+                        WHERE tenant_id = %s AND run_id = ANY(%s)
+                        """,
+                        (tenant_id, cluster_run_ids),
+                    )
+                    routing_ids = [r[0] for r in cur.fetchall() if r[0] is not None]
+
+                    cur.execute(
+                        """
+                        SELECT DISTINCT assign_id
+                        FROM sales_subcluster
+                        WHERE tenant_id = %s
+                          AND run_id = ANY(%s)
+                          AND assign_id IS NOT NULL
+                        """,
+                        (tenant_id, cluster_run_ids),
+                    )
+                    assign_ids = [r[0] for r in cur.fetchall() if r[0] is not None]
+
+                # ------------------------------------------------
+                # Helper: DELETE só se a tabela existir
+                # ------------------------------------------------
+                def safe_delete(label: str, table: str, sql_where: str, params: tuple):
+                    cur.execute("SELECT to_regclass(%s);", (table,))
+                    if cur.fetchone()[0] is None:
+                        contagens[label] = "skip (tabela ausente)"
+                        return
+                    cur.execute(f"DELETE FROM {table} WHERE {sql_where};", params)
+                    contagens[label] = cur.rowcount
+
+                # ------------------------------------------------
+                # 1. Vendedores / assigns (downstream de routings)
+                # ------------------------------------------------
+                # Cast explícito de array → uuid[]: psycopg2 envia listas como
+                # array de text por default, e essas colunas são UUID no PG.
+                # Sem o cast: `operator does not exist: uuid = text`.
+                assign_ids_str = [str(x) for x in assign_ids]
+                routing_ids_str = [str(x) for x in routing_ids]
+                clusterization_ids_str = [str(x) for x in clusterization_ids]
+
+                if assign_ids_str:
+                    safe_delete(
+                        "sales_vendedor_base",
+                        "sales_vendedor_base",
+                        "tenant_id = %s AND assign_id = ANY(%s::uuid[])",
+                        (tenant_id, assign_ids_str),
+                    )
+
+                if routing_ids_str:
+                    safe_delete(
+                        "sales_pdv_vendedor",
+                        "sales_pdv_vendedor",
+                        "tenant_id = %s AND routing_id = ANY(%s::uuid[])",
+                        (tenant_id, routing_ids_str),
+                    )
+                    safe_delete(
+                        "sales_subcluster_vendedor",
+                        "sales_subcluster_vendedor",
+                        "tenant_id = %s AND routing_id = ANY(%s::uuid[])",
+                        (tenant_id, routing_ids_str),
+                    )
+
+                    # historico_subcluster_jobs cascateia historico_assign_jobs (FK CASCADE)
+                    safe_delete(
+                        "historico_subcluster_jobs",
+                        "historico_subcluster_jobs",
+                        "tenant_id = %s AND routing_id = ANY(%s::uuid[])",
+                        (tenant_id, routing_ids_str),
+                    )
+
+                # ------------------------------------------------
+                # 2. Outliers da clusterização + histórico da setorização
+                # ------------------------------------------------
+                if clusterization_ids_str:
+                    safe_delete(
+                        "sales_clusterization_outliers",
+                        "sales_clusterization_outliers",
+                        "tenant_id = %s AND clusterization_id = ANY(%s::uuid[])",
+                        (tenant_id, clusterization_ids_str),
+                    )
+                    # historico_cluster_jobs.clusterization_id é VARCHAR (não uuid),
+                    # então não precisa cast ::uuid[]. Sem FK pra cluster_run, então
+                    # precisa DELETE manual — é o que alimenta a aba "Últimas
+                    # setorizações executadas" do frontend.
+                    safe_delete(
+                        "historico_cluster_jobs",
+                        "historico_cluster_jobs",
+                        "tenant_id = %s AND clusterization_id = ANY(%s)",
+                        (tenant_id, clusterization_ids_str),
+                    )
+
+                # ------------------------------------------------
+                # 3. Cluster filhos com FK NO ACTION (manual antes do parent)
+                # ------------------------------------------------
+                if cluster_run_ids:
+                    safe_delete(
+                        "cluster_setor_pdv",
+                        "cluster_setor_pdv",
+                        "run_id = ANY(%s)",
+                        (cluster_run_ids,),
+                    )
+                    safe_delete(
+                        "cluster_setor",
+                        "cluster_setor",
+                        "run_id = ANY(%s)",
+                        (cluster_run_ids,),
+                    )
+
+                # ------------------------------------------------
+                # 4. cluster_run — CASCATEIA sales_subcluster*,
+                #    sales_routing_resumo (FKs CASCADE)
+                # ------------------------------------------------
+                cur.execute(
+                    """
+                    DELETE FROM cluster_run
+                    WHERE tenant_id = %s AND input_id = %s
+                    """,
+                    (tenant_id, input_id),
+                )
+                contagens["cluster_run"] = cur.rowcount
+
+                # ------------------------------------------------
+                # 5. Inválidos (tabela criada via lazy migration)
+                # ------------------------------------------------
+                cur.execute("SELECT to_regclass('pdv_invalidos');")
+                if cur.fetchone()[0] is not None:
+                    cur.execute(
+                        """
+                        DELETE FROM pdv_invalidos
+                        WHERE tenant_id = %s AND input_id = %s
+                        """,
+                        (tenant_id, input_id),
+                    )
+                    contagens["pdv_invalidos"] = cur.rowcount
+                else:
+                    contagens["pdv_invalidos"] = "skip (tabela ausente)"
+
+                # ------------------------------------------------
+                # 6. Histórico do upload + PDVs base
+                # ------------------------------------------------
+                cur.execute(
+                    """
+                    DELETE FROM historico_pdv_jobs
+                    WHERE tenant_id = %s AND input_id = %s
+                    """,
+                    (tenant_id, input_id),
+                )
+                contagens["historico_pdv_jobs"] = cur.rowcount
+
+                cur.execute(
+                    """
+                    DELETE FROM pdvs
+                    WHERE tenant_id = %s AND input_id = %s
+                    """,
+                    (tenant_id, input_id),
+                )
+                contagens["pdvs"] = cur.rowcount
+
+            conn.commit()
+            logging.warning(
+                f"🧨 Cascata executada (tenant={tenant_id}, input_id={input_id}). "
+                f"Contagens: {contagens}"
+            )
+            return contagens
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(
+                f"❌ Erro na exclusão em cascata "
+                f"(tenant={tenant_id}, input_id={input_id}): {e}",
+                exc_info=True,
+            )
+            raise
 
         finally:
             POOL.putconn(conn)
@@ -471,6 +732,109 @@ class DatabaseWriter:
         except Exception as e:
             conn.rollback()
             logging.error(f"❌ Erro ao salvar histórico PDV: {e}", exc_info=True)
+        finally:
+            POOL.putconn(conn)
+
+    # ============================================================
+    # 🚫 Persistência de PDVs inválidos
+    # ============================================================
+    # Em vez de gerar XLSX no disco em /app/data/invalidos/, os inválidos
+    # ficam em pdv_invalidos. O endpoint de download gera XLSX on-demand
+    # a partir daqui — mesma filosofia "DB = fonte da verdade" dos válidos.
+    @retry_on_failure()
+    def salvar_invalidos_batch(
+        self,
+        tenant_id: int,
+        input_id: str,
+        df_invalidos,
+    ) -> int:
+        if df_invalidos is None or df_invalidos.empty:
+            return 0
+
+        import pandas as pd
+
+        conn = POOL.getconn()
+        try:
+            with conn.cursor() as cur:
+                # Lazy migration — segue padrão de outros repositories do projeto
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS pdv_invalidos (
+                        id SERIAL PRIMARY KEY,
+                        tenant_id INTEGER NOT NULL,
+                        input_id UUID NOT NULL,
+                        cnpj TEXT,
+                        logradouro TEXT,
+                        numero TEXT,
+                        bairro TEXT,
+                        cidade TEXT,
+                        uf TEXT,
+                        cep TEXT,
+                        pdv_vendas NUMERIC,
+                        motivo_invalidade TEXT,
+                        criado_em TIMESTAMP NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_pdv_invalidos_tenant_input
+                        ON pdv_invalidos(tenant_id, input_id);
+                    """
+                )
+
+                def safe_str(v, maxlen=None):
+                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                        return None
+                    s = str(v).strip()
+                    if not s:
+                        return None
+                    return s[:maxlen] if maxlen else s
+
+                def safe_num(v):
+                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                        return None
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        return None
+
+                valores = [
+                    (
+                        tenant_id,
+                        str(input_id),
+                        safe_str(row.get("cnpj"), 30),
+                        safe_str(row.get("logradouro"), 500),
+                        safe_str(row.get("numero"), 30),
+                        safe_str(row.get("bairro"), 200),
+                        safe_str(row.get("cidade"), 200),
+                        safe_str(row.get("uf"), 5),
+                        safe_str(row.get("cep"), 20),
+                        safe_num(row.get("pdv_vendas")),
+                        safe_str(row.get("motivo_invalidade")),
+                    )
+                    for _, row in df_invalidos.iterrows()
+                ]
+
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO pdv_invalidos (
+                        tenant_id, input_id, cnpj, logradouro, numero,
+                        bairro, cidade, uf, cep, pdv_vendas, motivo_invalidade
+                    ) VALUES %s
+                    """,
+                    valores,
+                )
+
+            conn.commit()
+            return len(valores)
+
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"❌ Erro ao salvar inválidos no banco: {e}", exc_info=True)
+            return 0
+
         finally:
             POOL.putconn(conn)
 

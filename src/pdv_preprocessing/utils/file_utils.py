@@ -63,29 +63,8 @@ def detectar_separador(path: str) -> str:
         return ";" if ";" in linha else ","
 
 
-def salvar_invalidos(df_invalidos: pd.DataFrame, pasta_base: str, input_id: str) -> str | None:
-    try:
-        if df_invalidos is None or df_invalidos.empty:
-            return None
-
-        df_export = enrich_invalidos_for_export(df_invalidos)
-
-        pasta_invalidos = os.path.join(pasta_base, "invalidos")
-        os.makedirs(pasta_invalidos, exist_ok=True)
-
-        nome_arquivo = f"pdvs_invalidos_{input_id}.xlsx"
-        caminho_saida = os.path.join(pasta_invalidos, nome_arquivo)
-
-        df_export.to_excel(
-            caminho_saida,
-            index=False,
-            engine="openpyxl"
-        )
-
-        logging.warning(f"⚠️ {len(df_invalidos)} inválidos salvos em: {caminho_saida}")
-        return caminho_saida
-
-    except Exception as e:
-        logging.error(f"❌ Erro ao salvar inválidos: {e}", exc_info=True)
-        return None
+# NOTA: `salvar_invalidos` foi removida em 2026-05-18.
+# Os PDVs inválidos agora ficam na tabela `pdv_invalidos` no PG e o XLSX
+# é gerado on-demand pelo endpoint `/pdv/processamentos/{input_id}/download-invalidos`
+# (ver `_gerar_xlsx_invalidos_stream` em api/routes.py).
 

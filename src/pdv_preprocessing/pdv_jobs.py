@@ -5,6 +5,7 @@
 # ============================================================
 
 import logging
+import os
 import subprocess
 import json
 from uuid import uuid4, UUID
@@ -205,6 +206,22 @@ def processar_pdv(tenant_id, file_path, descricao):
             descricao=descricao,
             input_id=input_id_norm,
         )
+
+        # ----------------------------------------------------
+        # 🧹 Cleanup: remove o XLSX original em caso de sucesso.
+        # Os dados estruturados já estão no PostgreSQL (válidos +
+        # histórico) e os inválidos têm XLSX separado em /app/output.
+        # Em caso de FALHA, o arquivo NÃO é removido (mantém p/ debug).
+        # ----------------------------------------------------
+        if resumo.get("status") == "success":
+            try:
+                if file_path and os.path.exists(file_path):
+                    os.remove(file_path)
+                    logger.info(f"🧹 Arquivo de entrada removido após sucesso: {file_path}")
+            except Exception as cleanup_err:
+                logger.warning(
+                    f"⚠️ Falha ao remover {file_path} após sucesso: {cleanup_err}"
+                )
 
         if job:
             job.meta.update({"step": "Finalizado", "progress": 100})

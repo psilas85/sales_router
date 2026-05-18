@@ -15,7 +15,7 @@ from fastapi import (
     Body,
     File,
 )
-from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 
 # Pydantic
 from pydantic import BaseModel
@@ -39,12 +39,7 @@ from redis import Redis
 from rq import Queue
 from rq.job import Job
 
-# Visualização
 from pathlib import Path
-from pdv_preprocessing.visualization.pdv_plotting import (
-    buscar_pdvs,
-    gerar_mapa_pdvs,
-)
 
 # Autenticação
 from .dependencies import verify_token
@@ -58,6 +53,9 @@ import unicodedata
 import shutil
 import os
 import re
+import io
+
+from pdv_preprocessing.utils.file_utils import enrich_invalidos_for_export
 import io
 
 
@@ -471,177 +469,149 @@ def upload_arquivo(
 
 
 # ==========================================================
-# 🗺️ Gerar mapa de PDVs (autenticado)
+# 🗺️ Mapas de PDVs — removidos em 2026-05-18.
+# Os endpoints abaixo geravam HTMLs estáticos em /app/output/maps/ e
+# foram substituídos por renderização inline no frontend, que busca os
+# pontos via `/pdv/mapa-locais` e renderiza com Leaflet (componente
+# `<GeocodeResultMap>`).
+#
+# Endpoints removidos:
+#   POST  /pdv/gerar-mapa
+#   GET   /pdv/mapa-status
+#   POST  /pdv/mapas-status
+#   GET   /pdv/download-mapa
+#   GET   /pdv/ver-mapa
+#
+# Páginas que faziam essa visualização (Carregamentos e /dados/mapas/{id})
+# foram refatoradas pra usar o mapa inline.
 # ==========================================================
-
-@router.post("/gerar-mapa", dependencies=[Depends(verify_token)], tags=["Visualização"])
-def gerar_mapa_pdv(
-    request: Request,
-    input_id: str = Query(..., description="UUID do input de PDVs"),
-    uf: str = Query(None, description="UF opcional para filtrar"),
-    cidade: str = Query(None, description="Cidade opcional para filtrar (prioritário)"),
-):
-    """
-    Gera o mapa de PDVs para o tenant e input_id informados.
-    Pode filtrar por UF ou Cidade.
-    Retorna o caminho do arquivo HTML gerado.
-    """
-    user = request.state.user
-    tenant_id = user["tenant_id"]
-
-    try:
-        logger.info(f"🗺️ Solicitada geração de mapa | tenant={tenant_id} | input={input_id} | UF={uf or '--'} | Cidade={cidade or '--'}")
-
-        dados = buscar_pdvs(tenant_id, input_id, uf, cidade)
-        if not dados:
-            raise HTTPException(status_code=404, detail="Nenhum PDV encontrado para os parâmetros informados.")
-
-        output_dir = Path(f"/app/output/maps/{tenant_id}")
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-
-        nome_arquivo = f"pdvs_{input_id}_{cidade or uf or 'BR'}.html".replace(" ", "_")
-        output_path = output_dir / nome_arquivo
-
-        gerar_mapa_pdvs(dados, output_path)
-
-        if not output_path.exists():
-            raise HTTPException(status_code=500, detail="Falha ao gerar o arquivo de mapa.")
-
-        logger.success(f"✅ Mapa de PDVs disponível em {output_path}")
-
-        return {
-            "status": "success",
-            "tenant_id": tenant_id,
-            "input_id": input_id,
-            "uf": uf,
-            "cidade": cidade,
-            "arquivo_html": str(output_path),
-            "url_relativa": f"/output/maps/{tenant_id}/{nome_arquivo}"
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Erro ao gerar mapa de PDVs: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/mapa-status", dependencies=[Depends(verify_token)], tags=["Visualização"])
-def status_mapa_pdv(
-    request: Request,
-    input_id: str = Query(..., description="UUID do input de PDVs"),
-    uf: str = Query(None, description="UF opcional usada no nome do arquivo"),
-    cidade: str = Query(None, description="Cidade opcional usada no nome do arquivo"),
-):
-    user = request.state.user
-    tenant_id = user["tenant_id"]
-
-    nome_arquivo = f"pdvs_{input_id}_{cidade or uf or 'BR'}.html".replace(" ", "_")
-    caminho_arquivo = Path(f"/app/output/maps/{tenant_id}/{nome_arquivo}")
-    existe = caminho_arquivo.exists()
-
-    return {
-        "exists": existe,
-        "tenant_id": tenant_id,
-        "input_id": input_id,
-        "uf": uf,
-        "cidade": cidade,
-        "filename": nome_arquivo,
-        "url_relativa": f"/output/maps/{tenant_id}/{nome_arquivo}" if existe else None,
-    }
-
-
-# ==========================================================
-# 📥 Download do mapa de PDVs (autenticado)
-# ==========================================================
-
-@router.get("/download-mapa", dependencies=[Depends(verify_token)], tags=["Visualização"])
-def download_mapa_pdv(
-    request: Request,
-    input_id: str = Query(..., description="UUID do input de PDVs"),
-    uf: str = Query(None, description="UF opcional usada no nome do arquivo"),
-    cidade: str = Query(None, description="Cidade opcional usada no nome do arquivo"),
-):
-    user = request.state.user
-    tenant_id = user["tenant_id"]
-
-    try:
-        nome_arquivo = f"pdvs_{input_id}_{cidade or uf or 'BR'}.html".replace(" ", "_")
-        caminho_arquivo = f"/app/output/maps/{tenant_id}/{nome_arquivo}"
-
-        if not os.path.exists(caminho_arquivo):
-            raise HTTPException(status_code=404, detail=f"Arquivo não encontrado: {caminho_arquivo}")
-
-        logger.info(
-            f"📥 Download solicitado por {user.get('email', 'usuário desconhecido')} | tenant={tenant_id} | arquivo={caminho_arquivo}"
-        )
-        return FileResponse(
-            caminho_arquivo,
-            media_type="text/html",
-            filename=os.path.basename(caminho_arquivo)
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Erro ao baixar mapa: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Erro ao baixar mapa: {e}")
-
-
-# ==========================================================
-# 🌐 Visualizar mapa diretamente (redirect)
-# ==========================================================
-
-@router.get("/ver-mapa", dependencies=[Depends(verify_token)], tags=["Visualização"])
-def ver_mapa_pdv(
-    request: Request,
-    input_id: str = Query(..., description="UUID do input de PDVs"),
-    uf: str = Query(None, description="UF opcional usada no nome do arquivo"),
-    cidade: str = Query(None, description="Cidade opcional usada no nome do arquivo"),
-):
-    """
-    Redireciona o navegador diretamente para o arquivo HTML do mapa gerado.
-    A URL é resolvida dentro da rota do serviço (por exemplo via API Gateway).
-    """
-    user = request.state.user
-    tenant_id = user["tenant_id"]
-
-    nome_arquivo = f"pdvs_{input_id}_{cidade or uf or 'BR'}.html".replace(" ", "_")
-    caminho_arquivo = f"/app/output/maps/{tenant_id}/{nome_arquivo}"
-
-    if not os.path.exists(caminho_arquivo):
-        raise HTTPException(status_code=404, detail=f"Mapa não encontrado: {caminho_arquivo}")
-
-    # 🔗 Monta URL relativa usada pelo Gateway (ex: /output/maps/1/arquivo.html)
-    url_relativa = f"/output/maps/{tenant_id}/{nome_arquivo}"
-
-    logger.info(
-        f"🌐 Visualização solicitada | tenant={tenant_id} | arquivo={url_relativa}"
-    )
-
-    return RedirectResponse(url=url_relativa, status_code=302)
 
 # ==========================================================
 # ❌ Excluir processamento completo (por input_id)
 # ==========================================================
+@router.get(
+    "/processamentos/{input_id}/dependencies",
+    dependencies=[Depends(verify_token)],
+    tags=["Jobs"],
+)
+def listar_dependencias(request: Request, input_id: str):
+    """
+    Retorna contagem de registros downstream vinculados a um input_id.
+    Frontend usa pra mostrar preview no modal de exclusão (e decidir
+    se mostra a opção de cascata).
+    """
+    user = request.state.user
+    tenant_id = user["tenant_id"]
+    input_id = _normalizar_input_id(input_id)
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+
+        # Tudo dentro do mesmo tenant (multi-tenant safety)
+        cur.execute(
+            """
+            SELECT id, clusterization_id
+            FROM cluster_run
+            WHERE tenant_id = %s AND input_id = %s
+            """,
+            (tenant_id, input_id),
+        )
+        runs = cur.fetchall()
+        cluster_run_ids = [r[0] for r in runs]
+
+        contagem_routings = 0
+        contagem_vendedores = 0
+        contagem_subclusters = 0
+
+        if cluster_run_ids:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(DISTINCT routing_id) AS routings,
+                    COUNT(*) AS subclusters,
+                    COUNT(DISTINCT assign_id) FILTER (WHERE assign_id IS NOT NULL) AS assigns
+                FROM sales_subcluster
+                WHERE tenant_id = %s AND run_id = ANY(%s)
+                """,
+                (tenant_id, cluster_run_ids),
+            )
+            row = cur.fetchone()
+            contagem_routings = row[0] or 0
+            contagem_subclusters = row[1] or 0
+            contagem_vendedores = row[2] or 0
+
+        return {
+            "tenant_id": tenant_id,
+            "input_id": input_id,
+            "setorizacoes": len(cluster_run_ids),
+            "roteirizacoes": contagem_routings,
+            "subclusters": contagem_subclusters,
+            "consultores_alocados": contagem_vendedores,
+            "tem_dependencias": len(cluster_run_ids) > 0,
+        }
+    finally:
+        conn.close()
+
+
 @router.delete(
     "/processamentos/{input_id}",
     dependencies=[Depends(verify_token)],
     tags=["Jobs"],
 )
-def excluir_processamento(request: Request, input_id: str):
+def excluir_processamento(
+    request: Request,
+    input_id: str,
+    cascade: bool = Query(
+        False,
+        description=(
+            "Se true, faz exclusão em CASCATA: setorizações, roteirizações, "
+            "vendedores assignados, históricos derivados. "
+            "Requer role sales_router_adm. Operação destrutiva e irreversível."
+        ),
+    ),
+):
     user = request.state.user
     tenant_id = user["tenant_id"]
-
-    # 🔒 Permissão
-    if user.get("role") not in [
-        "sales_router_adm",
-        "tenant_adm",
-    ]:
-        raise HTTPException(status_code=403, detail="Sem permissão.")
+    role = user.get("role")
 
     writer = DatabaseWriter()
+
+    # ----------------------------------------------------------
+    # Modo CASCATA — destrutivo, só sales_router_adm
+    # ----------------------------------------------------------
+    if cascade:
+        if role != "sales_router_adm":
+            raise HTTPException(
+                status_code=403,
+                detail="Exclusão em cascata requer permissão de sales_router_adm.",
+            )
+
+        try:
+            contagens = writer.excluir_processamento_cascata(
+                tenant_id=tenant_id,
+                input_id=input_id,
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Falha na exclusão em cascata: {e}",
+            )
+
+        return {
+            "status": "success",
+            "mode": "cascade",
+            "tenant_id": tenant_id,
+            "input_id": input_id,
+            "deleted": contagens,
+            "message": "Processamento e dependências excluídos em cascata.",
+        }
+
+    # ----------------------------------------------------------
+    # Modo padrão — só apaga se NÃO houver cluster_run vinculado
+    # ----------------------------------------------------------
+    if role not in ["sales_router_adm", "tenant_adm"]:
+        raise HTTPException(status_code=403, detail="Sem permissão.")
 
     sucesso = writer.excluir_processamento_por_input(
         tenant_id=tenant_id,
@@ -651,11 +621,15 @@ def excluir_processamento(request: Request, input_id: str):
     if not sucesso:
         raise HTTPException(
             status_code=400,
-            detail="Processamento já vinculado a clusterização ou erro na exclusão.",
+            detail=(
+                "Processamento vinculado a setorização/roteirização. "
+                "Use ?cascade=true para excluir tudo (requer sales_router_adm)."
+            ),
         )
 
     return {
         "status": "success",
+        "mode": "default",
         "tenant_id": tenant_id,
         "input_id": input_id,
         "message": "Processamento excluído com sucesso.",
@@ -664,20 +638,40 @@ def excluir_processamento(request: Request, input_id: str):
 # ==========================================================
 # 📜 Listar últimos jobs de PDV (com paginação)
 # ==========================================================
+
+# Whitelist de colunas ordenáveis em /jobs/ultimos.
+# Importante: ordem por chave estrangeira ao SQL — protege contra injection.
+_SORTABLE_ULTIMOS_JOBS = {
+    "criado_em": "criado_em",
+    "descricao": "descricao",
+    "total_processados": "total_processados",
+    "validos": "validos",
+    "invalidos": "invalidos",
+}
+
+
 @router.get("/jobs/ultimos", dependencies=[Depends(verify_token)], tags=["Jobs"])
 def listar_ultimos_jobs(
     request: Request,
     limit: int = Query(10, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    sort_by: str = Query("criado_em"),
+    sort_dir: str = Query("desc"),
 ):
     user = request.state.user
     tenant_id = user["tenant_id"]
+
+    sort_col = _SORTABLE_ULTIMOS_JOBS.get(sort_by, "criado_em")
+    sort_dir_sql = "ASC" if str(sort_dir).lower() == "asc" else "DESC"
+    # criado_em DESC como tie-breaker garante ordem estável quando os
+    # valores da coluna principal são iguais ou NULL.
+    order_by_clause = f"{sort_col} {sort_dir_sql} NULLS LAST, criado_em DESC"
 
     conn = get_connection()
     cur = conn.cursor()
 
     cur.execute(
-        """
+        f"""
         SELECT
             id,
             tenant_id,
@@ -701,7 +695,7 @@ def listar_ultimos_jobs(
             WHERE tenant_id = %s
             ORDER BY input_id, criado_em DESC
         ) t
-        ORDER BY criado_em DESC
+        ORDER BY {order_by_clause}
         LIMIT %s OFFSET %s
         """,
         (tenant_id, limit, offset),
@@ -1317,8 +1311,65 @@ def progresso_job(request: Request, job_id: str):
 
 
 # ==========================================================
-# 📥 Download CSV de registros inválidos
+# 📥 Download XLSX de registros inválidos (on-demand do banco)
 # ==========================================================
+# Em vez de servir um XLSX pré-gerado em disco, busca os inválidos em
+# pdv_invalidos e gera o XLSX em memória. Sem arquivos órfãos no host.
+
+def _gerar_xlsx_invalidos_stream(
+    tenant_id: int,
+    input_id: str,
+) -> StreamingResponse:
+    """Constrói e retorna um StreamingResponse de XLSX a partir do banco."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT cnpj, logradouro, numero, bairro, cidade, uf, cep,
+                   pdv_vendas, motivo_invalidade
+            FROM pdv_invalidos
+            WHERE tenant_id = %s AND input_id = %s
+            ORDER BY id
+            """,
+            (tenant_id, input_id),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="Nenhum registro inválido para este carregamento.",
+        )
+
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "cnpj",
+            "logradouro",
+            "numero",
+            "bairro",
+            "cidade",
+            "uf",
+            "cep",
+            "pdv_vendas",
+            "motivo_invalidade",
+        ],
+    )
+    df = enrich_invalidos_for_export(df)
+
+    buffer = io.BytesIO()
+    df.to_excel(buffer, index=False, engine="openpyxl")
+    buffer.seek(0)
+
+    filename = f"pdvs_invalidos_{input_id}.xlsx"
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get(
@@ -1330,43 +1381,30 @@ def download_invalidos(request: Request, job_id: str):
     user = request.state.user
     tenant_id = user["tenant_id"]
 
+    # Resolve input_id a partir do job_id no histórico
     conn = get_connection()
-    cur = conn.cursor()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT input_id
+            FROM historico_pdv_jobs
+            WHERE tenant_id = %s AND job_id = %s
+            LIMIT 1
+            """,
+            (tenant_id, job_id),
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
 
-    cur.execute(
-        """
-        SELECT arquivo_invalidos
-        FROM historico_pdv_jobs
-        WHERE tenant_id = %s
-          AND job_id = %s
-          AND arquivo_invalidos IS NOT NULL
-        LIMIT 1;
-        """,
-        (tenant_id, job_id),
-    )
-
-    row = cur.fetchone()
-    conn.close()
-
-    if not row:
+    if not row or not row[0]:
         raise HTTPException(
             status_code=404,
-            detail="Arquivo de inválidos não encontrado para este job.",
+            detail="Job não encontrado ou sem input_id associado.",
         )
 
-    caminho_arquivo = row[0]
-
-    if not os.path.exists(caminho_arquivo):
-        raise HTTPException(
-            status_code=404,
-            detail=f"Arquivo não existe no disco: {caminho_arquivo}",
-        )
-
-    return FileResponse(
-        path=caminho_arquivo,
-        media_type="text/csv",
-        filename=os.path.basename(caminho_arquivo),
-    )
+    return _gerar_xlsx_invalidos_stream(tenant_id, str(row[0]))
 
 
 # ==========================================================
@@ -1510,47 +1548,8 @@ def download_validos(request: Request, input_id: str):
 def download_invalidos_por_input(request: Request, input_id: str):
     user = request.state.user
     tenant_id = user["tenant_id"]
-
     input_id = _normalizar_input_id(input_id)
-
-    conn = get_connection()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT arquivo_invalidos
-            FROM historico_pdv_jobs
-            WHERE tenant_id = %s
-              AND input_id = %s
-              AND arquivo_invalidos IS NOT NULL
-            ORDER BY criado_em DESC
-            LIMIT 1;
-            """,
-            (tenant_id, input_id),
-        )
-        row = cur.fetchone()
-    finally:
-        conn.close()
-
-    if not row:
-        raise HTTPException(
-            status_code=404,
-            detail="Arquivo de inválidos não encontrado para este carregamento.",
-        )
-
-    caminho_arquivo = row[0]
-
-    if not os.path.exists(caminho_arquivo):
-        raise HTTPException(
-            status_code=404,
-            detail=f"Arquivo não existe no disco: {caminho_arquivo}",
-        )
-
-    return FileResponse(
-        path=caminho_arquivo,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=os.path.basename(caminho_arquivo),
-    )
+    return _gerar_xlsx_invalidos_stream(tenant_id, input_id)
 
 
 # ==========================================================

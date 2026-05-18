@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from pdv_preprocessing.application.pdv_preprocessing_use_case import PDVPreprocessingUseCase
 from pdv_preprocessing.infrastructure.database_reader import DatabaseReader
 from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
-from pdv_preprocessing.utils.file_utils import detectar_separador, salvar_invalidos
+from pdv_preprocessing.utils.file_utils import detectar_separador
 from pdv_preprocessing.logs.logging_config import setup_logging
 
 
@@ -182,14 +182,17 @@ def main():
             )
 
         # --------------------------------------------------------
-        # Salvar inválidos
+        # Persistir inválidos no banco (tabela pdv_invalidos).
+        # XLSX é gerado on-demand pelo endpoint de download — sem
+        # arquivo redundante em /app/data/invalidos/.
         # --------------------------------------------------------
-        emit_progress(90, "Salvando registros inválidos")
-        arquivo_invalidos = salvar_invalidos(
-            df_invalidos,
-            os.path.dirname(input_path),
-            input_id
+        emit_progress(90, "Persistindo registros inválidos")
+        db_writer.salvar_invalidos_batch(
+            tenant_id=tenant_id,
+            input_id=input_id,
+            df_invalidos=df_invalidos,
         )
+        arquivo_invalidos = None  # campo legado mantido por compat de histórico
 
         # --------------------------------------------------------
         # Finalização

@@ -67,10 +67,21 @@ def main():
     # Usado por ambos
     parser.add_argument("--max_pdv_cluster", type=int, default=200)
     parser.add_argument("--max_iter", type=int, default=10)
+    # operacional: kmeans_balanceado + refinador (default, atual)
+    # capacidade: só kmeans_balanceado (respeita só max_pdv_cluster)
+    # fixo:       roda KMeans com K=k_forcado, sem balancear nem refinar
+    parser.add_argument(
+        "--modo_refinamento",
+        choices=["operacional", "capacidade", "fixo"],
+        default="operacional",
+    )
 
     parser.add_argument("--excluir_outliers", action="store_true")
     parser.add_argument("--clusterization_id")
     parser.add_argument("--z_thresh", type=float, default=3.0)
+    # K alvo para modo_refinamento="fixo" — usuário define exatamente
+    # quantos setores quer. Default None = não usa.
+    parser.add_argument("--k_forcado", type=int, default=None)
 
     args = parser.parse_args()
 
@@ -113,6 +124,9 @@ def main():
         logger.info(f"🚚 velocidade (km/h)  = {args.vel}")
 
     logger.info(f"🔢 max_pdv_cluster    = {args.max_pdv_cluster}")
+    logger.info(f"🎛️ modo_refinamento   = {args.modo_refinamento}")
+    if args.k_forcado:
+        logger.info(f"🎯 k_forcado          = {args.k_forcado}")
     logger.info(f"🔧 max_iter           = {args.max_iter}")
     logger.info(f"🧹 excluir_outliers   = {args.excluir_outliers}")
     logger.info(f"📏 z_thresh           = {args.z_thresh}")
@@ -139,6 +153,8 @@ def main():
         excluir_outliers=args.excluir_outliers,
         z_thresh=args.z_thresh,
         max_iter=args.max_iter,
+        modo_refinamento=args.modo_refinamento,
+        k_forcado=args.k_forcado,
     )
 
     print("\n=== RESULTADO FINAL ===")

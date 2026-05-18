@@ -80,21 +80,16 @@ def executar_clusterizacao(
     excluir_outliers: bool,
     z_thresh: float,
     max_iter: int,
+    modo_refinamento: str = "operacional",
+    k_forcado: Optional[int] = None,
 ) -> Dict[str, Any]:
 
     inicio_execucao = time()  # ✅ start cronômetro
 
     logger.info(f"🏁 Iniciando clusterização | tenant={tenant_id} | algo={algo}")
 
-    # ============================================================
-    # ❗ Regra de negócio (defensiva)
-    # ============================================================
-    if algo == "capacitated_sweep":
-        if not cidade or not str(cidade).strip():
-            raise ValueError(
-                "Cidade obrigatória para execução do algoritmo capacitated_sweep."
-            )
-
+    # Cidade é opcional em todos os algoritmos. Quando omitida, o use case
+    # roda sobre todos os PDVs da UF — pode incluir várias cidades.
 
     # ============================================================
     # 1) Carregar PDVs
@@ -172,33 +167,68 @@ def executar_clusterizacao(
         # 🔵 KMEANS — refinamento operacional
         # ============================================================
         if algo == "kmeans":
-            logger.info("🔵 Executando KMEANS + refinamento.")
+            if modo_refinamento == "fixo":
+                # Modo "Número fixo" — usuário define exatamente K.
+                # Não balanceia, não subdivide, não refina. Roda KMeans
+                # direto e aceita os tamanhos que saírem.
+                if not k_forcado or k_forcado < 1:
+                    raise ValueError(
+                        "Modo 'fixo' exige k_forcado >= 1 informado pelo usuário."
+                    )
+                from src.sales_clusterization.domain.sector_generator import (
+                    kmeans_fixo,
+                )
+                logger.info(
+                    f"🎯 KMEANS modo FIXO | K solicitado={k_forcado} "
+                    f"(sem balanceamento, sem refinamento)."
+                )
+                setores_finais = kmeans_fixo(pdvs, k_forcado)
 
-            # (opcional) se você não usa o retorno, pode remover esta linha
-            _ = kmeans_balanceado(
-                pdvs=pdvs,
-                max_pdv_cluster=max_pdv_cluster,
-                v_kmh=v_kmh,
-                max_dist_km=route_km_max,
-                max_time_min=workday_min,
-                tempo_servico_min=service_min,
-            )
+            else:
+                # Modos "operacional" e "capacidade" — ambos passam por
+                # kmeans_balanceado primeiro. No "capacidade", ativa
+                # redistribuição para preservar K mínimo (= ceil(N/max));
+                # no "operacional", o K mínimo serve de ponto de partida
+                # para o refinador de rotas diárias.
+                setores_balanceados = kmeans_balanceado(
+                    pdvs=pdvs,
+                    max_pdv_cluster=max_pdv_cluster,
+                    v_kmh=v_kmh,
+                    max_dist_km=route_km_max,
+                    max_time_min=workday_min,
+                    tempo_servico_min=service_min,
+                    redistribuir=(modo_refinamento == "capacidade"),
+                )
+                k_balanceado = len(setores_balanceados)
 
-            refiner = OperationalClusterRefiner(
-                v_kmh=v_kmh,
-                max_time_min=workday_min,
-                max_dist_km=route_km_max,
-                tempo_servico_min=service_min,
-                max_iter=max_iter,
-                tenant_id=tenant_id,
-            )
-
-            setores_finais = refiner.refinar_com_subclusters_iterativo(
-                pdvs=pdvs,
-                dias_uteis=dias_uteis,
-                freq=freq,
-                max_pdv_cluster=max_pdv_cluster,
-            )
+                if modo_refinamento == "capacidade":
+                    logger.info(
+                        f"🔵 KMEANS modo CAPACIDADE | K={k_balanceado} setores "
+                        f"(respeita max_pdv_cluster={max_pdv_cluster}; "
+                        f"refinamento operacional desativado)."
+                    )
+                    setores_finais = setores_balanceados
+                else:
+                    logger.info(
+                        f"🔵 KMEANS modo OPERACIONAL | K inicial={k_balanceado} "
+                        f"(do balanceado), pode crescer p/ caber em "
+                        f"workday={workday_min}min + rota={route_km_max}km."
+                    )
+                    refiner = OperationalClusterRefiner(
+                        v_kmh=v_kmh,
+                        max_time_min=workday_min,
+                        max_dist_km=route_km_max,
+                        tempo_servico_min=service_min,
+                        max_iter=max_iter,
+                        tenant_id=tenant_id,
+                    )
+                    setores_finais = refiner.refinar_com_subclusters_iterativo(
+                        pdvs=pdvs,
+                        dias_uteis=dias_uteis,
+                        freq=freq,
+                        max_pdv_cluster=max_pdv_cluster,
+                        k_inicial_param=k_balanceado,
+                    )
 
         # ============================================================
         # 🟢 CAPACITATED SWEEP
