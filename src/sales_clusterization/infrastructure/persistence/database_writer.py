@@ -32,9 +32,21 @@ psycopg2.extensions.register_adapter(np.float32, psycopg2._psycopg.AsIs)
 # ============================================================
 # 🆕 Criação de execução (run)
 # ============================================================
+def _uf_to_str(uf) -> str | None:
+    """Normaliza UF pra string CSV ("MG" ou "MG,SP,RJ") antes de gravar.
+    psycopg2 serializa list como PG array ({MG,SP}), que polui colunas TEXT
+    e quebra exibições simples no frontend. Mantemos CSV humano."""
+    if uf is None:
+        return None
+    if isinstance(uf, (list, tuple)):
+        parts = [str(u).strip().upper() for u in uf if str(u).strip()]
+        return ",".join(parts) if parts else None
+    return str(uf).strip().upper() or None
+
+
 def criar_run(
     tenant_id: int,
-    uf: str | None,
+    uf,  # str | List[str] | None
     cidade: str | None,
     algo: str,
     params: dict,
@@ -49,6 +61,7 @@ def criar_run(
     - descricao (texto descritivo informado pelo usuário)
     - input_id (referência da base de PDVs)
     """
+    uf = _uf_to_str(uf)
 
     sql = """
         INSERT INTO cluster_run (
@@ -408,28 +421,10 @@ def salvar_outliers(tenant_id: int, clusterization_id: str, pdv_flags: list):
         f"({100 * total_outliers / len(rows):.2f}%)."
     )
 
-    # ============================================================
-    # 📤 Exporta CSV de auditoria
-    # ============================================================
-    try:
-        base_dir = Path("output/auditoria_outliers") / str(tenant_id)
-        base_dir.mkdir(parents=True, exist_ok=True)
-
-        data_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_path = base_dir / f"outliers_{tenant_id}_{clusterization_id}_{data_str}.csv"
-
-        with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f, delimiter=";")
-            writer.writerow([
-                "tenant_id", "clusterization_id", "pdv_id", "cnpj", "cidade",
-                "lat", "lon", "distancia_media_km", "is_outlier"
-            ])
-            writer.writerows(rows)
-
-        logger.success(f"📁 CSV de auditoria salvo em: {csv_path}")
-
-    except Exception as e:
-        logger.warning(f"⚠️ Falha ao exportar CSV de outliers: {e}")
+    # CSV de auditoria removido (2026-05-18): os dados ficam em
+    # sales_clusterization_outliers no PG (fonte da verdade). Antes era
+    # gravado também em output/auditoria_outliers/ — 1 arquivo por execução
+    # crescendo indefinidamente. Pra auditar agora, query direto na tabela.
 
 
 

@@ -98,6 +98,18 @@ def executar_clusterizacao(
     if not pdvs:
         raise ValueError("Nenhum PDV encontrado.")
 
+    # Limite máximo de PDVs por execução. Acima disso o KMeans iterativo
+    # + refinador operacional ficam lentos (>30s) e a tabela cluster_setor_pdv
+    # cresce demais (1 row por PDV × N execuções). Se aparecer caso real,
+    # ajustar caso a caso ou implementar split por UF/região no frontend.
+    MAX_PDVS_POR_SETORIZACAO = 50000
+    if len(pdvs) > MAX_PDVS_POR_SETORIZACAO:
+        raise ValueError(
+            f"Setorização recusada: {len(pdvs):,} PDVs excedem o limite "
+            f"de {MAX_PDVS_POR_SETORIZACAO:,} por execução. "
+            f"Filtre por UF/cidade ou divida o carregamento."
+        )
+
     logger.info(f"📦 {len(pdvs)} PDVs carregados.")
 
     # ============================================================
@@ -303,10 +315,22 @@ def executar_clusterizacao(
 
         mapping = salvar_setores(tenant_id, run_id, setores_finais)
 
+        # Defesa contra PDVs cujo cluster_label não está no mapping —
+        # acontece em casos extremos (1 PDV total, algoritmo retorna labels
+        # vazio). Sem isso, KeyError aborta a execução inteira e o PDV
+        # fica sem cluster_id mas as métricas continuam válidas.
         for p in pdvs:
-            p.cluster_id = mapping[p.cluster_label]
+            cluster_id = mapping.get(p.cluster_label)
+            if cluster_id is None:
+                logger.warning(
+                    f"⚠️ PDV sem cluster_id (label={p.cluster_label} "
+                    f"não está em mapping={list(mapping.keys())}); pulando."
+                )
+                continue
+            p.cluster_id = cluster_id
 
-        salvar_mapeamento_pdvs(tenant_id, run_id, pdvs)
+        pdvs_com_cluster = [p for p in pdvs if getattr(p, "cluster_id", None) is not None]
+        salvar_mapeamento_pdvs(tenant_id, run_id, pdvs_com_cluster)
 
         finalizar_run(run_id, status="done", k_final=len(setores_finais))
 

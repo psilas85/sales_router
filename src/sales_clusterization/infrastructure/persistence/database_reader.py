@@ -14,7 +14,7 @@ from loguru import logger
 def carregar_pdvs(
     tenant_id: int,
     input_id: str,
-    uf: Optional[str] = None,
+    uf=None,  # str | List[str] | None
     cidade: Optional[str] = None,
 ) -> List[PDV]:
 
@@ -26,7 +26,17 @@ def carregar_pdvs(
     """
     params = [tenant_id, input_id]
 
-    if uf:
+    # uf aceita str (1 UF), lista (>=2 UFs) ou None (todas).
+    # Lista vazia equivale a None — não filtra.
+    if isinstance(uf, (list, tuple)):
+        ufs_norm = [str(u).strip().upper() for u in uf if str(u).strip()]
+        if len(ufs_norm) == 1:
+            base_query += " AND UPPER(uf) = %s"
+            params.append(ufs_norm[0])
+        elif len(ufs_norm) > 1:
+            base_query += " AND UPPER(uf) = ANY(%s)"
+            params.append(ufs_norm)
+    elif uf:
         base_query += " AND UPPER(uf) = UPPER(%s)"
         params.append(uf)
     if cidade:
@@ -96,9 +106,12 @@ def carregar_pdvs(
     for idx, p in enumerate(pdvs_limp):
         p.original_index = idx
 
+    uf_label = (
+        ",".join(uf) if isinstance(uf, (list, tuple)) and uf else (uf or "todas")
+    )
     logger.info(
         f"📦 {len(pdvs_limp)} PDVs carregados | tenant={tenant_id} | input_id={input_id} | "
-        f"UF={uf or 'todas'} | cidade={cidade or 'todas'} | 🧹 {invalidos} inválidos | ⚠️ {duplicadas} duplicadas"
+        f"UF={uf_label} | cidade={cidade or 'todas'} | 🧹 {invalidos} inválidos | ⚠️ {duplicadas} duplicadas"
     )
 
     return pdvs_limp

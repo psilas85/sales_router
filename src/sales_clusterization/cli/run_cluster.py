@@ -24,6 +24,26 @@ def validar_uf(uf: str):
     return uf
 
 
+def validar_ufs(ufs_csv: str):
+    """Aceita 'MG' ou 'MG,SP,RJ'. Retorna lista normalizada e única."""
+    if not ufs_csv:
+        raise ValueError("Pelo menos 1 UF é obrigatória.")
+    parts = [p.strip().upper() for p in str(ufs_csv).split(",") if p.strip()]
+    if not parts:
+        raise ValueError("Pelo menos 1 UF válida é obrigatória.")
+    invalidas = [p for p in parts if p not in UF_VALIDAS]
+    if invalidas:
+        raise ValueError(f"UF(s) inválida(s): {', '.join(invalidas)}")
+    # Preserva ordem mas remove duplicatas
+    seen = set()
+    out = []
+    for p in parts:
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    return out
+
+
 def validar_input_id(input_id: str):
     try:
         return str(uuid.UUID(input_id))
@@ -88,7 +108,11 @@ def main():
     # ============================================================
     # Validações
     # ============================================================
-    uf = validar_uf(args.uf)
+    # --uf aceita CSV ("MG,SP,RJ"). Internamente vira lista de strings.
+    ufs = validar_ufs(args.uf)
+    # Pra compat com o resto do código, passa string única quando só 1 UF;
+    # senão a lista inteira (use_case e carregar_pdvs já lidam com ambos).
+    uf = ufs[0] if len(ufs) == 1 else ufs
     input_id = validar_input_id(args.input_id)
 
     cidade = (
@@ -96,6 +120,12 @@ def main():
         if args.cidade and args.cidade.strip().lower() not in ("none", "")
         else None
     )
+    # Cidade só faz sentido com 1 UF — ignora se múltiplas UFs.
+    if isinstance(uf, list) and cidade:
+        logger.warning(
+            f"⚠️ Cidade '{cidade}' ignorada — múltiplas UFs ({len(ufs)})."
+        )
+        cidade = None
 
     clusterization_id = args.clusterization_id or str(uuid.uuid4())
 
@@ -107,7 +137,10 @@ def main():
     logger.info("==============================================")
     logger.info(f"🔑 tenant_id          = {args.tenant_id}")
     logger.info(f"📦 input_id           = {input_id}")
-    logger.info(f"🗺️ UF                 = {uf}")
+    logger.info(
+        f"🗺️ UF                 = "
+        f"{','.join(uf) if isinstance(uf, list) else uf}"
+    )
     logger.info(f"🏙️ cidade             = {cidade or 'ALL'}")
     logger.info(f"⚙️ algoritmo          = {args.algo}")
     logger.info(f"📝 descrição          = {args.descricao}")

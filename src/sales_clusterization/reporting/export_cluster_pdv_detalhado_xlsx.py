@@ -4,6 +4,7 @@
 # 📦 src/sales_clusterization/reporting/export_cluster_pdv_detalhado_xlsx.py
 # ============================================================
 
+import io
 import os
 import math
 import pandas as pd
@@ -29,7 +30,7 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def exportar_cluster_pdv_detalhado(tenant_id: int, clusterization_id: str):
+def exportar_cluster_pdv_detalhado(tenant_id: int, clusterization_id: str, output=None):
     logger.info(f"📋 Exportando PDVs detalhados | tenant={tenant_id} | clusterization_id={clusterization_id}")
 
     conn = get_connection()
@@ -126,19 +127,32 @@ def exportar_cluster_pdv_detalhado(tenant_id: int, clusterization_id: str):
             f"(fator={ISOLADO_FATOR}× média de cada setor)"
         )
 
-    output_dir = f"output/reports/{tenant_id}"
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(
-        output_dir, f"cluster_pdv_detalhado_{clusterization_id}.xlsx"
-    )
+    if output is None:
+        # CLI standalone — grava em disco pra uso manual via python -m
+        output_dir = f"output/reports/{tenant_id}"
+        os.makedirs(output_dir, exist_ok=True)
+        output = os.path.join(
+            output_dir, f"cluster_pdv_detalhado_{clusterization_id}.xlsx"
+        )
+        destino_log = output
+    else:
+        destino_log = "(em memória)"
 
     # Duas sheets: detalhe completo + alerta de isolados
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="PDVs detalhado", index=False)
         if not df_isolados.empty:
             df_isolados.to_excel(writer, sheet_name="PDVs isolados", index=False)
 
-    logger.success(f"✅ Arquivo salvo em: {output_path}")
+    logger.success(f"✅ Arquivo gerado: {destino_log}")
+
+
+def cluster_pdv_detalhado_to_bytes(tenant_id: int, clusterization_id: str) -> bytes:
+    """Gera o XLSX em memória e retorna os bytes (sem persistir em disco)."""
+    buffer = io.BytesIO()
+    exportar_cluster_pdv_detalhado(tenant_id, clusterization_id, output=buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 

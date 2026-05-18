@@ -4,6 +4,7 @@
 # 📦 src/sales_clusterization/reporting/export_cluster_resumo_xlsx.py
 # ============================================================
 
+import io
 import os
 import pandas as pd
 import argparse
@@ -11,11 +12,32 @@ from loguru import logger
 from database.db_connection import get_connection
 
 
+def cluster_resumo_to_bytes(tenant_id: int, clusterization_id: str) -> bytes:
+    """Gera o XLSX em memória e retorna os bytes (sem persistir em disco).
+    Usado pelo endpoint de download via StreamingResponse."""
+    buffer = io.BytesIO()
+    _escrever_resumo(tenant_id, clusterization_id, buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def exportar_cluster_resumo(tenant_id: int, clusterization_id: str):
+    """CLI standalone: grava em disco (uso manual via python -m)."""
     logger.info(
         f"📊 Exportando resumo de clusters | tenant={tenant_id} | clusterization_id={clusterization_id}"
     )
 
+    output_dir = f"output/reports/{tenant_id}"
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"cluster_resumo_{clusterization_id}.xlsx")
+
+    with open(output_path, "wb") as f:
+        _escrever_resumo(tenant_id, clusterization_id, f)
+    logger.success(f"✅ Excel salvo em: {output_path}")
+
+
+def _escrever_resumo(tenant_id: int, clusterization_id: str, output):
+    """Núcleo: lê do DB e escreve XLSX em qualquer file-like (BytesIO ou file)."""
     conn = get_connection()
 
     # 🔍 Run mais recente
@@ -80,19 +102,13 @@ def exportar_cluster_resumo(tenant_id: int, clusterization_id: str):
         ]
     ]
 
-    output_dir = f"output/reports/{tenant_id}"
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(
-        output_dir, f"cluster_resumo_{clusterization_id}.xlsx"
-    )
-
     from openpyxl.styles import Font, Alignment
     from openpyxl.utils import get_column_letter
 
     # ===============================
     # 🧾 Escrita EXECUTIVA no Excel
     # ===============================
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="Resumo por Cluster", index=False)
 
         ws = writer.book["Resumo por Cluster"]
@@ -122,9 +138,6 @@ def exportar_cluster_resumo(tenant_id: int, clusterization_id: str):
 
         for col_idx, width in widths.items():
             ws.column_dimensions[get_column_letter(col_idx)].width = width
-
-
-    logger.success(f"✅ Excel executivo gerado: {output_path}")
 
 
 if __name__ == "__main__":
