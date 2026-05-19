@@ -144,6 +144,28 @@ class RouteOptimizer:
         total_min += len(rota) * self.service_min
 
         # ============================================================
+        # 5b) Parciais — total sem a perna final (último PDV → centro).
+        # Representa "até concluir o último atendimento" — métrica
+        # operacional útil pra dimensionar SLA do consultor sem contar
+        # o retorno ao depot.
+        # ============================================================
+        dist_parcial_km = total_km
+        tempo_parcial_min = total_min
+        if len(coords_list) >= 2:
+            try:
+                last_a = coords_list[-2]
+                last_b = coords_list[-1]
+                last_leg = self.distance_service.get_distance_time(last_a, last_b)
+                last_km = float(last_leg.get("distancia_km", 0.0))
+                last_min = float(last_leg.get("tempo_min", 0.0))
+                dist_parcial_km = max(0.0, total_km - last_km)
+                tempo_parcial_min = max(0.0, total_min - last_min)
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ Falha ao computar parcial (último trecho): {e}"
+                )
+
+        # ============================================================
         # 6️⃣ LOG FINAL
         # ============================================================
         logger.success(
@@ -155,6 +177,8 @@ class RouteOptimizer:
             "sequencia": rota,
             "distancia_total_km": round(total_km, 2),
             "tempo_total_min": round(total_min, 1),
+            "dist_parcial_km": round(dist_parcial_km, 2),
+            "tempo_parcial_min": round(tempo_parcial_min, 1),
             "rota_coord": rota_coords,
         }
 

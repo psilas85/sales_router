@@ -4,6 +4,7 @@
 # 📊 src/sales_routing/reporting/export_cluster_summary.py
 # ============================================================
 
+import io
 import os
 from pathlib import Path
 import pandas as pd
@@ -15,18 +16,38 @@ from openpyxl.utils import get_column_letter
 BASE_OUTPUT = Path("/app/output/reports")  # caminho absoluto no container
 
 
-def exportar_resumo_cluster(tenant_id: int, routing_id: str):
-    """
-    Exporta o resumo da view vw_sales_routing_resumo_cluster
-    em XLSX com formatação executiva.
-    """
+def routing_resumo_to_bytes(tenant_id: int, routing_id: str) -> bytes:
+    """Gera o XLSX em memória e retorna os bytes (sem persistir em disco).
+    Usado pelo endpoint /relatorio/resumo via StreamingResponse."""
+    buffer = io.BytesIO()
+    if not _escrever_resumo(tenant_id, routing_id, buffer):
+        raise ValueError("Nenhum dado encontrado para a roteirização informada.")
+    buffer.seek(0)
+    return buffer.getvalue()
 
+
+def exportar_resumo_cluster(tenant_id: int, routing_id: str):
+    """CLI standalone: grava em disco (uso manual via python -m).
+    A API agora usa routing_resumo_to_bytes."""
     logger.info(
         f"📊 Exportando resumo XLSX | tenant={tenant_id} | routing_id={routing_id}"
     )
+    pasta = BASE_OUTPUT / str(tenant_id)
+    pasta.mkdir(parents=True, exist_ok=True)
+    arquivo = pasta / f"routing_resumo_{routing_id}.xlsx"
+    with open(arquivo, "wb") as f:
+        if not _escrever_resumo(tenant_id, routing_id, f):
+            return None
+    logger.success(f"✅ XLSX salvo em: {arquivo}")
+    return str(arquivo)
+
+
+def _escrever_resumo(tenant_id: int, routing_id: str, output) -> bool:
+    """Núcleo: lê do DB e escreve XLSX em qualquer file-like.
+    Retorna False se não houver dados."""
 
     sql = """
-        SELECT 
+        SELECT
             cluster_id              AS "Cluster",
             qtd_pdvs                AS "PDVs",
             tempo_medio_min         AS "Tempo médio (min)",
@@ -50,52 +71,24 @@ def exportar_resumo_cluster(tenant_id: int, routing_id: str):
 
         if df.empty:
             logger.warning("⚠️ Nenhum dado encontrado para exportação.")
-            return None
+            return False
 
-        # 📁 pasta por tenant
-        pasta = BASE_OUTPUT / str(tenant_id)
-        pasta.mkdir(parents=True, exist_ok=True)
-
-        arquivo = pasta / f"routing_resumo_{routing_id}.xlsx"
-
-        # ===============================
-        # 🧾 Escrita EXECUTIVA
-        # ===============================
-        with pd.ExcelWriter(arquivo, engine="openpyxl") as writer:
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name="Resumo por Cluster", index=False)
             ws = writer.book["Resumo por Cluster"]
 
-            # 🔒 Freeze header
             ws.freeze_panes = "A2"
-
-            # 🎨 Header
             header_font = Font(bold=True)
             header_align = Alignment(horizontal="center", vertical="center")
-
             for cell in ws[1]:
                 cell.font = header_font
                 cell.alignment = header_align
 
-            # 📐 Largura das colunas
-            widths = {
-                1: 10,   # Cluster
-                2: 8,    # PDVs
-                3: 20,
-                4: 22,
-                5: 22,
-                6: 22,
-                7: 24,
-                8: 24,
-                9: 22,
-                10: 18,
-                11: 18,
-            }
-
+            widths = {1: 10, 2: 8, 3: 20, 4: 22, 5: 22, 6: 22, 7: 24, 8: 24, 9: 22, 10: 18, 11: 18}
             for col_idx, width in widths.items():
                 ws.column_dimensions[get_column_letter(col_idx)].width = width
 
-        logger.success(f"✅ XLSX gerado: {arquivo}")
-        return str(arquivo)
+        return True
 
     finally:
         conn.close()

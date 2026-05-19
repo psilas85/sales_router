@@ -43,6 +43,23 @@ class PDV:
     status_geolocalizacao: Optional[str] = None
 
     # ============================================================
+    # Identificação opcional (vinda do XLSX) — útil pra UI/relatórios.
+    # ============================================================
+    razao_social: Optional[str] = None
+    nome_fantasia: Optional[str] = None
+
+    # ============================================================
+    # Roteirização com janelas (CVRPTW) — todos opcionais.
+    # Quando ausentes, o solver cai nos fallbacks configurados no tenant
+    # ou no horário de operação. Ver sales_routing/application/
+    # cvrptw_subcluster_splitter.py para a semântica completa.
+    # ============================================================
+    janela_atendimento_inicio: Optional[int] = None   # min desde 0h
+    janela_atendimento_fim: Optional[int] = None      # min desde 0h
+    tempo_atendimento_min: Optional[float] = None     # sobrescreve service_min
+    is_estrategico: Optional[bool] = None             # disjunction quase-obrigatória
+
+    # ============================================================
     # Dados administrativos
     # ============================================================
     tenant_id: Optional[int] = field(default=None)
@@ -76,3 +93,29 @@ class PDV:
 
         if isinstance(self.pdv_lon, str) and self.pdv_lon.strip():
             self.pdv_lon = float(self.pdv_lon)
+
+        # ============================================================
+        # Sanitiza NaN/pd.NA → None nos campos opcionais de roteirização.
+        # Necessário porque o pandas converte None→NaN ao tipar colunas
+        # float64, e o PG aceita NaN como valor válido (≠ NULL), o que
+        # quebra o solver CVRPTW depois.
+        # ============================================================
+        import math
+        for _attr in (
+            "janela_atendimento_inicio",
+            "janela_atendimento_fim",
+            "tempo_atendimento_min",
+            "is_estrategico",
+        ):
+            _val = getattr(self, _attr, None)
+            if _val is None:
+                continue
+            try:
+                if isinstance(_val, float) and math.isnan(_val):
+                    setattr(self, _attr, None)
+                    continue
+            except (TypeError, ValueError):
+                pass
+            # Cobre pd.NA / NaT sem importar pandas aqui
+            if str(_val).strip().lower() in {"nan", "<na>", "nat", "none", "null", ""}:
+                setattr(self, _attr, None)

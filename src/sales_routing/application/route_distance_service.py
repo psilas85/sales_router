@@ -10,7 +10,7 @@ import math
 import requests
 import psycopg2
 import polyline
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 from datetime import datetime
 from loguru import logger
 
@@ -174,6 +174,276 @@ class RouteDistanceService:
         logger.debug(f"📍 OSRM rota: {len(coords)} pts / {dist_km:.2f} km / {tempo_min:.1f} min")
 
         return dist_km, tempo_min, coords
+
+    # ============================================================
+    # Pré-aquecimento da matriz de pares via OSRM /table
+    # ------------------------------------------------------------
+    # Faz 1 chamada (ou poucas, para listas grandes) ao endpoint
+    # /table do OSRM e persiste TODOS os pares (origem, destino) no
+    # route_cache. Útil ANTES de loops NN/2-opt para eliminar as N²
+    # chamadas HTTP sequenciais ao OSRM remoto.
+    #
+    # /table não retorna geometry (polyline) — só distância/tempo.
+    # rota_coord fica como linha reta no cache; a polyline real só é
+    # montada em get_full_route() no fim do calcular_rota.
+    # ============================================================
+    def prewarm_matrix(
+        self,
+        coords: list[tuple[float, float]],
+        chunk_size: int = 100,
+    ) -> int:
+        if not coords or len(coords) < 2:
+            return 0
+
+        # Dedup mantendo ordem (precisão de 6 casas — mesmo grão do cache)
+        seen: set[tuple[float, float]] = set()
+        unique: list[tuple[float, float]] = []
+        for c in coords:
+            k = (round(c[0], 6), round(c[1], 6))
+            if k in seen:
+                continue
+            seen.add(k)
+            unique.append((float(c[0]), float(c[1])))
+
+        n = len(unique)
+        if n < 2:
+            return 0
+
+        total = 0
+        # Particiona em blocos chunk_size × chunk_size — preserva limite do
+        # OSRM (--max-table-size, default 100) sem precisar reconfigurar.
+        for i_start in range(0, n, chunk_size):
+            i_end = min(i_start + chunk_size, n)
+            srcs = unique[i_start:i_end]
+            for j_start in range(0, n, chunk_size):
+                j_end = min(j_start + chunk_size, n)
+                dsts = unique[j_start:j_end]
+                try:
+                    total += self._prewarm_chunk(srcs, dsts)
+                except Exception as e:
+                    logger.warning(
+                        f"⚠️ prewarm_matrix chunk [{i_start}:{i_end}]x"
+                        f"[{j_start}:{j_end}] falhou: {e}"
+                    )
+
+        if total:
+            logger.info(
+                f"🔥 OSRM /table prewarm: {total} pares cacheados "
+                f"(de {n} coords únicas)"
+            )
+        return total
+
+    def _prewarm_chunk(
+        self,
+        srcs: list[tuple[float, float]],
+        dsts: list[tuple[float, float]],
+    ) -> int:
+        # Junta sources + destinations e usa parâmetros sources=/destinations=
+        # com índices, evitando duplicar coordenadas no path.
+        all_coords = list(srcs) + list(dsts)
+        n_src = len(srcs)
+        n_dst = len(dsts)
+        coords_str = ";".join(f"{lon},{lat}" for (lat, lon) in all_coords)
+        src_idx = ";".join(str(i) for i in range(n_src))
+        dst_idx = ";".join(str(i) for i in range(n_src, n_src + n_dst))
+
+        url = (
+            f"{self.osrm_url}/table/v1/driving/{coords_str}"
+            f"?sources={src_idx}&destinations={dst_idx}"
+            f"&annotations=duration,distance"
+        )
+        resp = requests.get(url, timeout=30)
+        data = resp.json()
+        if data.get("code") != "Ok":
+            raise Exception(f"OSRM /table code={data.get('code')}")
+
+        durations = data.get("durations") or []
+        distances = data.get("distances") or []
+        if not durations or not distances:
+            raise Exception("OSRM /table sem durations/distances")
+
+        agora = datetime.now()
+        rows: list[tuple] = []
+        for i, a in enumerate(srcs):
+            for j, b in enumerate(dsts):
+                if a == b:
+                    continue
+                d_sec = durations[i][j]
+                d_met = distances[i][j]
+                if d_sec is None or d_met is None:
+                    continue
+                tempo_min = d_sec / 60.0
+                dist_km = d_met / 1000.0
+                # Pares quase coincidentes: rejeitar (mesma trava de _from_osrm)
+                if dist_km < 0.05 or tempo_min < 0.05:
+                    continue
+                rows.append((
+                    a[0], a[1], b[0], b[1],
+                    dist_km, tempo_min, "osrm_table", agora,
+                    json.dumps([
+                        {"lat": a[0], "lon": a[1]},
+                        {"lat": b[0], "lon": b[1]},
+                    ]),
+                ))
+
+        if not rows:
+            return 0
+
+        # DO NOTHING preserva entradas existentes (que podem ter polyline real)
+        with self.conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO route_cache (
+                    origem_lat, origem_lon, destino_lat, destino_lon,
+                    distancia_km, tempo_min, fonte, atualizado_em, rota_coord
+                ) VALUES %s
+                ON CONFLICT (origem_lat, origem_lon, destino_lat, destino_lon)
+                DO NOTHING
+                """,
+                rows,
+                template="(%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
+            )
+        return len(rows)
+
+    # ============================================================
+    # Matriz NxN de tempo (e distância) via OSRM /table.
+    # Retorna matrizes em memória prontas para alimentar OR-Tools,
+    # E TAMBÉM popula route_cache (idêntico ao prewarm_matrix).
+    #
+    # Estratégia:
+    #   - 1 única chamada /table se N ≤ chunk_size
+    #   - múltiplos chunks (sources/destinations) caso contrário
+    #   - fallback Haversine vetorizado se OSRM falhar (preserva
+    #     interface da função; logs warning)
+    #
+    # Retorna: (dist_km_matrix[N][N], time_min_matrix[N][N], fonte)
+    #   fonte ∈ {"osrm_table", "haversine_fallback"}
+    # ============================================================
+    def get_time_matrix(
+        self,
+        coords: list[tuple[float, float]],
+        chunk_size: int = 100,
+    ) -> tuple[list[list[float]], list[list[float]], str]:
+        n = len(coords)
+        if n == 0:
+            return [], [], "empty"
+
+        # Inicializa matrizes (lat/lon idênticos = 0)
+        dist_km = [[0.0] * n for _ in range(n)]
+        time_min = [[0.0] * n for _ in range(n)]
+
+        try:
+            # Particiona em blocos para respeitar --max-table-size
+            for i_start in range(0, n, chunk_size):
+                i_end = min(i_start + chunk_size, n)
+                srcs = coords[i_start:i_end]
+                for j_start in range(0, n, chunk_size):
+                    j_end = min(j_start + chunk_size, n)
+                    dsts = coords[j_start:j_end]
+                    self._fill_table_chunk(
+                        srcs, dsts, i_start, j_start, dist_km, time_min
+                    )
+            logger.info(
+                f"📊 OSRM /table matriz {n}x{n} montada em memória "
+                f"(também populou route_cache)"
+            )
+            return dist_km, time_min, "osrm_table"
+        except Exception as e:
+            logger.warning(
+                f"⚠️ OSRM /table falhou ({e}); montando matriz por "
+                f"Haversine com α={self.alpha_path}"
+            )
+            return self._haversine_matrix(coords)
+
+    def _fill_table_chunk(
+        self,
+        srcs: list[tuple[float, float]],
+        dsts: list[tuple[float, float]],
+        i_offset: int,
+        j_offset: int,
+        dist_km: list[list[float]],
+        time_min: list[list[float]],
+    ) -> None:
+        all_coords = list(srcs) + list(dsts)
+        n_src = len(srcs)
+        n_dst = len(dsts)
+        coords_str = ";".join(f"{lon},{lat}" for (lat, lon) in all_coords)
+        src_idx = ";".join(str(i) for i in range(n_src))
+        dst_idx = ";".join(str(i) for i in range(n_src, n_src + n_dst))
+
+        url = (
+            f"{self.osrm_url}/table/v1/driving/{coords_str}"
+            f"?sources={src_idx}&destinations={dst_idx}"
+            f"&annotations=duration,distance"
+        )
+        resp = requests.get(url, timeout=30)
+        data = resp.json()
+        if data.get("code") != "Ok":
+            raise Exception(f"OSRM /table code={data.get('code')}")
+
+        durations = data.get("durations") or []
+        distances = data.get("distances") or []
+        if not durations or not distances:
+            raise Exception("OSRM /table sem durations/distances")
+
+        agora = datetime.now()
+        cache_rows: list[tuple] = []
+        for i, a in enumerate(srcs):
+            for j, b in enumerate(dsts):
+                if a == b:
+                    continue
+                d_sec = durations[i][j]
+                d_met = distances[i][j]
+                if d_sec is None or d_met is None:
+                    continue
+                t_min = d_sec / 60.0
+                d_km = d_met / 1000.0
+                # Preenche matriz em memória
+                dist_km[i_offset + i][j_offset + j] = d_km
+                time_min[i_offset + i][j_offset + j] = t_min
+                # Cache só os pares "reais" (>50m)
+                if d_km < 0.05 or t_min < 0.05:
+                    continue
+                cache_rows.append((
+                    a[0], a[1], b[0], b[1],
+                    d_km, t_min, "osrm_table", agora,
+                    json.dumps([
+                        {"lat": a[0], "lon": a[1]},
+                        {"lat": b[0], "lon": b[1]},
+                    ]),
+                ))
+
+        if cache_rows:
+            with self.conn.cursor() as cur:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO route_cache (
+                        origem_lat, origem_lon, destino_lat, destino_lon,
+                        distancia_km, tempo_min, fonte, atualizado_em, rota_coord
+                    ) VALUES %s
+                    ON CONFLICT (origem_lat, origem_lon, destino_lat, destino_lon)
+                    DO NOTHING
+                    """,
+                    cache_rows,
+                    template="(%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
+                )
+
+    def _haversine_matrix(
+        self, coords: list[tuple[float, float]]
+    ) -> tuple[list[list[float]], list[list[float]], str]:
+        n = len(coords)
+        dist_km = [[0.0] * n for _ in range(n)]
+        time_min = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                d = self._haversine_km(coords[i], coords[j]) * self.alpha_path
+                dist_km[i][j] = d
+                time_min[i][j] = (d / max(self.v_kmh, 1.0)) * 60.0
+        return dist_km, time_min, "haversine_fallback"
 
     # ============================================================
     # Google Maps Directions (fallback secundário)

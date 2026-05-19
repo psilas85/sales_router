@@ -83,6 +83,11 @@ def main():
     parser.add_argument("--routekm", type=float, default=200.0)
     parser.add_argument("--service", type=int, default=30)
     parser.add_argument("--vel", type=float, default=35.0)
+    # Fator de correção haversine → distância real por estrada.
+    # Aplicado no refinador operacional pra estimativa de tempo/dist
+    # ficar próxima do que o OSRM devolve depois na roteirização.
+    # Não exposto na UI; default 1.4.
+    parser.add_argument("--alpha", type=float, default=1.4)
 
     # Usado por ambos
     parser.add_argument("--max_pdv_cluster", type=int, default=200)
@@ -178,7 +183,7 @@ def main():
         route_km_max=args.routekm,
         service_min=args.service,
         v_kmh=args.vel,
-        alpha_path=1.0,
+        alpha_path=args.alpha,
         max_pdv_cluster=args.max_pdv_cluster,
         descricao=args.descricao,
         input_id=input_id,

@@ -4,6 +4,7 @@
 # 📦 src/sales_routing/reporting/export_pdvs_por_cluster.py
 # ============================================================
 
+import io
 import os
 import argparse
 import pandas as pd
@@ -12,11 +13,22 @@ from pathlib import Path
 from src.database.db_connection import get_connection
 
 
-def exportar_pdvs_por_cluster(tenant_id: int, routing_id: str):
+def routing_pdvs_to_bytes(tenant_id: int, routing_id: str) -> bytes:
+    """Gera o XLSX em memória e retorna os bytes. Usado via StreamingResponse."""
+    buffer = io.BytesIO()
+    ok = exportar_pdvs_por_cluster(tenant_id, routing_id, output=buffer)
+    if not ok:
+        raise ValueError("Nenhum PDV encontrado para a roteirização informada.")
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def exportar_pdvs_por_cluster(tenant_id: int, routing_id: str, output=None):
     """
     Exporta todos os PDVs (com informações completas + cluster + subcluster)
     para um arquivo Excel (.xlsx) filtrado por tenant_id e routing_id.
     Corrige CNPJ com máscara e formata coordenadas corretamente.
+    `output` opcional: BytesIO ou path; se None, grava em disco (uso CLI).
     """
     logger.info(f"📤 Exportando PDVs por cluster | tenant={tenant_id} | routing_id={routing_id}")
 
@@ -101,25 +113,26 @@ def exportar_pdvs_por_cluster(tenant_id: int, routing_id: str):
             df[col] = df[col].apply(normalizar_coord)
 
     # =======================================================
-    # 💾 Caminho de saída
+    # 💾 Destino: BytesIO (API) ou arquivo em disco (CLI)
     # =======================================================
-    output_dir = Path(f"output/reports/{tenant_id}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(output_dir, 0o777)
-    except Exception as e:
-        logger.warning(f"⚠️ Falha ao ajustar permissões: {e}")
-
-    arquivo_xlsx = output_dir / f"pdvs_por_cluster_{routing_id}.xlsx"
+    destino_log = None
+    if output is None:
+        output_dir = Path(f"output/reports/{tenant_id}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(output_dir, 0o777)
+        except Exception as e:
+            logger.warning(f"⚠️ Falha ao ajustar permissões: {e}")
+        output = output_dir / f"pdvs_por_cluster_{routing_id}.xlsx"
+        destino_log = output
 
     # =======================================================
     # 📊 Exportação Excel
     # =======================================================
     try:
-        with pd.ExcelWriter(arquivo_xlsx, engine="openpyxl") as writer:
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="PDVs_Clusters")
 
-            # Ajuste automático de largura de coluna
             ws = writer.sheets["PDVs_Clusters"]
             for col_cells in ws.columns:
                 max_length = 0
@@ -129,8 +142,10 @@ def exportar_pdvs_por_cluster(tenant_id: int, routing_id: str):
                         max_length = max(max_length, len(str(cell.value)))
                 ws.column_dimensions[col_letter].width = min(max_length + 2, 60)
 
-        logger.success(f"✅ Arquivo Excel exportado com sucesso: {arquivo_xlsx}")
-        return arquivo_xlsx
+        logger.success(
+            f"✅ XLSX exportado: {destino_log if destino_log else '(em memória)'}"
+        )
+        return destino_log if destino_log else True
 
     except Exception as e:
         logger.error(f"❌ Erro ao salvar XLSX: {e}")

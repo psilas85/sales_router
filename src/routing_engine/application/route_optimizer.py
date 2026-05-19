@@ -155,6 +155,26 @@ class RouteOptimizer:
         # 5) tempo de serviço
         total_min += len(rota) * self.service_min
 
+        # 5b) Parciais (até o último PDV, sem a perna de retorno ao depot).
+        # Métrica adicional usada pelo front da Simulação Inteligente p/
+        # estimar "quando o consultor conclui o trabalho" sem contar o
+        # retorno. Aditivo: não altera nenhuma decisão de roteirização.
+        dist_parcial_km = total_km
+        tempo_parcial_min = total_min
+        if len(coords_list) >= 2:
+            try:
+                last_a = coords_list[-2]
+                last_b = coords_list[-1]
+                last_leg = self.distance_service.get_distance_time(last_a, last_b)
+                last_km = float(last_leg.get("distancia_km", 0.0))
+                last_min = float(last_leg.get("tempo_min", 0.0))
+                dist_parcial_km = max(0.0, total_km - last_km)
+                tempo_parcial_min = max(0.0, total_min - last_min)
+            except Exception as e:
+                logger.warning(
+                    f"⚠️ Falha ao computar parcial (último trecho): {e}"
+                )
+
         logger.success(
             f"✅ Rota concluída | PDVs={len(rota)} | dist={round(total_km, 2)} km | tempo={round(total_min, 1)} min | fonte={fonte}"
         )
@@ -163,6 +183,8 @@ class RouteOptimizer:
             "sequencia": rota,
             "distancia_total_km": round(total_km, 2),
             "tempo_total_min": round(total_min, 1),
+            "dist_parcial_km": round(dist_parcial_km, 2),
+            "tempo_parcial_min": round(tempo_parcial_min, 1),
             "rota_coord": rota_coords,
         }
 

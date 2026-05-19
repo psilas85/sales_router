@@ -30,6 +30,7 @@ class OperationalClusterRefiner:
         tempo_servico_min: float,
         max_iter: int,
         tenant_id: int = None,
+        alpha_path: float = 1.4,
     ):
         self.v_kmh = v_kmh
         self.max_time_min = max_time_min
@@ -37,6 +38,12 @@ class OperationalClusterRefiner:
         self.tempo_servico_min = tempo_servico_min
         self.max_iter = max_iter
         self.tenant_id = tenant_id
+        # Fator multiplicativo aplicado à distância haversine para
+        # aproximar das distâncias reais por estrada. Não é exposto na
+        # UI — vem do default do backend (1.4). O tempo derivado (dist
+        # ajustada / v_kmh) fica mais alinhado ao que o OSRM devolve na
+        # roteirização operacional, reduzindo subestimativa.
+        self.alpha_path = max(alpha_path, 1.0)
 
     # ============================================================
     # 🔹 Distância Haversine (km)
@@ -93,7 +100,10 @@ class OperationalClusterRefiner:
 
         # Usa heurística interna
         rota_seq = self._ordenar_por_vizinho_mais_proximo(cluster_coords, centro)
-        dist_km = sum(_haversine_km(rota_seq[i], rota_seq[i + 1]) for i in range(len(rota_seq) - 1))
+        dist_haversine = sum(_haversine_km(rota_seq[i], rota_seq[i + 1]) for i in range(len(rota_seq) - 1))
+        # Ajuste de sinuosidade rua-vs-linha-reta. Mesmo fator usado pelo
+        # routing_engine; aqui só pra estimativa do refinador.
+        dist_km = dist_haversine * self.alpha_path
         tempo_min = (dist_km / max(self.v_kmh, 1e-6)) * 60.0 + len(cluster_coords) * self.tempo_servico_min
 
         # ⚠️ Alerta se rota parecer anômala

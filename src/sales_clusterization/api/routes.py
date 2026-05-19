@@ -59,14 +59,17 @@ def listar_inputs(
 
     # ============================================================
     # TOTAL (COM OS MESMOS FILTROS DO SELECT PRINCIPAL)
+    # OBS: `criado_em` é TIMESTAMPTZ (armazena UTC). Filtramos pelo
+    # horário local America/Sao_Paulo pra evitar perder uploads feitos
+    # após 21h BRT (que em UTC já viram dia seguinte).
     # ============================================================
     sql_total = """
         SELECT COUNT(DISTINCT h.input_id)
         FROM historico_pdv_jobs h
         WHERE h.tenant_id = %s
           AND h.status = 'done'
-          AND (%s IS NULL OR DATE(h.criado_em) >= %s)
-          AND (%s IS NULL OR DATE(h.criado_em) <= %s)
+          AND (%s IS NULL OR h.criado_em >= (%s::timestamp AT TIME ZONE 'America/Sao_Paulo'))
+          AND (%s IS NULL OR h.criado_em <  ((%s::date + 1)::timestamp AT TIME ZONE 'America/Sao_Paulo'))
           AND (%s IS NULL OR LOWER(h.descricao) LIKE %s)
     """
 
@@ -99,8 +102,8 @@ def listar_inputs(
          AND p.input_id  = h.input_id
         WHERE h.tenant_id = %s
           AND h.status = 'done'
-          AND (%s IS NULL OR DATE(h.criado_em) >= %s)
-          AND (%s IS NULL OR DATE(h.criado_em) <= %s)
+          AND (%s IS NULL OR h.criado_em >= (%s::timestamp AT TIME ZONE 'America/Sao_Paulo'))
+          AND (%s IS NULL OR h.criado_em <  ((%s::date + 1)::timestamp AT TIME ZONE 'America/Sao_Paulo'))
           AND (%s IS NULL OR LOWER(h.descricao) LIKE %s)
         GROUP BY h.input_id, h.criado_em, h.descricao
         ORDER BY h.criado_em DESC
@@ -232,12 +235,12 @@ def listar_jobs(
     where_params = [tenant_id]
 
     if data_inicio:
-        filtros.append("DATE(h.criado_em) >= %s")
-        where_params.append(data_inicio)   # <<< FALTAVA ISSO
+        filtros.append("DATE(h.criado_em AT TIME ZONE 'America/Sao_Paulo') >= %s")
+        where_params.append(data_inicio)
 
     if data_fim:
-        filtros.append("DATE(h.criado_em) <= %s")
-        where_params.append(data_fim)       # <<< FALTAVA ISSO
+        filtros.append("DATE(h.criado_em AT TIME ZONE 'America/Sao_Paulo') <= %s")
+        where_params.append(data_fim)
 
     if descricao:
         filtros.append("LOWER(h.descricao) LIKE %s")
@@ -251,7 +254,7 @@ def listar_jobs(
 
     # TOTAL REAL
     sql_total = f"""
-        SELECT COUNT(*) 
+        SELECT COUNT(*)
         FROM historico_pipeline_jobs
         WHERE {where_clause};
     """

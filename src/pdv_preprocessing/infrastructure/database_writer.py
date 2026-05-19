@@ -1,11 +1,27 @@
 #sales_router/src/pdv_preprocessing/infrastructure/database_writer.py
 
 import logging
+import math
 import time
 from functools import wraps
 from typing import Optional, List, Tuple
 from psycopg2.extras import execute_values
 import psycopg2
+
+
+def _safe_num(val):
+    """Retorna None pra NaN/None; senão devolve o próprio valor.
+    Necessário porque pandas converte None→NaN em colunas float64 e
+    o PG aceita NaN como valor válido (≠ NULL), o que estraga
+    consultas e comparações."""
+    if val is None:
+        return None
+    try:
+        if isinstance(val, float) and math.isnan(val):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return val
 
 from pdv_preprocessing.infrastructure.database_reader import POOL
 from pdv_preprocessing.domain.utils_geo import coordenada_generica
@@ -42,10 +58,40 @@ def retry_on_failure(max_retries=3, delay=1.0, backoff=2.0):
     return decorator
 
 
+# ============================================================
+# Lazy migration: garante as colunas opcionais de roteirização CVRPTW
+# na tabela `pdvs` antes de inserir. Idempotente; ADD COLUMN com
+# DEFAULT em PG 11+ não faz rewrite (operação rápida).
+# Espelho do _ensure_pdvs_routing_columns em sales_routing — está aqui
+# também pra cobrir o caso em que pdv_preprocessing roda primeiro.
+# ============================================================
+_PDV_ROUTING_COLUMNS_ENSURED = False
+
+
+def _ensure_pdvs_routing_columns(conn) -> None:
+    global _PDV_ROUTING_COLUMNS_ENSURED
+    if _PDV_ROUTING_COLUMNS_ENSURED:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            ALTER TABLE pdvs
+                ADD COLUMN IF NOT EXISTS janela_atendimento_inicio INTEGER,
+                ADD COLUMN IF NOT EXISTS janela_atendimento_fim INTEGER,
+                ADD COLUMN IF NOT EXISTS tempo_atendimento_min DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS is_estrategico BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS razao_social TEXT,
+                ADD COLUMN IF NOT EXISTS nome_fantasia TEXT;
+            """
+        )
+        conn.commit()
+    _PDV_ROUTING_COLUMNS_ENSURED = True
+
+
 class DatabaseWriter:
     def __init__(self):
         pass
-    
+
     # ============================================================
     # 💾 Inserção de PDVs
     # ============================================================
@@ -67,11 +113,24 @@ class DatabaseWriter:
                 p.uf,
                 p.cep,
                 p.pdv_endereco_completo,
-                p.endereco_cache_key,   # 👈 NOVO
+                p.endereco_cache_key,
                 p.pdv_lat,
                 p.pdv_lon,
                 p.status_geolocalizacao,
-                float(p.pdv_vendas) if p.pdv_vendas is not None else None,
+                float(_safe_num(p.pdv_vendas))
+                if _safe_num(p.pdv_vendas) is not None else None,
+                # Roteirização CVRPTW — campos opcionais
+                int(_safe_num(p.janela_atendimento_inicio))
+                if _safe_num(p.janela_atendimento_inicio) is not None else None,
+                int(_safe_num(p.janela_atendimento_fim))
+                if _safe_num(p.janela_atendimento_fim) is not None else None,
+                float(_safe_num(p.tempo_atendimento_min))
+                if _safe_num(p.tempo_atendimento_min) is not None else None,
+                bool(p.is_estrategico)
+                if _safe_num(p.is_estrategico) is not None else None,
+                # Identificação opcional
+                getattr(p, "razao_social", None) or None,
+                getattr(p, "nome_fantasia", None) or None,
             )
             for p in lista_pdvs
         ]
@@ -93,7 +152,13 @@ class DatabaseWriter:
                 pdv_lat,
                 pdv_lon,
                 status_geolocalizacao,
-                pdv_vendas
+                pdv_vendas,
+                janela_atendimento_inicio,
+                janela_atendimento_fim,
+                tempo_atendimento_min,
+                is_estrategico,
+                razao_social,
+                nome_fantasia
             )
             VALUES %s
             ON CONFLICT (tenant_id, input_id, cnpj)
@@ -102,6 +167,7 @@ class DatabaseWriter:
 
         conn = POOL.getconn()
         try:
+            _ensure_pdvs_routing_columns(conn)
             with conn.cursor() as cur:
                 execute_values(cur, sql, valores)
             conn.commit()
@@ -782,6 +848,21 @@ class DatabaseWriter:
                         ON pdv_invalidos(tenant_id, input_id);
                     """
                 )
+                # Expansão p/ permitir XLSX de inválidos servir como
+                # planilha de re-upload (manual com lat/lon, etc).
+                cur.execute(
+                    """
+                    ALTER TABLE pdv_invalidos
+                        ADD COLUMN IF NOT EXISTS razao_social TEXT,
+                        ADD COLUMN IF NOT EXISTS nome_fantasia TEXT,
+                        ADD COLUMN IF NOT EXISTS janela_atendimento_inicio INTEGER,
+                        ADD COLUMN IF NOT EXISTS janela_atendimento_fim INTEGER,
+                        ADD COLUMN IF NOT EXISTS tempo_atendimento_min DOUBLE PRECISION,
+                        ADD COLUMN IF NOT EXISTS is_estrategico BOOLEAN,
+                        ADD COLUMN IF NOT EXISTS pdv_lat DOUBLE PRECISION,
+                        ADD COLUMN IF NOT EXISTS pdv_lon DOUBLE PRECISION;
+                    """
+                )
 
                 def safe_str(v, maxlen=None):
                     if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -799,6 +880,22 @@ class DatabaseWriter:
                     except (TypeError, ValueError):
                         return None
 
+                def safe_int(v):
+                    n = safe_num(v)
+                    return int(n) if n is not None else None
+
+                def safe_bool(v):
+                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                        return None
+                    if isinstance(v, bool):
+                        return v
+                    s = str(v).strip().lower()
+                    if s in {"true", "1", "sim", "s", "yes", "y"}:
+                        return True
+                    if s in {"false", "0", "nao", "não", "n", "no", ""}:
+                        return False
+                    return None
+
                 valores = [
                     (
                         tenant_id,
@@ -812,6 +909,14 @@ class DatabaseWriter:
                         safe_str(row.get("cep"), 20),
                         safe_num(row.get("pdv_vendas")),
                         safe_str(row.get("motivo_invalidade")),
+                        safe_str(row.get("razao_social"), 300),
+                        safe_str(row.get("nome_fantasia"), 300),
+                        safe_int(row.get("janela_atendimento_inicio")),
+                        safe_int(row.get("janela_atendimento_fim")),
+                        safe_num(row.get("tempo_atendimento_min")),
+                        safe_bool(row.get("is_estrategico")),
+                        safe_num(row.get("pdv_lat")),
+                        safe_num(row.get("pdv_lon")),
                     )
                     for _, row in df_invalidos.iterrows()
                 ]
@@ -821,7 +926,11 @@ class DatabaseWriter:
                     """
                     INSERT INTO pdv_invalidos (
                         tenant_id, input_id, cnpj, logradouro, numero,
-                        bairro, cidade, uf, cep, pdv_vendas, motivo_invalidade
+                        bairro, cidade, uf, cep, pdv_vendas, motivo_invalidade,
+                        razao_social, nome_fantasia,
+                        janela_atendimento_inicio, janela_atendimento_fim,
+                        tempo_atendimento_min, is_estrategico,
+                        pdv_lat, pdv_lon
                     ) VALUES %s
                     """,
                     valores,

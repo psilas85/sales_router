@@ -99,9 +99,12 @@ class GeolocationService:
 
         street = street.upper().strip()
 
-        street = street.replace("R ", "RUA ")
-        street = street.replace("AV ", "AVENIDA ")
-        street = street.replace("ROD ", "RODOVIA ")
+        # Expansão ancorada no início: evita que "COLLOR DE" vire
+        # "COLLORUA DE" ou "TRAV " vire "TRAVENIDA " (o replace solto
+        # capturava qualquer "R ", "AV ", "ROD " no meio da string).
+        street = re.sub(r"^R\s+", "RUA ", street)
+        street = re.sub(r"^AV\s+", "AVENIDA ", street)
+        street = re.sub(r"^ROD\s+", "RODOVIA ", street)
 
         street = re.sub(r"\s+", " ", street)
 
@@ -403,12 +406,12 @@ class GeolocationService:
             street = re.split(r" - |,", street)[0].strip()
 
         # -----------------------------------------------------
-        # NORMALIZA PREFIXOS
+        # NORMALIZA PREFIXOS (ancorado no início — ver _normalize_street)
         # -----------------------------------------------------
         if street:
-            street = street.replace("R ", "RUA ")
-            street = street.replace("AV ", "AVENIDA ")
-            street = street.replace("ROD ", "RODOVIA ")
+            street = re.sub(r"^R\s+", "RUA ", street)
+            street = re.sub(r"^AV\s+", "AVENIDA ", street)
+            street = re.sub(r"^ROD\s+", "RODOVIA ", street)
 
         # -----------------------------------------------------
         # GARANTE NÚMERO

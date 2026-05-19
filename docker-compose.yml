@@ -295,18 +295,22 @@ services:
 
   # ======================
   # OSRM - Servidor de rotas Sudeste (RJ, SP, MG, ES)
+  # DESATIVADO em 2026-05-18 — uso atual aponta para OSRM remoto em EC2
+  # (OSRM_URL=http://98.90.57.0:5000 no .env raiz). Se voltar a apontar
+  # para o container local, descomente este bloco e suba com
+  # `docker compose up -d osrm`. Imagem/volume (./osrm-data) preservados.
   # ======================
-  osrm:
-    image: osrm/osrm-backend
-    container_name: osrm
-    command: osrm-routed --algorithm mld /data/sudeste-latest.osrm
-    ports:
-      - "5000:5000"
-    volumes:
-      - ./osrm-data:/data
-    networks:
-      - sales_router_net
-    restart: always
+  # osrm:
+  #   image: osrm/osrm-backend
+  #   container_name: osrm
+  #   command: osrm-routed --algorithm mld /data/sudeste-latest.osrm
+  #   ports:
+  #     - "5000:5000"
+  #   volumes:
+  #     - ./osrm-data:/data
+  #   networks:
+  #     - sales_router_net
+  #   restart: always
   
   # ======================
   # Clusterization Jobs Worker (RQ)

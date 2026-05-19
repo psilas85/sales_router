@@ -44,6 +44,8 @@ def _build_group_dict(
         "n_pdvs": len(pdvs_group),
         "tempo_total_min": rota_result["tempo_total_min"],
         "dist_total_km": rota_result["distancia_total_km"],
+        "tempo_parcial_min": rota_result.get("tempo_parcial_min"),
+        "dist_parcial_km": rota_result.get("dist_parcial_km"),
         "pdvs": rota_result["sequencia"],
         "rota_coord": rota_result["rota_coord"],
         "centro_lat": cluster.centro_lat,

@@ -282,6 +282,10 @@ def dividir_grupo_em_rotas_balanceadas(
                 "n_pdvs": len(grupo),
                 "tempo_total_min": rota_result["tempo_total_min"],
                 "dist_total_km": rota_result["distancia_total_km"],
+                # Parciais (até o último PDV, sem retorno ao depot) —
+                # campo aditivo consumido pela Simulação Inteligente.
+                "tempo_parcial_min": rota_result.get("tempo_parcial_min"),
+                "dist_parcial_km": rota_result.get("dist_parcial_km"),
                 "pdvs": rota_result["sequencia"],
                 "rota_coord": rota_result["rota_coord"],
                 "centro_lat": route_group.centro_lat,

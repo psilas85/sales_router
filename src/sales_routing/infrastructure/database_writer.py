@@ -13,6 +13,31 @@ from loguru import logger
 from src.database.db_connection import get_connection_context
 
 
+# Lazy migration: adiciona colunas de parcial (até último PDV, sem
+# retorno ao centro) em sales_subcluster. Idempotente; ADD COLUMN com
+# DEFAULT NULL em PG 11+ não faz rewrite.
+_SUBCLUSTER_PARCIAL_COLS_ENSURED = False
+
+
+def _ensure_subcluster_parcial_cols(conn) -> None:
+    global _SUBCLUSTER_PARCIAL_COLS_ENSURED
+    if _SUBCLUSTER_PARCIAL_COLS_ENSURED:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            ALTER TABLE sales_subcluster
+                ADD COLUMN IF NOT EXISTS dist_parcial_km DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS tempo_parcial_min DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS status_rota TEXT,
+                ADD COLUMN IF NOT EXISTS timeline_eventos JSONB,
+                ADD COLUMN IF NOT EXISTS horario_inicio_operacao INTEGER;
+            """
+        )
+        conn.commit()
+    _SUBCLUSTER_PARCIAL_COLS_ENSURED = True
+
+
 class SalesRoutingDatabaseWriter:
     """
     Responsável por persistir resultados de subclusterização (rotas diárias)
@@ -29,11 +54,17 @@ class SalesRoutingDatabaseWriter:
         tenant_id: int,
         run_id: int,
         routing_id: str,
+        frequencia_visita: int = 1,
     ):
         """
         Grava nova simulação operacional no banco e gera resumo por cluster.
         Cada routing_id representa uma execução única.
-        O tempo e distância mensais são a soma total das rotas (subclusters).
+
+        Tempo/distância de cada rota (sales_subcluster) = uma execução
+        (1 dia útil de operação). O resumo por cluster mantém duas visões:
+          - *_total_*  : soma de uma execução de cada rota (1 ciclo)
+          - *_total_mes_* : soma multiplicada por `frequencia_visita`
+            (esforço real no período).
         """
         try:
             logger.info(
@@ -86,6 +117,19 @@ class SalesRoutingDatabaseWriter:
                             centro_lat,
                             centro_lon,
                             datetime.now(),
+                            # Parciais (até último PDV, sem retorno).
+                            # CVRPTW deriva da matriz OSRM /table;
+                            # Rápido subtrai o último trecho via /route.
+                            sub.get("tempo_parcial_min"),
+                            sub.get("dist_parcial_km"),
+                            # status_rota: "viavel_sla" / "fallback_excedente"
+                            # (só CVRPTW preenche; geradores antigos = None)
+                            sub.get("status_rota"),
+                            # timeline_eventos: lista de eventos pro Gantt
+                            # (transito/espera/atendimento) — só CVRPTW
+                            json.dumps(sub.get("timeline_eventos") or [])
+                            if sub.get("timeline_eventos") is not None else None,
+                            sub.get("horario_inicio_operacao"),
                         )
                     )
 
@@ -115,6 +159,9 @@ class SalesRoutingDatabaseWriter:
                 # 📊 Resumo por cluster
                 # =========================================================
                 if qtd_subclusters > 0:
+                    freq = max(1, int(frequencia_visita or 1))
+                    dist_periodo = dist_total_cluster * freq
+                    tempo_periodo = tempo_total_cluster * freq
                     resumo_rows.append(
                         (
                             tenant_id,
@@ -127,22 +174,24 @@ class SalesRoutingDatabaseWriter:
                             tempo_total_cluster,
                             dist_total_cluster / qtd_subclusters,
                             tempo_total_cluster / qtd_subclusters,
-                            dist_total_cluster,   # total mês = soma total
-                            tempo_total_cluster,  # total mês = soma total
+                            dist_periodo,
+                            tempo_periodo,
                             datetime.now(),
                         )
                     )
 
                     logger.info(
                         f"📦 Cluster {cluster_id}: {qtd_subclusters} rotas | "
-                        f"{total_pdvs_cluster} PDVs | {dist_total_cluster:.1f} km | "
-                        f"{tempo_total_cluster:.1f} min (total mensal)"
+                        f"{total_pdvs_cluster} PDVs | "
+                        f"{dist_total_cluster:.1f} km/dia × freq={freq} = {dist_periodo:.1f} km no período | "
+                        f"{tempo_total_cluster:.1f} min/dia × freq={freq} = {tempo_periodo:.1f} min no período"
                     )
 
             # =========================================================
             # 💾 Inserções em batch no banco
             # =========================================================
             with get_connection_context() as conn:
+                _ensure_subcluster_parcial_cols(conn)
                 with conn.cursor() as cur:
                     if subcluster_rows:
                         execute_values(
@@ -151,7 +200,9 @@ class SalesRoutingDatabaseWriter:
                             INSERT INTO sales_subcluster (
                                 tenant_id, run_id, routing_id, cluster_id, subcluster_seq,
                                 k_final, tempo_total_min, dist_total_km, n_pdvs,
-                                rota_coord, centro_lat, centro_lon, criado_em
+                                rota_coord, centro_lat, centro_lon, criado_em,
+                                tempo_parcial_min, dist_parcial_km, status_rota,
+                                timeline_eventos, horario_inicio_operacao
                             ) VALUES %s
                             """,
                             subcluster_rows,
@@ -187,32 +238,14 @@ class SalesRoutingDatabaseWriter:
 
                     conn.commit()
 
-            # =========================================================
-            # 💾 Exportar resumo CSV (seguro)
-            # =========================================================
-            try:
-                pasta_output = os.path.join("output", "reports", str(tenant_id))
-                os.makedirs(pasta_output, exist_ok=True)
-                caminho_csv = os.path.join(pasta_output, f"routing_resumo_{routing_id}.csv")
-
-                with open(caminho_csv, "w", newline="", encoding="utf-8") as csvfile:
-                    writer = csv.writer(csvfile)
-                    writer.writerow([
-                        "tenant_id", "run_id", "routing_id", "cluster_id",
-                        "qtd_subclusters", "qtd_pdvs",
-                        "dist_total_km", "tempo_total_min",
-                        "dist_media_km", "tempo_medio_min",
-                        "dist_total_mes_km", "tempo_total_mes_min", "criado_em"
-                    ])
-                    writer.writerows(resumo_rows)
-
-                logger.success(
-                    f"✅ Simulação salva | tenant={tenant_id} | routing_id={routing_id} | "
-                    f"{len(subcluster_rows)} subclusters | {len(pdv_rows)} PDVs | "
-                    f"Resumo exportado → {caminho_csv}"
-                )
-            except Exception as e:
-                logger.warning(f"⚠️ Falha ao exportar CSV de resumo: {e}")
+            # CSV de resumo em disco removido (2026-05-18): redundante com
+            # sales_routing_resumo no PG (fonte da verdade) e nunca foi
+            # consumido por endpoint. XLSX equivalente é gerado on-demand
+            # via /relatorio/resumo (StreamingResponse, sem persistir).
+            logger.success(
+                f"✅ Simulação salva | tenant={tenant_id} | routing_id={routing_id} | "
+                f"{len(subcluster_rows)} subclusters | {len(pdv_rows)} PDVs"
+            )
 
         except Exception as e:
             logger.error(f"❌ Erro ao salvar simulação operacional: {e}")

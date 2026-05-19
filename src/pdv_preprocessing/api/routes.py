@@ -782,6 +782,8 @@ def filtrar_jobs(
     data_inicio: str = Query(None),
     data_fim: str = Query(None),
     descricao: str = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
 ):
     user = request.state.user
     tenant_id = user["tenant_id"]
@@ -808,6 +810,25 @@ def filtrar_jobs(
 
     where_clause = " AND ".join(filtros)
 
+    # FILTRAR_JOBS_CAP: máximo de registros acessíveis via filtro (não é
+    # o limit por página — é o teto total). Acima disso o front avisa
+    # pra refinar, em vez de paginar histórico antigo via filtro.
+    FILTRAR_JOBS_CAP = 100
+
+    # COUNT real (input_ids distintos que casam com o filtro) — usado
+    # pelo front pra decidir se exibe o aviso "refine o filtro".
+    count_sql = f"""
+        SELECT COUNT(*) FROM (
+            SELECT DISTINCT input_id
+            FROM historico_pdv_jobs
+            WHERE {where_clause}
+        ) t;
+    """
+
+    # Offset é truncado para não ultrapassar o cap (evita páginas vazias
+    # além do registro 100º).
+    safe_offset = max(0, min(offset, max(FILTRAR_JOBS_CAP - limit, 0)))
+
     sql = f"""
         SELECT *
         FROM (
@@ -816,6 +837,7 @@ def filtrar_jobs(
                 job_id,
                 input_id,
                 descricao,
+                arquivo,
                 status,
                 total_processados,
                 validos,
@@ -827,12 +849,21 @@ def filtrar_jobs(
             ORDER BY input_id, criado_em DESC
         ) t
         ORDER BY criado_em DESC
-        LIMIT 20;
+        LIMIT %s OFFSET %s;
     """
 
+    page_params = tuple(params) + (limit, safe_offset)
+
     conn = get_connection()
-    df = pd.read_sql_query(sql, conn, params=tuple(params))
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(count_sql, tuple(params))
+        total = int(cur.fetchone()[0] or 0)
+        cur.close()
+
+        df = pd.read_sql_query(sql, conn, params=page_params)
+    finally:
+        conn.close()
 
     df = df.astype(object).replace({np.nan: None, np.inf: None, -np.inf: None})
 
@@ -840,8 +871,9 @@ def filtrar_jobs(
     jobs = enrich_jobs_with_live_counts(jobs, tenant_id)
 
     return {
-        "total": int(len(df)),
+        "total": total,
         "jobs": jobs,
+        "cap": FILTRAR_JOBS_CAP,
     }
 
 
@@ -1320,14 +1352,29 @@ def _gerar_xlsx_invalidos_stream(
     tenant_id: int,
     input_id: str,
 ) -> StreamingResponse:
-    """Constrói e retorna um StreamingResponse de XLSX a partir do banco."""
+    """Constrói e retorna um StreamingResponse de XLSX a partir do banco.
+
+    Ordem das colunas segue o template de upload + extras de inválido
+    (motivo_invalidade/label) + lat/lon, pra o usuário poder ajustar
+    o registro e reuploadar manualmente (ou usar como base p/ inserção
+    geocodificada manualmente).
+    """
+    # Colunas opcionais (razao_social, nome_fantasia, janela_*, lat/lon)
+    # foram adicionadas via lazy migration em salvar_invalidos_batch;
+    # registros antigos retornam NULL nelas, o que o openpyxl exporta
+    # como célula vazia (comportamento desejado p/ planilha de upload).
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT cnpj, logradouro, numero, bairro, cidade, uf, cep,
-                   pdv_vendas, motivo_invalidade
+            SELECT cnpj, razao_social, nome_fantasia,
+                   logradouro, numero, bairro, cidade, uf, cep,
+                   pdv_vendas,
+                   janela_atendimento_inicio, janela_atendimento_fim,
+                   tempo_atendimento_min, is_estrategico,
+                   pdv_lat, pdv_lon,
+                   motivo_invalidade
             FROM pdv_invalidos
             WHERE tenant_id = %s AND input_id = %s
             ORDER BY id
@@ -1348,6 +1395,8 @@ def _gerar_xlsx_invalidos_stream(
         rows,
         columns=[
             "cnpj",
+            "razao_social",
+            "nome_fantasia",
             "logradouro",
             "numero",
             "bairro",
@@ -1355,6 +1404,12 @@ def _gerar_xlsx_invalidos_stream(
             "uf",
             "cep",
             "pdv_vendas",
+            "janela_atendimento_inicio",
+            "janela_atendimento_fim",
+            "tempo_atendimento_min",
+            "is_estrategico",
+            "pdv_lat",
+            "pdv_lon",
             "motivo_invalidade",
         ],
     )
@@ -1742,6 +1797,14 @@ def inserir_pdvs_manuais(
         )
 
     tem_vendas = "pdv_vendas" in df.columns
+    # Campos opcionais (CVRPTW + identificação). Se presentes na
+    # planilha, são parseados e persistidos no PDV; ausência não é erro.
+    tem_jan_ini = "janela_atendimento_inicio" in df.columns
+    tem_jan_fim = "janela_atendimento_fim" in df.columns
+    tem_t_atend = "tempo_atendimento_min" in df.columns
+    tem_estrat = "is_estrategico" in df.columns
+    tem_razao = "razao_social" in df.columns
+    tem_fantasia = "nome_fantasia" in df.columns
 
     # ------------------------------------------------------
     # Helpers de parsing
@@ -1769,6 +1832,59 @@ def inserir_pdvs_manuais(
         except Exception:
             return None
         return numero if np.isfinite(numero) and numero <= 1_000_000_000 else None
+
+    def _parse_horario_min(valor):
+        """Aceita HH:MM, HH:MM:SS, int/str de minutos. Retorna int ou None."""
+        if valor is None:
+            return None
+        v = str(valor).strip()
+        if not v or v.lower() in {"nan", "none", "null"}:
+            return None
+        m = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2}(?:\.\d+)?)?$", v)
+        if m:
+            h, mm = int(m.group(1)), int(m.group(2))
+            if 0 <= h < 24 and 0 <= mm < 60:
+                return h * 60 + mm
+            return None
+        try:
+            n = int(float(v.replace(",", ".")))
+            if 0 <= n < 1440:
+                return n
+        except Exception:
+            pass
+        return None
+
+    def _parse_tempo_atendimento(valor):
+        if valor is None:
+            return None
+        v = str(valor).strip().replace("R$", "").replace(",", ".")
+        if not v or v.lower() in {"nan", "none", "null"}:
+            return None
+        try:
+            n = float(v)
+            return n if 0 < n <= 1440 else None
+        except Exception:
+            return None
+
+    _VERDADEIROS = {
+        "true", "verdadeiro", "1", "sim", "s", "yes", "y", "x",
+        "✓", "estrategico", "estrategica",
+    }
+    _FALSOS = {"false", "falso", "0", "nao", "n", "no"}
+
+    def _parse_bool_estrategico(valor):
+        if valor is None:
+            return None
+        if isinstance(valor, bool):
+            return valor
+        v = str(valor).strip().lower()
+        if not v or v in {"nan", "none", "null"}:
+            return None
+        if v in _VERDADEIROS:
+            return True
+        if v in _FALSOS:
+            return False
+        return None
 
     # ------------------------------------------------------
     # CNPJs já existentes no carregamento
@@ -1842,6 +1958,14 @@ def inserir_pdvs_manuais(
             base_endereco = f"{base_endereco}, {cep_fmt}"
         endereco_completo = f"{base_endereco}, Brasil"
 
+        # Opcionais (CVRPTW + identificação)
+        jan_ini = _parse_horario_min(row.get("janela_atendimento_inicio")) if tem_jan_ini else None
+        jan_fim = _parse_horario_min(row.get("janela_atendimento_fim")) if tem_jan_fim else None
+        t_atend = _parse_tempo_atendimento(row.get("tempo_atendimento_min")) if tem_t_atend else None
+        estrat = _parse_bool_estrategico(row.get("is_estrategico")) if tem_estrat else None
+        razao = str(row.get("razao_social") or "").strip() if tem_razao else ""
+        fantasia = str(row.get("nome_fantasia") or "").strip() if tem_fantasia else ""
+
         pdvs_para_inserir.append(
             PDV(
                 cnpj=cnpj,
@@ -1860,6 +1984,12 @@ def inserir_pdvs_manuais(
                 pdv_lon=lon,
                 status_geolocalizacao="manual_insert",
                 tenant_id=tenant_id,
+                razao_social=razao or None,
+                nome_fantasia=fantasia or None,
+                janela_atendimento_inicio=jan_ini,
+                janela_atendimento_fim=jan_fim,
+                tempo_atendimento_min=t_atend,
+                is_estrategico=estrat,
             )
         )
 

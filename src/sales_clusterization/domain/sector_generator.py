@@ -300,6 +300,7 @@ def kmeans_balanceado(
     max_time_min: float,
     tempo_servico_min: float,
     redistribuir: bool = False,
+    alpha_path: float = 1.4,
 ):
     """
     Executa KMeans balanceado com controle de tamanho máximo de cluster.
@@ -339,6 +340,11 @@ def kmeans_balanceado(
         return resultados
 
 
+    # Fator de sinuosidade — vem do caller (cluster_use_case). Mesmo
+    # multiplicador usado pelo routing_engine; aproxima a estimativa
+    # haversine da distância real por estrada.
+    alpha = max(alpha_path, 1.0)
+
     def avaliar_cluster(coords, centro):
         """Calcula distância total e tempo de rota simulada (vizinho mais próximo simples)."""
         if len(coords) == 0:
@@ -353,6 +359,7 @@ def kmeans_balanceado(
             atual = coords[idx]
             visitados[idx] = True
         dist_total += _haversine_km(atual, centro)
+        dist_total *= alpha
         tempo_total = (dist_total / max(v_kmh, 1e-3)) * 60 + len(coords) * tempo_servico_min
         return dist_total, tempo_total
 

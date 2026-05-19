@@ -98,15 +98,14 @@ def executar_clusterizacao(
     if not pdvs:
         raise ValueError("Nenhum PDV encontrado.")
 
-    # Limite máximo de PDVs por execução. Acima disso o KMeans iterativo
-    # + refinador operacional ficam lentos (>30s) e a tabela cluster_setor_pdv
-    # cresce demais (1 row por PDV × N execuções). Se aparecer caso real,
-    # ajustar caso a caso ou implementar split por UF/região no frontend.
-    MAX_PDVS_POR_SETORIZACAO = 50000
-    if len(pdvs) > MAX_PDVS_POR_SETORIZACAO:
+    # Limite máximo de PDVs por execução — pareado com roteirização em
+    # src/limits.py (a setorização inteira é carregada na roteirização,
+    # então os dois precisam aceitar o mesmo teto).
+    from src.limits import MAX_PDVS_POR_EXECUCAO
+    if len(pdvs) > MAX_PDVS_POR_EXECUCAO:
         raise ValueError(
             f"Setorização recusada: {len(pdvs):,} PDVs excedem o limite "
-            f"de {MAX_PDVS_POR_SETORIZACAO:,} por execução. "
+            f"de {MAX_PDVS_POR_EXECUCAO:,} por execução. "
             f"Filtre por UF/cidade ou divida o carregamento."
         )
 
@@ -210,6 +209,7 @@ def executar_clusterizacao(
                     max_time_min=workday_min,
                     tempo_servico_min=service_min,
                     redistribuir=(modo_refinamento == "capacidade"),
+                    alpha_path=alpha_path,
                 )
                 k_balanceado = len(setores_balanceados)
 
@@ -233,6 +233,7 @@ def executar_clusterizacao(
                         tempo_servico_min=service_min,
                         max_iter=max_iter,
                         tenant_id=tenant_id,
+                        alpha_path=alpha_path,
                     )
                     setores_finais = refiner.refinar_com_subclusters_iterativo(
                         pdvs=pdvs,

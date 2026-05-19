@@ -39,6 +39,19 @@ def dividir_cluster_em_subclusters(
         alpha_path=alpha_path
     )
 
+    # Pré-aquece o route_cache com a matriz NxN do cluster inteiro via OSRM
+    # /table — evita N² chamadas /route durante NN/2-opt em cada iteração
+    # de k. Particularmente importante na primeira execução, quando o
+    # cache está vazio. Falha silenciosamente.
+    try:
+        coords_prewarm: list[tuple[float, float]] = [
+            (cluster.centro_lat, cluster.centro_lon)
+        ]
+        coords_prewarm.extend((p.lat, p.lon) for p in pdvs_cluster)
+        optimizer.distance_service.prewarm_matrix(coords_prewarm)
+    except Exception as e:
+        logger.warning(f"⚠️ prewarm OSRM /table falhou ({e}); seguindo sem ele")
+
     k = 1
     convergiu = False
     resultados_iter = []

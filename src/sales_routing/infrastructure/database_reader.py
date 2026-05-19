@@ -8,6 +8,33 @@ from src.database.db_connection import get_connection_context
 from src.sales_routing.domain.entities.cluster_data_entity import ClusterData, PDVData
 
 
+# Lazy migration: garante colunas opcionais na tabela `pdvs` para o modo
+# de roteirização CVRPTW com janelas de tempo. Idempotente (IF NOT EXISTS).
+# Em PG 11+, ADD COLUMN com DEFAULT não faz rewrite — operação rápida
+# mesmo em tabela grande.
+_PDV_ROUTING_COLUMNS_ENSURED = False
+
+
+def _ensure_pdvs_routing_columns(conn) -> None:
+    global _PDV_ROUTING_COLUMNS_ENSURED
+    if _PDV_ROUTING_COLUMNS_ENSURED:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            ALTER TABLE pdvs
+                ADD COLUMN IF NOT EXISTS janela_atendimento_inicio INTEGER,
+                ADD COLUMN IF NOT EXISTS janela_atendimento_fim INTEGER,
+                ADD COLUMN IF NOT EXISTS tempo_atendimento_min DOUBLE PRECISION,
+                ADD COLUMN IF NOT EXISTS is_estrategico BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS razao_social TEXT,
+                ADD COLUMN IF NOT EXISTS nome_fantasia TEXT;
+            """
+        )
+        conn.commit()
+    _PDV_ROUTING_COLUMNS_ENSURED = True
+
+
 class SalesRoutingDatabaseReader:
     """
     Classe de leitura de dados para o módulo Sales Routing.
@@ -72,6 +99,7 @@ class SalesRoutingDatabaseReader:
     def get_pdvs(self, run_id: int) -> List[PDVData]:
         """Busca os PDVs mapeados de um run específico."""
         with get_connection_context() as conn:
+            _ensure_pdvs_routing_columns(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT
@@ -81,8 +109,13 @@ class SalesRoutingDatabaseReader:
                         p.lat,
                         p.lon,
                         p.cidade,
-                        p.uf
+                        p.uf,
+                        pd.janela_atendimento_inicio,
+                        pd.janela_atendimento_fim,
+                        pd.tempo_atendimento_min,
+                        pd.is_estrategico
                     FROM cluster_setor_pdv p
+                    LEFT JOIN pdvs pd ON pd.id = p.pdv_id
                     WHERE p.run_id = %s
                     ORDER BY p.pdv_id;
                 """, (run_id,))
@@ -95,7 +128,11 @@ class SalesRoutingDatabaseReader:
                         lat=row["lat"],
                         lon=row["lon"],
                         cidade=row["cidade"],
-                        uf=row["uf"]
+                        uf=row["uf"],
+                        janela_atendimento_inicio=row.get("janela_atendimento_inicio"),
+                        janela_atendimento_fim=row.get("janela_atendimento_fim"),
+                        tempo_atendimento_min=row.get("tempo_atendimento_min"),
+                        is_estrategico=row.get("is_estrategico"),
                     )
                     for row in rows
                 ]

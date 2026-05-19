@@ -125,9 +125,47 @@ class PDVPreprocessingUseCase:
             c = c.strip().lower()
             c = unicodedata.normalize("NFKD", c)
             c = "".join(ch for ch in c if not unicodedata.combining(ch))
+            # Remove conteúdo entre parênteses (ex.: "tempo (min)" → "tempo ")
+            c = re.sub(r"\([^)]*\)", "", c)
+            # Espaços e hífens viram underscore
+            c = re.sub(r"[\s\-]+", "_", c.strip())
+            # Descarta o resto (vírgulas, etc) mantendo só alphanumeric+underscore
+            c = re.sub(r"[^a-z0-9_]", "", c)
+            # Colapsa underscores múltiplos
+            c = re.sub(r"_+", "_", c).strip("_")
             return c
 
         df.columns = [normalize_col(c) for c in df.columns]
+
+        # Aliases das colunas opcionais de roteirização CVRPTW.
+        # Aceita variações comuns no XLSX e renomeia pra forma canônica
+        # (que é a coluna da tabela `pdvs`).
+        aliases = {
+            "janela_atendimento_inicio": [
+                "janela_inicio", "horario_inicio", "janela_ini",
+                "janela_atendimento_ini", "horario_atendimento_inicio",
+                "abertura", "inicio_atendimento",
+            ],
+            "janela_atendimento_fim": [
+                "janela_fim", "horario_fim", "janela_atendimento_fim",
+                "horario_atendimento_fim", "fechamento", "fim_atendimento",
+            ],
+            "tempo_atendimento_min": [
+                "tempo_atendimento", "service_min", "tempo_servico",
+                "tempo_visita", "tempo_medio_visita",
+            ],
+            "is_estrategico": [
+                "estrategico", "pdv_estrategico", "loja_ancora",
+                "estrategica", "is_ancora",
+            ],
+        }
+        for canonical, alts in aliases.items():
+            if canonical in df.columns:
+                continue
+            for alt in alts:
+                if alt in df.columns:
+                    df = df.rename(columns={alt: canonical})
+                    break
         return df
 
     # ------------------------------------------------------------
@@ -242,12 +280,98 @@ class PDVPreprocessingUseCase:
 
             df["pdv_vendas"] = df["pdv_vendas"].apply(normalizar_vendas)
 
+        # ============================================================
+        # Roteirização CVRPTW — colunas opcionais
+        # ============================================================
+        def parse_horario_min(valor):
+            """Aceita 'HH:MM', 'HH:MM:SS', 'H:MM', int/str de minutos,
+            objetos datetime.time (do Excel quando célula tipada como
+            Time). Retorna int 0..1439 ou None."""
+            if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+                return None
+            # Excel pode entregar datetime.time direto (quando dtype=str
+            # falha em coluna Time)
+            try:
+                import datetime as _dt
+                if isinstance(valor, _dt.time):
+                    return valor.hour * 60 + valor.minute
+                if isinstance(valor, _dt.datetime):
+                    return valor.hour * 60 + valor.minute
+            except Exception:
+                pass
+            v = str(valor).strip()
+            if not v or v.lower() in {"nan", "none", "null", "nat"}:
+                return None
+            # HH:MM ou HH:MM:SS (Excel adiciona segundos quando célula
+            # tem tipo Time — comum no template)
+            m = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2}(?:\.\d+)?)?$", v)
+            if m:
+                h, mm = int(m.group(1)), int(m.group(2))
+                if 0 <= h < 24 and 0 <= mm < 60:
+                    return h * 60 + mm
+                return None
+            try:
+                # Pode vir como float ("480.0") do Excel — coage pra int
+                n = int(float(v.replace(",", ".")))
+                if 0 <= n < 1440:
+                    return n
+            except Exception:
+                pass
+            return None
+
+        for col in ("janela_atendimento_inicio", "janela_atendimento_fim"):
+            if col in df.columns:
+                df[col] = df[col].apply(parse_horario_min)
+
+        if "tempo_atendimento_min" in df.columns:
+            def parse_tempo(valor):
+                if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+                    return None
+                v = str(valor).strip().replace("R$", "").replace(",", ".")
+                if not v or v.lower() in {"nan", "none", "null"}:
+                    return None
+                try:
+                    n = float(v)
+                    return n if 0 < n <= 1440 else None
+                except Exception:
+                    return None
+            df["tempo_atendimento_min"] = df["tempo_atendimento_min"].apply(parse_tempo)
+
+        if "is_estrategico" in df.columns:
+            VERDADEIROS = {
+                "true", "verdadeiro", "1", "sim", "s", "yes", "y", "x",
+                "✓", "estrategico", "estrategica",
+            }
+            FALSOS = {"false", "falso", "0", "nao", "n", "no"}
+            def parse_bool(valor):
+                if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+                    return None
+                if isinstance(valor, bool):
+                    return valor
+                v = str(valor).strip().lower()
+                if not v or v in {"nan", "none", "null"}:
+                    return None
+                if v in VERDADEIROS:
+                    return True
+                if v in FALSOS:
+                    return False
+                return None
+            df["is_estrategico"] = df["is_estrategico"].apply(parse_bool)
+
         return df
 
     # ------------------------------------------------------------
     def filtrar_colunas(self, df):
         colunas_base = ["cnpj", "logradouro", "numero", "bairro", "cidade", "uf", "cep"]
-        colunas_opcionais = ["pdv_vendas"]
+        colunas_opcionais = [
+            "pdv_vendas",
+            "razao_social",
+            "nome_fantasia",
+            "janela_atendimento_inicio",
+            "janela_atendimento_fim",
+            "tempo_atendimento_min",
+            "is_estrategico",
+        ]
         colunas_presentes = [c for c in (colunas_base + colunas_opcionais) if c in df.columns]
         return df[colunas_presentes].copy()
 
@@ -755,6 +879,22 @@ class PDVPreprocessingUseCase:
                     df_validos["pdv_vendas"],
                     errors="coerce"
                 )
+
+            # BLINDAGEM dos campos opcionais de roteirização CVRPTW.
+            # Substitui NaN/pd.NA → None ANTES de construir as entities,
+            # pra não acabar gravando NaN no PostgreSQL (≠ NULL).
+            for _col in (
+                "janela_atendimento_inicio",
+                "janela_atendimento_fim",
+                "tempo_atendimento_min",
+                "is_estrategico",
+            ):
+                if _col in df_validos.columns:
+                    df_validos[_col] = (
+                        df_validos[_col]
+                        .astype(object)
+                        .where(df_validos[_col].notna(), None)
+                    )
 
             campos_validos = PDV.__init__.__code__.co_varnames[1:]
             df_insert = df_validos[[c for c in df_validos.columns if c in campos_validos]]
