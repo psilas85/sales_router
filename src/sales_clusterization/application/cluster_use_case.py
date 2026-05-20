@@ -73,7 +73,7 @@ def executar_clusterizacao(
     service_min: int,
     v_kmh: float,
     alpha_path: float,
-    max_pdv_cluster: int,
+    max_pdv_cluster: Optional[int],
     descricao: str,
     input_id: str,
     clusterization_id: str,
@@ -82,6 +82,7 @@ def executar_clusterizacao(
     max_iter: int,
     modo_refinamento: str = "operacional",
     k_forcado: Optional[int] = None,
+    min_pdv_cluster: Optional[int] = None,
 ) -> Dict[str, Any]:
 
     inicio_execucao = time()  # ✅ start cronômetro
@@ -157,6 +158,7 @@ def executar_clusterizacao(
         alpha_path=alpha_path,
         n_pdvs=len(pdvs),
         max_pdv_cluster=max_pdv_cluster,
+        min_pdv_cluster=min_pdv_cluster,
         descricao=descricao,
         input_id=input_id,
         clusterization_id=clusterization_id,
@@ -178,6 +180,9 @@ def executar_clusterizacao(
         # 🔵 KMEANS — refinamento operacional
         # ============================================================
         if algo == "kmeans":
+            # refiner só é instanciado no modo operacional; fica disponível
+            # depois para o rebalancer regenerar subclusters, se preciso.
+            refiner = None
             if modo_refinamento == "fixo":
                 # Modo "Número fixo" — usuário define exatamente K.
                 # Não balanceia, não subdivide, não refina. Roda KMeans
@@ -196,6 +201,16 @@ def executar_clusterizacao(
                 setores_finais = kmeans_fixo(pdvs, k_forcado)
 
             else:
+                # Modos "operacional" e "capacidade" precisam do teto de PDVs
+                # por setor (max_pdv_cluster) pra dimensionar o K. O backend
+                # NÃO inventa default — o frontend envia. Sem valor, erro
+                # claro em vez de quebrar lá dentro.
+                if max_pdv_cluster is None:
+                    raise ValueError(
+                        f"Modo '{modo_refinamento}' exige o máximo de PDVs "
+                        f"por setor (max_pdv_cluster) — informe o valor."
+                    )
+
                 # Modos "operacional" e "capacidade" — ambos passam por
                 # kmeans_balanceado primeiro. No "capacidade", ativa
                 # redistribuição para preservar K mínimo (= ceil(N/max));
@@ -243,10 +258,34 @@ def executar_clusterizacao(
                         k_inicial_param=k_balanceado,
                     )
 
+            # ============================================================
+            # 🎚️ Banda opcional [mínimo, máximo] de PDVs por setor
+            # ============================================================
+            # Só roda se o usuário enviou min e/ou max — sem default no
+            # backend. operacional/capacidade reestruturam; "fixo" só avalia
+            # e avisa (preserva o K travado pelo usuário).
+            if min_pdv_cluster is not None or max_pdv_cluster is not None:
+                from src.sales_clusterization.domain.banda_rebalancer import (
+                    rebalancear_para_banda,
+                )
+                setores_finais = rebalancear_para_banda(
+                    setores_finais,
+                    limite_min=min_pdv_cluster,
+                    limite_max=max_pdv_cluster,
+                    modo=modo_refinamento,
+                    refiner=refiner,
+                    dias_uteis=dias_uteis,
+                    freq=freq,
+                )
+
         # ============================================================
         # 🟢 CAPACITATED SWEEP
         # ============================================================
         elif algo == "capacitated_sweep":
+            if max_pdv_cluster is None:
+                raise ValueError(
+                    "Algoritmo 'capacitated_sweep' exige max_pdv_cluster."
+                )
             logger.info("🟢 Executando CAPACITATED SWEEP.")
             labels, centers = capacitated_sweep(pdvs, max_capacity=max_pdv_cluster)
 
@@ -273,6 +312,10 @@ def executar_clusterizacao(
         # 🟣 DENSE SUBSET — cluster único
         # ============================================================
         elif algo == "dense_subset":
+            if max_pdv_cluster is None:
+                raise ValueError(
+                    "Algoritmo 'dense_subset' exige max_pdv_cluster."
+                )
             logger.info(f"🟣 Executando DENSE SUBSET | capacidade={max_pdv_cluster}")
 
             selecionados = dense_subset(pdvs, capacidade=max_pdv_cluster)

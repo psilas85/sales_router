@@ -174,7 +174,11 @@ async def clusterizar(request: Request):
         "input_id": body["input_id"],
         "clusterization_id": clusterization_id,
 
-        "max_pdv_cluster": body.get("max_pdv_cluster", 200),
+        # max/min de PDVs por setor — SEM default no backend. O frontend
+        # envia max_pdv_cluster (com seu próprio default visível) nos modos
+        # que precisam dele; min_pdv_cluster é totalmente opcional (banda).
+        "max_pdv_cluster": body.get("max_pdv_cluster"),
+        "min_pdv_cluster": body.get("min_pdv_cluster"),
         # "operacional" (default, atual): kmeans_balanceado + refinador de rotas diárias
         # "capacidade": só kmeans_balanceado (respeita teto de PDVs, ignora workday/route)
         "modo_refinamento": body.get("modo_refinamento", "operacional"),
@@ -602,7 +606,8 @@ def listar_pontos(
                 cs.n_pdvs,
                 COALESCE(agg.total_vendas, 0)::float AS total_vendas,
                 cd.cidade AS cidade_dominante,
-                cd.uf AS uf_dominante
+                cd.uf AS uf_dominante,
+                cs.metrics->>'banda_status' AS banda_status
             FROM cluster_setor cs
             LEFT JOIN agg ON agg.cluster_id = cs.id
             LEFT JOIN cidade_ranqueada cd
@@ -621,6 +626,9 @@ def listar_pontos(
                 "total_vendas": _f(r[4]) or 0.0,
                 "cidade_dominante": r[5],
                 "uf_dominante": r[6],
+                # banda_status: "OK" / "ABAIXO_MIN" / "FORA_DA_BANDA" quando
+                # a banda opcional de PDVs por setor foi usada; senão None.
+                "banda_status": r[7],
             }
             for r in cur.fetchall()
         ]

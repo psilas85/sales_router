@@ -40,6 +40,54 @@ logging.info("🔌 ThreadedConnectionPool inicializado para PDV Preprocessing.")
 
 
 # ============================================================
+# 🔀 Conexão schema-aware (Simulação vs Execução Operacional)
+# ============================================================
+# schema 'public'      → Simulação Inteligente (comportamento original).
+# schema 'operacional' → Execução Operacional: a conexão roda com
+#   search_path = operacional, public. Assim `pdvs`/`historico_pdv_jobs`/
+#   `pdv_invalidos` resolvem no schema operacional, enquanto
+#   enderecos_cache/cadastro_pdvs/viacep_cache (só existem em public)
+#   seguem resolvendo normalmente. As strings SQL não mudam.
+
+_SCHEMAS_VALIDOS = ("public", "operacional")
+
+
+def pool_getconn(schema: str = "public"):
+    """Pega uma conexão do POOL com o search_path ajustado ao schema."""
+    conn = POOL.getconn()
+    if schema != "public":
+        try:
+            conn.rollback()  # garante transação limpa antes do SET
+        except Exception:
+            pass
+        with conn.cursor() as cur:
+            cur.execute(f"SET search_path TO {schema}, public")
+        conn.commit()
+    return conn
+
+
+def pool_putconn(conn, schema: str = "public") -> None:
+    """Devolve a conexão ao POOL, restaurando o search_path padrão.
+
+    Sem esse reset, a próxima requisição (possivelmente Simulação) herdaria
+    o search_path operacional e leria/gravaria no schema errado.
+    """
+    if schema == "public":
+        POOL.putconn(conn)
+        return
+    try:
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute("SET search_path TO public")
+        conn.commit()
+        POOL.putconn(conn)
+    except Exception:
+        # Não conseguiu restaurar — descarta a conexão para não contaminar
+        # o pool com search_path operacional.
+        POOL.putconn(conn, close=True)
+
+
+# ============================================================
 # 🔁 Decorator de retry automático
 # ============================================================
 
@@ -80,8 +128,12 @@ class DatabaseReader:
     Todas as operações são threadsafe.
     """
 
-    def __init__(self):
-        pass  # não guarda conexão fixa
+    def __init__(self, schema: str = "public"):
+        # schema da pipeline: 'public' (Simulação) ou 'operacional'
+        # (Execução Operacional). Ver pool_getconn/pool_putconn.
+        if schema not in _SCHEMAS_VALIDOS:
+            raise ValueError(f"schema inválido: {schema!r}")
+        self._schema = schema
 
 
     # ============================================================
@@ -95,7 +147,7 @@ class DatabaseReader:
 
         endereco_norm = normalize_for_cache(endereco)
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -115,7 +167,7 @@ class DatabaseReader:
             return None
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
 
     # ============================================================
@@ -128,7 +180,7 @@ class DatabaseReader:
 
         cep = str(cep).replace("-", "").strip().zfill(8)
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -148,7 +200,7 @@ class DatabaseReader:
             return None
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     # ============================================================
     # 🔍 ViaCEP Cache — Batch
@@ -160,7 +212,7 @@ class DatabaseReader:
 
         lista_ceps = [str(c).replace("-", "").strip().zfill(8) for c in lista_ceps]
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -180,7 +232,7 @@ class DatabaseReader:
             return {}
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
 
 
@@ -189,7 +241,7 @@ class DatabaseReader:
     # ============================================================
     @retry_on_failure()
     def buscar_pdv_por_cnpj(self, tenant_id: int, cnpj: str) -> Optional[Dict[str, Any]]:
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -206,14 +258,14 @@ class DatabaseReader:
             logging.warning(f"⚠️ [PDV_DB] Erro ao buscar PDV existente ({cnpj}): {e}")
             return None
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     # ============================================================
     # 📋 Carrega todos os PDVs de um tenant
     # ============================================================
     @retry_on_failure()
     def listar_pdvs_por_tenant(self, tenant_id: int) -> pd.DataFrame:
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             query = """
                 SELECT *
@@ -229,7 +281,7 @@ class DatabaseReader:
             logging.warning(f"⚠️ [PDV_DB] Erro ao listar PDVs (tenant={tenant_id}): {e}")
             return pd.DataFrame()
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
 
     # ============================================================
@@ -256,7 +308,7 @@ class DatabaseReader:
             """
             params = (tenant_id,)
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(query, params)
@@ -270,7 +322,7 @@ class DatabaseReader:
             return []
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
 
 
@@ -285,7 +337,7 @@ class DatabaseReader:
 
         end_norm = [normalize_for_cache(e) for e in enderecos if e]
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -307,7 +359,7 @@ class DatabaseReader:
             return {}
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
 
 
@@ -322,7 +374,7 @@ class DatabaseReader:
 
         lista_ceps = [c.replace("-", "").strip().zfill(8) for c in lista_ceps]
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -338,7 +390,7 @@ class DatabaseReader:
             logging.error(f"❌ Erro ao buscar CEPs no cache: {e}", exc_info=True)
             return []
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
 
     # ============================================================
@@ -360,7 +412,7 @@ class DatabaseReader:
         if cep_invalido(cep):
             return None
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -389,7 +441,7 @@ class DatabaseReader:
             return None
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
 
     # ============================================================
@@ -415,7 +467,7 @@ class DatabaseReader:
         if not lista_ceps:
             return []
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
@@ -445,7 +497,7 @@ class DatabaseReader:
             return []
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
 
     # ============================================================
@@ -476,7 +528,7 @@ class DatabaseReader:
         if not lista_ceps:
             return []
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -506,7 +558,7 @@ class DatabaseReader:
             return []
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     # ============================================================
     # 📦 Carregar marketplace_cep por input_id
@@ -523,7 +575,7 @@ class DatabaseReader:
         if not tenant_id or not input_id:
             return []
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
@@ -561,13 +613,13 @@ class DatabaseReader:
             )
             return []
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     @retry_on_failure()
     def buscar_marketplace_info(self, cep, tenant_id, input_id):
         cep = str(cep).replace("-", "").strip().zfill(8)
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -597,14 +649,14 @@ class DatabaseReader:
                     uf.strip().upper(),
                 )
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
         # ============================================================
     # 📋 Listar últimos 10 jobs (para /jobs/ultimos)
     # ============================================================
     @retry_on_failure()
     def listar_ultimos_jobs(self, tenant_id: int, limite: int = 10) -> pd.DataFrame:
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             query = """
                 SELECT 
@@ -624,14 +676,14 @@ class DatabaseReader:
             logging.error(f"❌ Erro ao listar últimos jobs: {e}", exc_info=True)
             return pd.DataFrame()
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     # ============================================================
     # 📋 Listar jobs (para /jobs) — máximo 100
     # ============================================================
     @retry_on_failure()
     def listar_jobs(self, tenant_id: int, limite: int = 100) -> pd.DataFrame:
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             query = """
                 SELECT 
@@ -651,7 +703,7 @@ class DatabaseReader:
             logging.error(f"❌ Erro ao listar jobs: {e}", exc_info=True)
             return pd.DataFrame()
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     # ============================================================
     # 🔍 Filtrar jobs por data + descrição (para /jobs/filtrar)
@@ -705,7 +757,7 @@ class DatabaseReader:
 
         params.append(limite)
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             df = pd.read_sql_query(sql, conn, params=tuple(params))
             df = df.replace([float("inf"), float("-inf")], pd.NA)
@@ -715,4 +767,4 @@ class DatabaseReader:
             logging.error(f"❌ Erro ao filtrar jobs: {e}", exc_info=True)
             return pd.DataFrame()
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)

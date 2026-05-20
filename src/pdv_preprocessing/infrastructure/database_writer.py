@@ -23,7 +23,11 @@ def _safe_num(val):
         pass
     return val
 
-from pdv_preprocessing.infrastructure.database_reader import POOL
+from pdv_preprocessing.infrastructure.database_reader import (
+    pool_getconn,
+    pool_putconn,
+    _SCHEMAS_VALIDOS,
+)
 from pdv_preprocessing.domain.utils_geo import coordenada_generica
 from pdv_preprocessing.domain.address_normalizer import normalize_for_cache
 from pdv_preprocessing.entities.pdv_entity import PDV
@@ -89,8 +93,12 @@ def _ensure_pdvs_routing_columns(conn) -> None:
 
 
 class DatabaseWriter:
-    def __init__(self):
-        pass
+    def __init__(self, schema: str = "public"):
+        # schema da pipeline: 'public' (Simulação) ou 'operacional'
+        # (Execução Operacional). Ver pool_getconn/pool_putconn.
+        if schema not in _SCHEMAS_VALIDOS:
+            raise ValueError(f"schema inválido: {schema!r}")
+        self._schema = schema
 
     # ============================================================
     # 💾 Inserção de PDVs
@@ -165,7 +173,7 @@ class DatabaseWriter:
             DO NOTHING;
         """
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             _ensure_pdvs_routing_columns(conn)
             with conn.cursor() as cur:
@@ -179,7 +187,7 @@ class DatabaseWriter:
             return 0
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     # ============================================================
     # ❌ Excluir processamento completo (por input_id)
@@ -197,7 +205,7 @@ class DatabaseWriter:
 
         input_id = str(input_id)
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
 
@@ -308,7 +316,7 @@ class DatabaseWriter:
             return False
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     # ============================================================
     # 🧨 Exclusão em CASCATA (input + setorizações + roteirizações)
@@ -339,7 +347,7 @@ class DatabaseWriter:
         input_id = str(input_id)
         contagens: dict = {}
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
 
@@ -539,7 +547,7 @@ class DatabaseWriter:
             raise
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     # ============================================================
     # 🗺️ Inserção no cache de endereços (PDV e MKP unificado)
@@ -581,7 +589,7 @@ class DatabaseWriter:
         # --------------------------------------------------------
         endereco_norm = normalize_for_cache(endereco_cache)
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -627,7 +635,7 @@ class DatabaseWriter:
             raise
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
 
 
@@ -649,7 +657,7 @@ class DatabaseWriter:
 
         cep = str(cep).replace("-", "").strip().zfill(8)
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -675,7 +683,7 @@ class DatabaseWriter:
             logging.error(f"❌ Erro ao salvar viacep_cache para {cep}: {e}", exc_info=True)
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     # ============================================================
     # 💾 ViaCEP Cache — Inserção em lote
@@ -707,7 +715,7 @@ class DatabaseWriter:
                 atualizado_em = NOW();
         """
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 execute_values(cur, sql, valores)
@@ -720,7 +728,7 @@ class DatabaseWriter:
             return 0
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     
     # ============================================================
@@ -744,7 +752,7 @@ class DatabaseWriter:
         input_id: Optional[str] = None,
     ) -> None:
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -799,7 +807,7 @@ class DatabaseWriter:
             conn.rollback()
             logging.error(f"❌ Erro ao salvar histórico PDV: {e}", exc_info=True)
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     # ============================================================
     # 🚫 Persistência de PDVs inválidos
@@ -819,7 +827,7 @@ class DatabaseWriter:
 
         import pandas as pd
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 # Lazy migration — segue padrão de outros repositories do projeto
@@ -945,7 +953,7 @@ class DatabaseWriter:
             return 0
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     @retry_on_failure()
     def salvar_historico_mkp_job(
@@ -992,7 +1000,7 @@ class DatabaseWriter:
             descricao, input_id,
         )
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(query, params)
@@ -1001,7 +1009,7 @@ class DatabaseWriter:
             conn.rollback()
             logging.error(f"❌ Erro ao salvar histórico MKP: {e}", exc_info=True)
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
 
     
@@ -1066,7 +1074,7 @@ class DatabaseWriter:
             str(mkp_id),
         )
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
@@ -1087,7 +1095,7 @@ class DatabaseWriter:
             )
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     @retry_on_failure()
     def inserir_mkp_sem_geo(
@@ -1165,7 +1173,7 @@ class DatabaseWriter:
 
                     """
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 execute_values(cur, sql, valores)
@@ -1178,7 +1186,7 @@ class DatabaseWriter:
             return 0
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
 
 
@@ -1239,7 +1247,7 @@ class DatabaseWriter:
         if lat is None or lon is None:
             return None
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1264,7 +1272,7 @@ class DatabaseWriter:
             return None
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     # ============================================================
     # 📝 Atualizar endereço completo do PDV
@@ -1278,7 +1286,7 @@ class DatabaseWriter:
         if not novo_endereco:
             return False
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1299,7 +1307,7 @@ class DatabaseWriter:
             return False
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     
     # ============================================================
@@ -1318,7 +1326,7 @@ class DatabaseWriter:
         # Normaliza usando a mesma regra do pipeline
         endereco_norm = normalize_for_cache(endereco_completo)
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1338,7 +1346,7 @@ class DatabaseWriter:
             return None
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
 
 
@@ -1372,7 +1380,7 @@ class DatabaseWriter:
             )
             return False
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1413,7 +1421,7 @@ class DatabaseWriter:
             return False
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
 
     # ============================================================
@@ -1443,7 +1451,7 @@ class DatabaseWriter:
 
         endereco_norm = normalize_for_cache(endereco_completo)
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1499,7 +1507,7 @@ class DatabaseWriter:
             return False
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
 
     # ============================================================
@@ -1507,7 +1515,7 @@ class DatabaseWriter:
     # ============================================================
     @retry_on_failure()
     def excluir_pdv(self, pdv_id: int, tenant_id: int) -> bool:
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1526,11 +1534,11 @@ class DatabaseWriter:
             return False
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     @retry_on_failure()
     def atualizar_pdv_completo(self, pdv: PDV) -> bool:
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1572,7 +1580,7 @@ class DatabaseWriter:
             logging.error(f"❌ Erro ao atualizar PDV: {e}", exc_info=True)
             return False
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     # ============================================================
     # ✏️ Atualizar lat/lon no cache usando CHAVE CANÔNICA (CORRIGIDO)
@@ -1585,7 +1593,7 @@ class DatabaseWriter:
         if coordenada_generica(nova_lat, nova_lon):
             return False
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1629,7 +1637,7 @@ class DatabaseWriter:
             return False
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
 
 
@@ -1654,7 +1662,7 @@ class DatabaseWriter:
         if coordenada_generica(lat, lon):
             return False
 
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1684,11 +1692,11 @@ class DatabaseWriter:
             return False
 
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     @retry_on_failure()
     def buscar_cache_key_pdv(self, pdv_id: int, tenant_id: int) -> str | None:
-        conn = POOL.getconn()
+        conn = pool_getconn(self._schema)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -1703,6 +1711,6 @@ class DatabaseWriter:
                 row = cur.fetchone()
                 return row[0] if row else None
         finally:
-            POOL.putconn(conn)
+            pool_putconn(conn, self._schema)
 
     

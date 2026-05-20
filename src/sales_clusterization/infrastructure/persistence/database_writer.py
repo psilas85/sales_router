@@ -168,6 +168,11 @@ def salvar_setores(tenant_id: int, run_id: int, setores: List[Setor]) -> Dict[in
 
                 subclusters = getattr(s, "subclusters", [])
 
+                # banda_status: marca o setor quando a banda opcional [mín,máx]
+                # de PDVs por setor foi aplicada (banda_rebalancer). Fica None
+                # quando o usuário não usou a banda.
+                banda_status = (getattr(s, "metrics", None) or {}).get("banda_status")
+
                 if subclusters and isinstance(subclusters, list):
                     tempos = [sc.get("tempo_min", 0.0) for sc in subclusters]
                     distancias = [sc.get("dist_km", 0.0) for sc in subclusters]
@@ -196,6 +201,7 @@ def salvar_setores(tenant_id: int, run_id: int, setores: List[Setor]) -> Dict[in
                         "tempo_max_min": tempo_max_min,
                         "distancia_media_km": distancia_media_km,
                         "dist_max_km": dist_max_km,
+                        "banda_status": banda_status,
                         "subclusters": subclusters,
                     },
                     ensure_ascii=False,

@@ -89,8 +89,12 @@ def main():
     # Não exposto na UI; default 1.4.
     parser.add_argument("--alpha", type=float, default=1.4)
 
-    # Usado por ambos
-    parser.add_argument("--max_pdv_cluster", type=int, default=200)
+    # Teto de PDVs por setor. Sem default no backend — o frontend envia o
+    # valor. Quando o modo precisa dele e não vier, o use case acusa erro.
+    parser.add_argument("--max_pdv_cluster", type=int, default=None)
+    # Piso opcional de PDVs por setor (banda). Sem ele, não há fusão de
+    # setores pequenos — a clusterização roda normalmente.
+    parser.add_argument("--min_pdv_cluster", type=int, default=None)
     parser.add_argument("--max_iter", type=int, default=10)
     # operacional: kmeans_balanceado + refinador (default, atual)
     # capacidade: só kmeans_balanceado (respeita só max_pdv_cluster)
@@ -162,6 +166,7 @@ def main():
         logger.info(f"🚚 velocidade (km/h)  = {args.vel}")
 
     logger.info(f"🔢 max_pdv_cluster    = {args.max_pdv_cluster}")
+    logger.info(f"🔢 min_pdv_cluster    = {args.min_pdv_cluster}")
     logger.info(f"🎛️ modo_refinamento   = {args.modo_refinamento}")
     if args.k_forcado:
         logger.info(f"🎯 k_forcado          = {args.k_forcado}")
@@ -185,6 +190,7 @@ def main():
         v_kmh=args.vel,
         alpha_path=args.alpha,
         max_pdv_cluster=args.max_pdv_cluster,
+        min_pdv_cluster=args.min_pdv_cluster,
         descricao=args.descricao,
         input_id=input_id,
         clusterization_id=clusterization_id,
