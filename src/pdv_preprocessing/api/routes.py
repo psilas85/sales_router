@@ -25,6 +25,7 @@ from loguru import logger
 
 # Banco de dados
 from database.db_connection import get_connection
+from psycopg2.extras import execute_values
 from pdv_preprocessing.infrastructure.database_reader import DatabaseReader
 from pdv_preprocessing.infrastructure.database_writer import DatabaseWriter
 
@@ -469,6 +470,144 @@ def upload_arquivo(
 
 
 # ==========================================================
+# 📇 Carregamento a partir do Cadastro de Clientes
+# ==========================================================
+
+class CarregamentoFromCadastroSchema(BaseModel):
+    descricao: str
+    cliente_ids: list[str]
+
+
+@router.post(
+    "/carregamento-from-cadastro",
+    dependencies=[Depends(verify_token)],
+    tags=["Jobs"],
+)
+def carregamento_from_cadastro(
+    request: Request,
+    payload: CarregamentoFromCadastroSchema,
+):
+    """
+    Gera um carregamento (input_id) a partir do Cadastro de Clientes —
+    snapshot dos PDVs selecionados (ATIVOS e GEOCODIFICADOS) direto para a
+    tabela `pdvs`. Sem upload, sem geocodificação, síncrono.
+    """
+    tenant_id = request.state.user["tenant_id"]
+    input_id = str(uuid4())
+    job_id = str(uuid4())
+
+    descricao = (payload.descricao or "").strip()[:60]
+    if not descricao:
+        raise HTTPException(status_code=400, detail="Informe a descrição do carregamento.")
+
+    ids = [str(i).strip() for i in (payload.cliente_ids or []) if str(i).strip()]
+    if not ids:
+        raise HTTPException(status_code=400, detail="Nenhum cliente selecionado.")
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            # Migração preguiçosa: marcador de origem do carregamento.
+            cur.execute(
+                "ALTER TABLE historico_pdv_jobs ADD COLUMN IF NOT EXISTS "
+                "origem VARCHAR(20) NOT NULL DEFAULT 'upload';"
+            )
+
+            cur.execute(
+                """
+                SELECT cnpj, logradouro, numero, bairro, cidade, uf, cep,
+                       pdv_lat, pdv_lon, status_geolocalizacao, pdv_vendas,
+                       janela_atendimento_inicio, janela_atendimento_fim,
+                       tempo_atendimento_min, is_estrategico,
+                       razao_social, nome_fantasia
+                FROM cadastro_pdvs
+                WHERE tenant_id = %s
+                  AND id = ANY(%s::uuid[])
+                  AND ativo = TRUE
+                  AND pdv_lat IS NOT NULL
+                  AND pdv_lon IS NOT NULL
+                """,
+                (tenant_id, ids),
+            )
+            rows = cur.fetchall()
+
+            if not rows:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Nenhum cliente ativo e geocodificado entre os selecionados.",
+                )
+
+            valores = []
+            vistos: set[str] = set()
+            for r in rows:
+                (cnpj, log, num, bairro, cid, uf_, cep, lat, lon, status,
+                 vendas, jini, jfim, tempo, estrat, rs, nf) = r
+                if cnpj in vistos:
+                    continue
+                vistos.add(cnpj)
+                canonico, chave = _cache_keys_geocoding(log, num, cid, uf_)
+                valores.append((
+                    tenant_id, input_id, descricao, cnpj,
+                    log, num, bairro, cid, uf_, cep,
+                    canonico, chave, lat, lon, status, vendas,
+                    jini, jfim, tempo, estrat, rs, nf,
+                ))
+
+            execute_values(
+                cur,
+                """
+                INSERT INTO pdvs (
+                    tenant_id, input_id, descricao, cnpj,
+                    logradouro, numero, bairro, cidade, uf, cep,
+                    pdv_endereco_completo, endereco_cache_key,
+                    pdv_lat, pdv_lon, status_geolocalizacao, pdv_vendas,
+                    janela_atendimento_inicio, janela_atendimento_fim,
+                    tempo_atendimento_min, is_estrategico,
+                    razao_social, nome_fantasia
+                ) VALUES %s
+                ON CONFLICT (tenant_id, input_id, cnpj) DO NOTHING
+                """,
+                valores,
+            )
+            total = len(valores)
+
+            cur.execute(
+                """
+                INSERT INTO historico_pdv_jobs (
+                    tenant_id, job_id, arquivo, status,
+                    total_processados, validos, invalidos,
+                    inseridos, sobrescritos, mensagem, descricao,
+                    input_id, origem, criado_em
+                ) VALUES (%s,%s,%s,'done',%s,%s,0,%s,0,%s,%s,%s,'cadastro', NOW())
+                """,
+                (
+                    tenant_id, job_id, "Cadastro de Clientes",
+                    total, total, total,
+                    "origem:cadastro_clientes", descricao, input_id,
+                ),
+            )
+
+        conn.commit()
+        logger.info(
+            f"[CARREGAMENTO_CADASTRO] input_id={input_id} total={total} "
+            f"tenant={tenant_id} descricao='{descricao}'"
+        )
+        return {"input_id": input_id, "job_id": job_id, "total": total}
+
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"[CARREGAMENTO_CADASTRO][ERRO] {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail=f"Erro ao gerar carregamento: {e}"
+        )
+    finally:
+        conn.close()
+
+
+# ==========================================================
 # 🗺️ Mapas de PDVs — removidos em 2026-05-18.
 # Os endpoints abaixo geravam HTMLs estáticos em /app/output/maps/ e
 # foram substituídos por renderização inline no frontend, que busca os
@@ -838,6 +977,7 @@ def filtrar_jobs(
                 input_id,
                 descricao,
                 arquivo,
+                origem,
                 status,
                 total_processados,
                 validos,
@@ -2029,3 +2169,145 @@ def inserir_pdvs_manuais(
         "detalhes_duplicados": duplicados[:50],
         "detalhes_invalidos": invalidos[:50],
     }
+
+
+# ==========================================================
+# POST /pdv/processamentos/{input_id}/pdvs-from-cadastro
+#
+# Adiciona ao carregamento clientes selecionados do Cadastro de
+# Clientes (apenas ativos e geocodificados). Sem upload, sem
+# geocodificação — CNPJs já presentes no carregamento são ignorados.
+# ==========================================================
+
+class PdvsFromCadastroSchema(BaseModel):
+    cliente_ids: list[str]
+
+
+@router.post(
+    "/processamentos/{input_id}/pdvs-from-cadastro",
+    dependencies=[Depends(verify_token)],
+    tags=["Locais"],
+)
+def inserir_pdvs_from_cadastro(
+    request: Request,
+    input_id: str,
+    payload: PdvsFromCadastroSchema,
+):
+    user = request.state.user
+    tenant_id = user["tenant_id"]
+
+    if user.get("role") not in [
+        "sales_router_adm",
+        "tenant_adm",
+        "tenant_operacional",
+    ]:
+        raise HTTPException(status_code=403, detail="Usuário sem permissão.")
+
+    input_id = _normalizar_input_id(input_id)
+
+    descricao = _carregamento_descricao(tenant_id, input_id)
+    if descricao is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Carregamento não encontrado para este tenant.",
+        )
+
+    ids = [str(i).strip() for i in (payload.cliente_ids or []) if str(i).strip()]
+    if not ids:
+        raise HTTPException(status_code=400, detail="Nenhum cliente selecionado.")
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            # CNPJs já presentes no carregamento (dedup).
+            cur.execute(
+                "SELECT cnpj FROM pdvs WHERE tenant_id = %s AND input_id = %s",
+                (tenant_id, input_id),
+            )
+            cnpjs_existentes = {r[0] for r in cur.fetchall()}
+
+            # Clientes selecionados — só ativos e geocodificados.
+            cur.execute(
+                """
+                SELECT cnpj, logradouro, numero, bairro, cidade, uf, cep,
+                       pdv_lat, pdv_lon, pdv_vendas,
+                       janela_atendimento_inicio, janela_atendimento_fim,
+                       tempo_atendimento_min, is_estrategico,
+                       razao_social, nome_fantasia
+                FROM cadastro_pdvs
+                WHERE tenant_id = %s
+                  AND id = ANY(%s::uuid[])
+                  AND ativo = TRUE
+                  AND pdv_lat IS NOT NULL
+                  AND pdv_lon IS NOT NULL
+                """,
+                (tenant_id, ids),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Nenhum cliente ativo e geocodificado entre os selecionados.",
+                )
+
+            valores = []
+            ignorados = 0
+            cnpjs_no_lote: set[str] = set()
+            for r in rows:
+                (cnpj, log, num, bairro, cid, uf_, cep, lat, lon, vendas,
+                 jini, jfim, tempo, estrat, rs, nf) = r
+                if cnpj in cnpjs_existentes or cnpj in cnpjs_no_lote:
+                    ignorados += 1
+                    continue
+                cnpjs_no_lote.add(cnpj)
+                canonico, chave = _cache_keys_geocoding(log, num, cid, uf_)
+                valores.append((
+                    tenant_id, input_id, descricao, cnpj,
+                    log, num, bairro, cid, uf_, cep,
+                    canonico, chave, lat, lon, "cadastro_insert", vendas,
+                    jini, jfim, tempo, estrat, rs, nf,
+                ))
+
+            inseridos = 0
+            if valores:
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO pdvs (
+                        tenant_id, input_id, descricao, cnpj,
+                        logradouro, numero, bairro, cidade, uf, cep,
+                        pdv_endereco_completo, endereco_cache_key,
+                        pdv_lat, pdv_lon, status_geolocalizacao, pdv_vendas,
+                        janela_atendimento_inicio, janela_atendimento_fim,
+                        tempo_atendimento_min, is_estrategico,
+                        razao_social, nome_fantasia
+                    ) VALUES %s
+                    ON CONFLICT (tenant_id, input_id, cnpj) DO NOTHING
+                    """,
+                    valores,
+                )
+                inseridos = len(valores)
+
+        conn.commit()
+        logger.info(
+            f"[PDVS_FROM_CADASTRO] input_id={input_id} selecionados={len(ids)} "
+            f"inseridos={inseridos} ignorados={ignorados}"
+        )
+        return {
+            "status": "success",
+            "input_id": input_id,
+            "inseridos": inseridos,
+            "ignorados_duplicados": ignorados,
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"[PDVS_FROM_CADASTRO][ERRO] {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail=f"Erro ao inserir PDVs do cadastro: {e}"
+        )
+    finally:
+        conn.close()

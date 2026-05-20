@@ -79,6 +79,33 @@ services:
     restart: always
 
   # ======================
+  # Worker do cadastro de Clientes (import em lote XLSX)
+  # ======================
+  sales_cadastros_worker:
+    image: sales_router-sales_cadastros:latest
+    container_name: sales_cadastros_worker
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=sales_router_db
+      - DB_PORT=5432
+      - PYTHONPATH=/app/src
+      - REDIS_URL=redis://redis:6379/0
+      - GEOCODING_ENGINE_URL=${GEOCODING_ENGINE_URL:-http://geocoding_engine:8007/api/v1}
+    depends_on:
+      - redis
+      - sales_router_db
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./output:/app/output
+    networks:
+      - sales_router_net
+    command: >
+      rq worker -v -u redis://redis:6379/0 cadastros_import
+    restart: always
+
+  # ======================
   # Pré-processamento de PDVs (FastAPI)
   # ======================
   pdv_preprocessing:

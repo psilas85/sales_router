@@ -52,6 +52,18 @@ class CacheUpdateSchema(BaseModel):
     lon: float
 
 
+class CacheUpsertSchema(BaseModel):
+    """Upsert idempotente por chave canônica — usado por outros serviços
+    (ex.: cadastro de Clientes) para propagar coordenada corrigida."""
+    logradouro: str = Field(..., min_length=2, max_length=200)
+    numero: str = Field(default="", max_length=40)
+    cidade: str = Field(..., min_length=2, max_length=120)
+    uf: str = Field(..., min_length=2, max_length=2)
+    lat: float
+    lon: float
+    origem: Optional[str] = Field(default="correcao_manual", max_length=40)
+
+
 def validar_lat_lon(lat: float, lon: float):
     if lat < -90 or lat > 90 or lon < -180 or lon > 180:
         raise HTTPException(status_code=400, detail="Latitude/longitude fora da faixa válida")
@@ -582,6 +594,41 @@ def criar_cache(payload: CacheCreateSchema):
 
     criado = reader.buscar_cache_por_id(novo_id)
     return jsonable_encoder(criado)
+
+
+# ============================================================
+# CACHE UPSERT (idempotente, por chave canônica)
+# ============================================================
+
+@router.post("/cache/upsert", dependencies=[Depends(verify_token)])
+def upsert_cache(payload: CacheUpsertSchema):
+    """Grava/atualiza o cache de endereços pela chave canônica
+    (build_cache_key) — a MESMA usada nas consultas de geocoding. O cliente
+    envia logradouro/numero/cidade/uf crus; a chave é montada aqui."""
+
+    validar_lat_lon(payload.lat, payload.lon)
+
+    reader = DatabaseReader()
+    writer = DatabaseWriter(reader.conn)
+
+    writer.salvar_cache(
+        logradouro=payload.logradouro,
+        numero=payload.numero or "",
+        cidade=payload.cidade,
+        uf=payload.uf,
+        endereco_original=build_canonical_address(
+            payload.logradouro, payload.numero or "", payload.cidade, payload.uf
+        ),
+        lat=payload.lat,
+        lon=payload.lon,
+        origem=payload.origem or "correcao_manual",
+    )
+
+    chave = build_cache_key(
+        payload.logradouro, payload.numero or "", payload.cidade, payload.uf
+    )
+    logger.info(f"[CACHE][UPSERT] chave='{chave}' lat={payload.lat} lon={payload.lon}")
+    return {"status": "ok", "endereco_normalizado": chave}
 
 
 # ============================================================

@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from cadastros.api.consultores_api import router as consultores_router
+from cadastros.api.pdvs_api import router as pdvs_router
 
 
 app = FastAPI(
@@ -15,6 +16,7 @@ app = FastAPI(
 )
 
 app.include_router(consultores_router)
+app.include_router(pdvs_router)
 
 @app.get("/")
 def root():
