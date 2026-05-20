@@ -526,7 +526,8 @@ def listar_pontos(
             SELECT csp.lat, csp.lon, cs.cluster_label,
                    p.cnpj, p.cidade, p.uf,
                    p.pdv_endereco_completo, p.logradouro, p.numero,
-                   p.bairro, p.cep, p.pdv_vendas, p.status_geolocalizacao
+                   p.bairro, p.cep, p.pdv_vendas, p.status_geolocalizacao,
+                   p.razao_social, p.nome_fantasia
             FROM cluster_setor_pdv csp
             JOIN cluster_setor cs ON cs.id = csp.cluster_id
             LEFT JOIN pdvs p ON p.id = csp.pdv_id
@@ -557,6 +558,8 @@ def listar_pontos(
                     "cep": r[10],
                     "pdv_vendas": _f(r[11]),
                     "status_geolocalizacao": r[12],
+                    "razao_social": r[13],
+                    "nome_fantasia": r[14],
                 }
             )
 

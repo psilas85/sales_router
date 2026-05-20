@@ -22,6 +22,7 @@ from rq.job import Job
 
 from cadastros.application.pdv_use_case import CadastroPDVUseCase
 from cadastros.entities.pdv_entity import CadastroPDV
+from cadastros.infrastructure.pdv_repository import CnpjDuplicadoError
 from cadastros.api.dependencies import verify_token
 from cadastros.infrastructure.queue_factory import fila_import, redis_conn
 from cadastros.jobs.import_clientes_job import processar_import_clientes
@@ -184,7 +185,10 @@ def criar_pdv(
         origem="manual",
     )
 
-    criado = use_case.criar(pdv, geocode=geocode)
+    try:
+        criado = use_case.criar(pdv, geocode=geocode)
+    except CnpjDuplicadoError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e))
     return to_schema(criado)
 
 
@@ -202,7 +206,9 @@ def listar_pdvs(
     ativo: Optional[bool] = Query(default=None, description="True=ativos, False=desativados, omitido=todos"),
     situacao: Optional[str] = Query(default=None, description="ativo | revisar | inativo (precede `ativo`)"),
     uf: Optional[str] = Query(default=None),
+    ufs: Optional[str] = Query(default=None, description="UFs separadas por vírgula"),
     cidade: Optional[str] = Query(default=None),
+    cidades: Optional[str] = Query(default=None, description="Cidades separadas por vírgula (match exato)"),
     busca: Optional[str] = Query(default=None, description="CNPJ, razão social ou nome fantasia"),
     is_estrategico: Optional[bool] = Query(default=None),
     com_coordenadas: Optional[bool] = Query(default=None),
@@ -219,7 +225,15 @@ def listar_pdvs(
         ativo=ativo,
         situacao=situacao,
         uf=uf,
+        ufs=(
+            [u.strip() for u in ufs.split(",") if u.strip()] if ufs else None
+        ),
         cidade=cidade,
+        cidades=(
+            [c.strip() for c in cidades.split(",") if c.strip()]
+            if cidades
+            else None
+        ),
         busca=busca,
         is_estrategico=is_estrategico,
         com_coordenadas=com_coordenadas,
@@ -312,7 +326,10 @@ def atualizar_pdv(pdv_id: UUID, payload: PDVUpdateSchema, request: Request):
         revisao_pendente=existente.revisao_pendente,
     )
 
-    atualizado = use_case.atualizar(pdv, endereco_anterior=existente)
+    try:
+        atualizado = use_case.atualizar(pdv, endereco_anterior=existente)
+    except CnpjDuplicadoError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e))
     if not atualizado:
         raise HTTPException(404, "PDV não encontrado para atualização.")
     return to_schema(atualizado)

@@ -12,7 +12,10 @@ import requests
 from loguru import logger
 
 from cadastros.entities.pdv_entity import CadastroPDV
-from cadastros.infrastructure.pdv_repository import CadastroPDVRepository
+from cadastros.infrastructure.pdv_repository import (
+    CadastroPDVRepository,
+    CnpjDuplicadoError,
+)
 
 
 # ============================================================
@@ -186,6 +189,16 @@ class CadastroPDVUseCase:
         geocode: bool = True,
     ) -> CadastroPDV:
         pdv = self._normalizar(pdv)
+
+        # Unicidade de CNPJ por tenant — rejeita antes de geocodificar
+        # (evita gastar chamada de geocoding em PDV que não será inserido).
+        if self.repository.buscar_por_cnpj(pdv.tenant_id, pdv.cnpj):
+            logger.warning(
+                f"[CADASTRO_PDV][CRIAR] CNPJ {pdv.cnpj} já cadastrado "
+                f"tenant={pdv.tenant_id} — criação rejeitada"
+            )
+            raise CnpjDuplicadoError(pdv.cnpj)
+
         # lat/lon já preenchidos no payload = coordenada confirmada por humano.
         coords_manuais = pdv.pdv_lat is not None and pdv.pdv_lon is not None
         logger.info(
@@ -236,7 +249,9 @@ class CadastroPDVUseCase:
         ativo: Optional[bool] = True,
         situacao: Optional[str] = None,
         uf: Optional[str] = None,
+        ufs: Optional[List[str]] = None,
         cidade: Optional[str] = None,
+        cidades: Optional[List[str]] = None,
         busca: Optional[str] = None,
         is_estrategico: Optional[bool] = None,
         com_coordenadas: Optional[bool] = None,
@@ -252,9 +267,13 @@ class CadastroPDVUseCase:
             ativo=ativo,
             situacao=situacao,
             uf=uf,
+            ufs=ufs,
             # Normaliza igual ao cadastro (UPPER + sem acento) para casar
             # com o valor armazenado, já que o filtro usa ILIKE.
             cidade=_norm_cidade(cidade) if cidade else None,
+            cidades=(
+                [_norm_cidade(c) for c in cidades if c] if cidades else None
+            ),
             busca=busca,
             is_estrategico=is_estrategico,
             com_coordenadas=com_coordenadas,

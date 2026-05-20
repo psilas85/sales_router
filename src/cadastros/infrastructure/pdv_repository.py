@@ -1,11 +1,22 @@
 # sales_router/src/cadastros/infrastructure/pdv_repository.py
 
+import logging
 from typing import List, Optional, Tuple
 from uuid import UUID
 import uuid
 
+import psycopg2
+
 from cadastros.entities.pdv_entity import CadastroPDV
 from database.db_connection import get_connection
+
+
+class CnpjDuplicadoError(Exception):
+    """CNPJ já cadastrado para o tenant — viola a unicidade (tenant_id, cnpj)."""
+
+    def __init__(self, cnpj: str):
+        self.cnpj = cnpj
+        super().__init__(f"CNPJ {cnpj} já cadastrado neste tenant.")
 
 
 SELECT_COLUMNS = """
@@ -68,16 +79,31 @@ class CadastroPDVRepository:
             )
             cur.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_cadastro_pdvs_tenant_cnpj
-                    ON cadastro_pdvs(tenant_id, cnpj);
-                """
-            )
-            cur.execute(
-                """
                 CREATE INDEX IF NOT EXISTS idx_cadastro_pdvs_tenant_ativo
                     ON cadastro_pdvs(tenant_id, ativo);
                 """
             )
+            # Unicidade de CNPJ por tenant — garantida no banco. Substitui o
+            # antigo índice comum idx_cadastro_pdvs_tenant_cnpj. Em savepoint:
+            # se houver CNPJs duplicados legados, o índice não é criado mas as
+            # demais migrações seguem (o app loga e continua funcionando).
+            cur.execute("SAVEPOINT sp_uq_cnpj;")
+            try:
+                cur.execute("DROP INDEX IF EXISTS idx_cadastro_pdvs_tenant_cnpj;")
+                cur.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_cadastro_pdvs_tenant_cnpj
+                        ON cadastro_pdvs(tenant_id, cnpj);
+                    """
+                )
+                cur.execute("RELEASE SAVEPOINT sp_uq_cnpj;")
+            except Exception as exc:
+                cur.execute("ROLLBACK TO SAVEPOINT sp_uq_cnpj;")
+                logging.warning(
+                    "[CADASTRO_PDV] índice único (tenant_id, cnpj) não criado "
+                    "— provável CNPJ duplicado legado: %s",
+                    exc,
+                )
         conn.commit()
 
     # ============================================================
@@ -105,6 +131,7 @@ class CadastroPDVRepository:
                     %s, %s, %s, %s, %s, %s,
                     NOW(), NOW()
                 )
+                ON CONFLICT (tenant_id, cnpj) DO NOTHING
                 RETURNING {SELECT_COLUMNS}
                 """,
                 (
@@ -118,6 +145,10 @@ class CadastroPDVRepository:
                 ),
             )
             row = cur.fetchone()
+            # ON CONFLICT DO NOTHING — sem linha = CNPJ já existe no tenant.
+            if row is None:
+                conn.rollback()
+                raise CnpjDuplicadoError(pdv.cnpj)
             conn.commit()
             return self._row_to_entity(row)
         finally:
@@ -133,7 +164,9 @@ class CadastroPDVRepository:
         ativo: Optional[bool] = True,
         situacao: Optional[str] = None,
         uf: Optional[str] = None,
+        ufs: Optional[list] = None,
         cidade: Optional[str] = None,
+        cidades: Optional[list] = None,
         busca: Optional[str] = None,
         is_estrategico: Optional[bool] = None,
         com_coordenadas: Optional[bool] = None,
@@ -166,9 +199,18 @@ class CadastroPDVRepository:
                 where.append("uf = %s")
                 params.append(uf.strip().upper()[:2])
 
+            if ufs:
+                where.append("uf = ANY(%s)")
+                params.append([u.strip().upper()[:2] for u in ufs if u])
+
             if cidade:
                 where.append("cidade ILIKE %s")
                 params.append(f"%{cidade.strip()}%")
+
+            if cidades:
+                # Match exato — cidades já normalizadas (UPPER/sem acento).
+                where.append("cidade = ANY(%s)")
+                params.append([c for c in cidades if c])
 
             if is_estrategico is not None:
                 where.append("is_estrategico IS %s" % ("TRUE" if is_estrategico else "FALSE"))
@@ -245,6 +287,30 @@ class CadastroPDVRepository:
             conn.close()
 
     # ============================================================
+    # Buscar por CNPJ (unicidade por tenant)
+    # ============================================================
+    def buscar_por_cnpj(
+        self, tenant_id: int, cnpj: str
+    ) -> Optional[CadastroPDV]:
+        conn = get_connection()
+        try:
+            self._ensure_table(conn)
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT {SELECT_COLUMNS}
+                FROM cadastro_pdvs
+                WHERE tenant_id = %s AND cnpj = %s
+                LIMIT 1
+                """,
+                (tenant_id, cnpj),
+            )
+            row = cur.fetchone()
+            return self._row_to_entity(row) if row else None
+        finally:
+            conn.close()
+
+    # ============================================================
     # Atualizar
     # ============================================================
     def atualizar(self, pdv: CadastroPDV) -> Optional[CadastroPDV]:
@@ -252,44 +318,51 @@ class CadastroPDVRepository:
         try:
             self._ensure_table(conn)
             cur = conn.cursor()
-            cur.execute(
-                f"""
-                UPDATE cadastro_pdvs
-                SET
-                    ativo = %s,
-                    cnpj = %s,
-                    razao_social = %s,
-                    nome_fantasia = %s,
-                    logradouro = %s,
-                    numero = %s,
-                    bairro = %s,
-                    cidade = %s,
-                    uf = %s,
-                    cep = %s,
-                    pdv_lat = %s,
-                    pdv_lon = %s,
-                    status_geolocalizacao = %s,
-                    pdv_vendas = %s,
-                    janela_atendimento_inicio = %s,
-                    janela_atendimento_fim = %s,
-                    tempo_atendimento_min = %s,
-                    is_estrategico = %s,
-                    revisao_pendente = %s,
-                    atualizado_em = NOW()
-                WHERE id = %s AND tenant_id = %s
-                RETURNING {SELECT_COLUMNS}
-                """,
-                (
-                    pdv.ativo,
-                    pdv.cnpj, pdv.razao_social, pdv.nome_fantasia,
-                    pdv.logradouro, pdv.numero, pdv.bairro, pdv.cidade, pdv.uf, pdv.cep,
-                    pdv.pdv_lat, pdv.pdv_lon, pdv.status_geolocalizacao, pdv.pdv_vendas,
-                    pdv.janela_atendimento_inicio, pdv.janela_atendimento_fim,
-                    pdv.tempo_atendimento_min, pdv.is_estrategico,
-                    pdv.revisao_pendente,
-                    str(pdv.id), pdv.tenant_id,
-                ),
-            )
+            try:
+                cur.execute(
+                    f"""
+                    UPDATE cadastro_pdvs
+                    SET
+                        ativo = %s,
+                        cnpj = %s,
+                        razao_social = %s,
+                        nome_fantasia = %s,
+                        logradouro = %s,
+                        numero = %s,
+                        bairro = %s,
+                        cidade = %s,
+                        uf = %s,
+                        cep = %s,
+                        pdv_lat = %s,
+                        pdv_lon = %s,
+                        status_geolocalizacao = %s,
+                        pdv_vendas = %s,
+                        janela_atendimento_inicio = %s,
+                        janela_atendimento_fim = %s,
+                        tempo_atendimento_min = %s,
+                        is_estrategico = %s,
+                        revisao_pendente = %s,
+                        atualizado_em = NOW()
+                    WHERE id = %s AND tenant_id = %s
+                    RETURNING {SELECT_COLUMNS}
+                    """,
+                    (
+                        pdv.ativo,
+                        pdv.cnpj, pdv.razao_social, pdv.nome_fantasia,
+                        pdv.logradouro, pdv.numero, pdv.bairro,
+                        pdv.cidade, pdv.uf, pdv.cep,
+                        pdv.pdv_lat, pdv.pdv_lon, pdv.status_geolocalizacao,
+                        pdv.pdv_vendas,
+                        pdv.janela_atendimento_inicio, pdv.janela_atendimento_fim,
+                        pdv.tempo_atendimento_min, pdv.is_estrategico,
+                        pdv.revisao_pendente,
+                        str(pdv.id), pdv.tenant_id,
+                    ),
+                )
+            except psycopg2.errors.UniqueViolation:
+                # CNPJ alterado para um já usado por outro PDV do tenant.
+                conn.rollback()
+                raise CnpjDuplicadoError(pdv.cnpj)
             row = cur.fetchone()
             conn.commit()
             return self._row_to_entity(row) if row else None
