@@ -21,6 +21,12 @@ from database.db_connection import get_connection
 from src.sales_clusterization.application.setorizacao_operacional import (
     executar_setorizacao_operacional,
 )
+from src.sales_clusterization.application.setorizacao_manual import (
+    salvar_setorizacao_manual,
+)
+from src.sales_clusterization.infrastructure.persistence.database_reader import (
+    get_cidades_por_uf,
+)
 from src.sales_clusterization.reporting.export_operacional_pdv_detalhado_xlsx import (
     operacional_pdv_detalhado_to_bytes,
 )
@@ -270,6 +276,36 @@ async def save_parametros_padrao_operacional(request: Request):
 
 
 # ============================================================
+# 🏙️ Cidades disponíveis num carregamento operacional (por UF)
+# ============================================================
+@router.get(
+    "/operacional/cidades",
+    dependencies=[Depends(verify_token)],
+    tags=["Operacional"],
+)
+def listar_cidades_operacional(
+    request: Request,
+    input_id: str = Query(...),
+    uf: str = Query(...),
+):
+    """Cidades com PDVs georreferenciados no carregamento + UF informados.
+    Alimenta o autocomplete de cidades da setorização operacional."""
+    tenant_id = request.state.user["tenant_id"]
+    input_id = (input_id or "").strip()
+    uf = (uf or "").strip()
+    if not input_id or not uf:
+        raise HTTPException(400, "Informe input_id e uf.")
+    try:
+        cidades = get_cidades_por_uf(
+            tenant_id, uf, input_id, schema="operacional"
+        )
+    except Exception as e:
+        logger.error(f"[OPERACIONAL][CIDADES][ERRO] {e}", exc_info=True)
+        raise HTTPException(500, f"Falha ao listar cidades: {e}")
+    return {"cidades": cidades}
+
+
+# ============================================================
 # 🚀 Iniciar setorização operacional (SÍNCRONA)
 # ============================================================
 @router.post(
@@ -339,6 +375,53 @@ async def clusterizar_operacional(request: Request):
     except Exception as e:
         logger.error(f"[OPERACIONAL][CLUSTERIZAR][ERRO] {e}", exc_info=True)
         raise HTTPException(500, f"Falha na setorização: {e}")
+
+    return resultado
+
+
+# ============================================================
+# ✏️ Salvar setorização MANUAL (editor de laço — SÍNCRONA)
+# ============================================================
+# Recebe a atribuição PDV→consultor montada manualmente no mapa e a
+# persiste como uma NOVA setorização, derivada de uma já existente
+# (origem). Não sobrescreve a setorização de origem.
+@router.post(
+    "/operacional/setorizacao-manual",
+    dependencies=[Depends(verify_token)],
+    tags=["Operacional"],
+)
+async def setorizacao_manual_operacional(request: Request):
+    tenant_id = request.state.user["tenant_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "JSON inválido no body.")
+
+    origem = str(body.get("origem_clusterization_id") or "").strip()
+    if not origem:
+        raise HTTPException(400, "Informe a setorização de origem.")
+
+    descricao = str(body.get("descricao") or "").strip()[:120]
+    if not descricao:
+        raise HTTPException(400, "Informe o apelido da nova setorização.")
+
+    atribuicoes = body.get("atribuicoes") or []
+    if not atribuicoes:
+        raise HTTPException(400, "Nenhuma atribuição de PDVs informada.")
+
+    try:
+        resultado = await run_in_threadpool(
+            salvar_setorizacao_manual,
+            tenant_id=tenant_id,
+            origem_clusterization_id=origem,
+            descricao=descricao,
+            atribuicoes=atribuicoes,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.error(f"[OPERACIONAL][MANUAL][ERRO] {e}", exc_info=True)
+        raise HTTPException(500, f"Falha ao salvar setorização manual: {e}")
 
     return resultado
 
@@ -475,7 +558,7 @@ def listar_pontos_operacional(
                        p.cnpj, p.cidade, p.uf,
                        p.pdv_endereco_completo, p.logradouro, p.numero,
                        p.bairro, p.cep, p.pdv_vendas, p.status_geolocalizacao,
-                       p.razao_social, p.nome_fantasia
+                       p.razao_social, p.nome_fantasia, csp.pdv_id
                 FROM cluster_setor_pdv csp
                 JOIN cluster_setor cs ON cs.id = csp.cluster_id
                 LEFT JOIN pdvs p ON p.id = csp.pdv_id
@@ -497,6 +580,9 @@ def listar_pontos_operacional(
                     "bairro": r[9], "cep": r[10], "pdv_vendas": _f(r[11]),
                     "status_geolocalizacao": r[12],
                     "razao_social": r[13], "nome_fantasia": r[14],
+                    # pdv_id: necessário para o editor de setorização manual
+                    # mapear cada marcador ao registro de PDV.
+                    "pdv_id": int(r[15]) if r[15] is not None else None,
                 })
 
             cur.execute(
@@ -511,7 +597,8 @@ def listar_pontos_operacional(
                 )
                 SELECT cs.cluster_label, cs.centro_lat, cs.centro_lon,
                        cs.n_pdvs, COALESCE(agg.total_vendas, 0)::float,
-                       cs.consultor_nome, cs.metrics->>'banda_status'
+                       cs.consultor_nome, cs.metrics->>'banda_status',
+                       cs.consultor_id
                 FROM cluster_setor cs
                 LEFT JOIN agg ON agg.cluster_id = cs.id
                 WHERE cs.run_id = %s
@@ -527,6 +614,9 @@ def listar_pontos_operacional(
                     "total_vendas": _f(r[4]) or 0.0,
                     "consultor_nome": r[5],
                     "banda_status": r[6],
+                    # consultor_id: usado pelo editor manual como âncora
+                    # fixa de cada setor.
+                    "consultor_id": str(r[7]) if r[7] is not None else None,
                 }
                 for r in cur.fetchall()
             ]

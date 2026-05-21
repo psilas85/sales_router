@@ -433,12 +433,17 @@ def listar_pontos_operacional(
                     }
                 )
 
+            # Cada setor operacional é um consultor — devolve nome +
+            # cidade/UF de residência (de public.consultores) para a UI
+            # rotular os setores no mapa, Gantt e tabela de rotas.
             cur.execute(
                 """
                 SELECT DISTINCT cs.id, cs.cluster_label,
-                       cs.centro_lat, cs.centro_lon, cs.n_pdvs
+                       cs.centro_lat, cs.centro_lon, cs.n_pdvs,
+                       cs.consultor_nome, c.cidade, c.uf, c.setor
                 FROM sales_subcluster ss
                 JOIN cluster_setor cs ON cs.id = ss.cluster_id
+                LEFT JOIN public.consultores c ON c.id = cs.consultor_id
                 WHERE ss.tenant_id = %s AND ss.routing_id = %s
                 ORDER BY cs.id;
                 """,
@@ -451,6 +456,12 @@ def listar_pontos_operacional(
                     "centro_lat": _f(r[2]),
                     "centro_lon": _f(r[3]),
                     "n_pdvs": int(r[4] or 0),
+                    "consultor_nome": r[5],
+                    "consultor_cidade": r[6],
+                    "consultor_uf": r[7],
+                    # Código de setor cadastrado no consultor (ex.: "SP03").
+                    # Opcional — nem todo consultor tem.
+                    "consultor_setor": r[8],
                 }
                 for r in cur.fetchall()
             ]

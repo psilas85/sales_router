@@ -18,7 +18,7 @@ def carregar_pdvs(
     tenant_id: int,
     input_id: str,
     uf=None,  # str | List[str] | None
-    cidade: Optional[str] = None,
+    cidade=None,  # str | List[str] | None
     schema: str = "public",
 ) -> List[PDV]:
     # schema da pipeline: 'public' (Simulação) ou 'operacional' (Execução
@@ -48,7 +48,17 @@ def carregar_pdvs(
     elif uf:
         base_query += " AND UPPER(uf) = UPPER(%s)"
         params.append(uf)
-    if cidade:
+    # cidade aceita str (1 cidade), lista (>=1 cidades) ou None (todas).
+    # Lista vazia equivale a None — não filtra.
+    if isinstance(cidade, (list, tuple)):
+        cidades_norm = [str(c).strip().upper() for c in cidade if str(c).strip()]
+        if len(cidades_norm) == 1:
+            base_query += " AND UPPER(cidade) = %s"
+            params.append(cidades_norm[0])
+        elif len(cidades_norm) > 1:
+            base_query += " AND UPPER(cidade) = ANY(%s)"
+            params.append(cidades_norm)
+    elif cidade:
         base_query += " AND UPPER(cidade) = UPPER(%s)"
         params.append(cidade)
 
@@ -130,10 +140,20 @@ def carregar_pdvs(
 
 
 
-def get_cidades_por_uf(tenant_id: int, uf: str, input_id: str) -> list[str]:
+def get_cidades_por_uf(
+    tenant_id: int,
+    uf: str,
+    input_id: str,
+    schema: str = "public",
+) -> list[str]:
     """
-    Retorna lista de cidades com PDVs válidos (com lat/lon) na UF e input_id informados.
+    Retorna lista de cidades com PDVs válidos (com lat/lon) na UF e
+    input_id informados. `schema` resolve a tabela `pdvs` em public
+    (Simulação) ou operacional (Execução Operacional).
     """
+    if schema not in _SCHEMAS_VALIDOS:
+        raise ValueError(f"schema inválido: {schema!r}")
+
     query = """
         SELECT DISTINCT cidade
         FROM pdvs
@@ -142,17 +162,23 @@ def get_cidades_por_uf(tenant_id: int, uf: str, input_id: str) -> list[str]:
           AND UPPER(uf) = UPPER(%s)
           AND pdv_lat IS NOT NULL
           AND pdv_lon IS NOT NULL
+          AND cidade IS NOT NULL
+          AND TRIM(cidade) <> ''
         ORDER BY cidade;
     """
 
     with get_connection() as conn:
+        if schema != "public":
+            with conn.cursor() as _c:
+                _c.execute(f"SET search_path TO {schema}, public")
         with conn.cursor() as cur:
             cur.execute(query, (tenant_id, input_id, uf))
             rows = cur.fetchall()
 
     cidades = [r[0] for r in rows] if rows else []
     logger.info(
-        f"🌎 {len(cidades)} cidades encontradas | tenant={tenant_id} | UF={uf} | input_id={input_id}"
+        f"🌎 {len(cidades)} cidades encontradas | tenant={tenant_id} | "
+        f"UF={uf} | input_id={input_id} | schema={schema}"
     )
     return cidades
 

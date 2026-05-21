@@ -39,6 +39,17 @@ def _uf_to_str(uf) -> str | None:
     return str(uf).strip().upper() or None
 
 
+def _cidade_to_str(cidade) -> str | None:
+    """Normaliza cidade(s) para texto ('São Paulo' ou 'São Paulo, Campinas').
+    Diferente de UF, preserva o caixa original (nome de exibição)."""
+    if cidade is None:
+        return None
+    if isinstance(cidade, (list, tuple)):
+        parts = [str(c).strip() for c in cidade if str(c).strip()]
+        return ", ".join(parts) if parts else None
+    return str(cidade).strip() or None
+
+
 # ============================================================
 # Conexão com search_path no schema operacional
 # ============================================================
@@ -81,7 +92,7 @@ def carregar_consultores(tenant_id: int, consultor_ids: list) -> list[dict]:
 # Persistência (operacional.cluster_*)
 # ============================================================
 def _criar_run(tenant_id, uf, cidade, params, descricao, input_id,
-               clusterization_id) -> int:
+               clusterization_id, algo: str = _ALGO) -> int:
     with get_connection() as conn:
         ensure_operacional_cluster_schema(conn)
         _set_operacional(conn)
@@ -97,7 +108,7 @@ def _criar_run(tenant_id, uf, cidade, params, descricao, input_id,
                 """,
                 (
                     tenant_id, clusterization_id, descricao, input_id,
-                    _uf_to_str(uf), cidade, _ALGO,
+                    _uf_to_str(uf), _cidade_to_str(cidade), algo,
                     json.dumps(params, ensure_ascii=False),
                 ),
             )
