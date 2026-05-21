@@ -50,11 +50,21 @@ def get_connection(retries: int = 5, delay: int = 2, backoff: float = 1.5):
 # =====================================================
 # 🧱 Context Manager seguro (rollback e fechamento)
 # =====================================================
+_SCHEMAS_PERMITIDOS = {"public", "operacional"}
+
+
 @contextmanager
-def get_connection_context(retries: int = 3):
+def get_connection_context(retries: int = 3, schema: str | None = None):
     """
     Context manager seguro para uso de conexões PostgreSQL.
     Fecha e faz rollback automaticamente em caso de erro.
+
+    `schema`: quando informado (e diferente de 'public'), aplica
+    `SET search_path TO <schema>, public` na conexão — usado pela Execução
+    Operacional para resolver as tabelas no schema `operacional`, com
+    fallback em `public` para as tabelas-globais. Default (None) não altera
+    o search_path — comportamento idêntico ao original.
+
     Exemplo:
         with get_connection_context() as conn:
             with conn.cursor() as cur:
@@ -63,6 +73,11 @@ def get_connection_context(retries: int = 3):
     conn = None
     try:
         conn = get_connection(retries=retries)
+        if schema and schema != "public":
+            if schema not in _SCHEMAS_PERMITIDOS:
+                raise ValueError(f"schema inválido: {schema!r}")
+            with conn.cursor() as cur:
+                cur.execute(f"SET search_path TO {schema}, public")
         yield conn
         conn.commit()
     except (OperationalError, InterfaceError) as e:

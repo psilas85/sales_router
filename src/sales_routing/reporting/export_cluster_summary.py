@@ -16,11 +16,14 @@ from openpyxl.utils import get_column_letter
 BASE_OUTPUT = Path("/app/output/reports")  # caminho absoluto no container
 
 
-def routing_resumo_to_bytes(tenant_id: int, routing_id: str) -> bytes:
+def routing_resumo_to_bytes(
+    tenant_id: int, routing_id: str, schema: str = "public"
+) -> bytes:
     """Gera o XLSX em memória e retorna os bytes (sem persistir em disco).
-    Usado pelo endpoint /relatorio/resumo via StreamingResponse."""
+    Usado pelo endpoint /relatorio/resumo via StreamingResponse.
+    `schema`: 'operacional' resolve as views no schema operacional."""
     buffer = io.BytesIO()
-    if not _escrever_resumo(tenant_id, routing_id, buffer):
+    if not _escrever_resumo(tenant_id, routing_id, buffer, schema=schema):
         raise ValueError("Nenhum dado encontrado para a roteirização informada.")
     buffer.seek(0)
     return buffer.getvalue()
@@ -42,7 +45,9 @@ def exportar_resumo_cluster(tenant_id: int, routing_id: str):
     return str(arquivo)
 
 
-def _escrever_resumo(tenant_id: int, routing_id: str, output) -> bool:
+def _escrever_resumo(
+    tenant_id: int, routing_id: str, output, schema: str = "public"
+) -> bool:
     """Núcleo: lê do DB e escreve XLSX em qualquer file-like.
     Retorna False se não houver dados."""
 
@@ -67,6 +72,9 @@ def _escrever_resumo(tenant_id: int, routing_id: str, output) -> bool:
 
     conn = get_connection()
     try:
+        if schema and schema != "public":
+            with conn.cursor() as _c:
+                _c.execute(f"SET search_path TO {schema}, public")
         df = pd.read_sql_query(sql, conn, params=(tenant_id, routing_id))
 
         if df.empty:

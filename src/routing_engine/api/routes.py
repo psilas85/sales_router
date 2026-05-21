@@ -92,6 +92,41 @@ class CriarAgendaRequest(BaseModel):
     data_fim: date
 
 
+# Agenda a partir de rotas já estruturadas (roteirização integrada, sem
+# planilha) — usado pela Execução Operacional via /internal/agenda/from-rotas.
+class AgendaVisitaInput(BaseModel):
+    sequencia: int
+    cnpj: Optional[str] = None
+    nome_fantasia: Optional[str] = None
+    cidade: Optional[str] = None
+    uf: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    logradouro: Optional[str] = None
+    numero: Optional[str] = None
+    bairro: Optional[str] = None
+    cep: Optional[str] = None
+    razao_social: Optional[str] = None
+
+
+class AgendaRotaInput(BaseModel):
+    consultor: str
+    rota_id: str
+    distancia_km: Optional[float] = None
+    tempo_min: Optional[float] = None
+    qtd_pdvs: Optional[int] = None
+    pdvs: list[AgendaVisitaInput] = []
+
+
+class CriarAgendaRotasRequest(BaseModel):
+    tenant_id: int
+    job_id: str            # routing_id da roteirização de origem
+    nome: str
+    data_inicio: date
+    data_fim: date
+    rotas: list[AgendaRotaInput]
+
+
 class AtualizarDataRotaRequest(BaseModel):
     nova_data: date
 
@@ -548,6 +583,94 @@ def criar_agenda_route(job_id: str, body: CriarAgendaRequest, request: Request):
 
     agenda = buscar_agenda(agenda_id, body.tenant_id)
     return agenda
+
+
+@router.post(
+    "/internal/agenda/from-rotas",
+    dependencies=[Depends(verify_token)],
+    status_code=201,
+)
+def criar_agenda_from_rotas(body: CriarAgendaRotasRequest, request: Request):
+    """Cria agenda a partir de rotas já estruturadas — sem planilha.
+
+    Usado pela roteirização integrada (Execução Operacional): o caller
+    monta as rotas (consultor + PDVs) e este endpoint apenas distribui as
+    datas úteis e persiste via criar_agenda. As tabelas de agenda seguem
+    em `public` (compartilhadas)."""
+    user = request.state.user
+    user_tenant_id = user.get("tenant_id")
+    if user_tenant_id is not None and int(user_tenant_id) != body.tenant_id:
+        raise HTTPException(status_code=403, detail="tenant_id divergente do token")
+
+    dias = calcular_dias_uteis(body.data_inicio, body.data_fim)
+    if not dias:
+        raise HTTPException(
+            status_code=400, detail="Nenhum dia útil no período informado"
+        )
+    if not body.rotas:
+        raise HTTPException(status_code=400, detail="Nenhuma rota informada")
+
+    from collections import defaultdict
+
+    def _rota_num(rid: str) -> int:
+        digs = "".join(ch for ch in rid if ch.isdigit())
+        return int(digs) if digs else 0
+
+    por_consultor: dict[str, list] = defaultdict(list)
+    for r in body.rotas:
+        por_consultor[r.consultor].append(r)
+
+    rotas_para_salvar: list[AgendaRotaRow] = []
+    for consultor, rotas_c in sorted(por_consultor.items()):
+        rotas_c = sorted(rotas_c, key=lambda r: _rota_num(r.rota_id))
+        if len(rotas_c) > len(dias):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Período insuficiente: consultor '{consultor}' tem "
+                    f"{len(rotas_c)} rotas mas o período tem {len(dias)} "
+                    f"dias úteis."
+                ),
+            )
+        for idx, r in enumerate(rotas_c):
+            rotas_para_salvar.append(
+                AgendaRotaRow(
+                    consultor=consultor,
+                    rota_id=r.rota_id,
+                    data=dias[idx],
+                    distancia_km=r.distancia_km,
+                    tempo_min=r.tempo_min,
+                    qtd_pdvs=r.qtd_pdvs,
+                    pdvs=[
+                        AgendaVisitaRow(
+                            sequencia=p.sequencia,
+                            cnpj=p.cnpj,
+                            nome_fantasia=p.nome_fantasia,
+                            cidade=p.cidade,
+                            uf=p.uf,
+                            lat=p.lat,
+                            lon=p.lon,
+                            logradouro=p.logradouro,
+                            numero=p.numero,
+                            bairro=p.bairro,
+                            cep=p.cep,
+                            razao_social=p.razao_social,
+                        )
+                        for p in r.pdvs
+                    ],
+                )
+            )
+
+    agenda_id = criar_agenda(
+        tenant_id=body.tenant_id,
+        job_id=body.job_id,
+        nome=body.nome,
+        data_inicio=body.data_inicio,
+        data_fim=body.data_fim,
+        dias_uteis=len(dias),
+        rotas=rotas_para_salvar,
+    )
+    return buscar_agenda(agenda_id, body.tenant_id)
 
 
 @router.get(

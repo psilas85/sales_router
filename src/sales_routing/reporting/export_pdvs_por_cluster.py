@@ -13,17 +13,24 @@ from pathlib import Path
 from src.database.db_connection import get_connection
 
 
-def routing_pdvs_to_bytes(tenant_id: int, routing_id: str) -> bytes:
-    """Gera o XLSX em memória e retorna os bytes. Usado via StreamingResponse."""
+def routing_pdvs_to_bytes(
+    tenant_id: int, routing_id: str, schema: str = "public"
+) -> bytes:
+    """Gera o XLSX em memória e retorna os bytes. Usado via StreamingResponse.
+    `schema`: 'operacional' resolve a view no schema operacional."""
     buffer = io.BytesIO()
-    ok = exportar_pdvs_por_cluster(tenant_id, routing_id, output=buffer)
+    ok = exportar_pdvs_por_cluster(
+        tenant_id, routing_id, output=buffer, schema=schema
+    )
     if not ok:
         raise ValueError("Nenhum PDV encontrado para a roteirização informada.")
     buffer.seek(0)
     return buffer.getvalue()
 
 
-def exportar_pdvs_por_cluster(tenant_id: int, routing_id: str, output=None):
+def exportar_pdvs_por_cluster(
+    tenant_id: int, routing_id: str, output=None, schema: str = "public"
+):
     """
     Exporta todos os PDVs (com informações completas + cluster + subcluster)
     para um arquivo Excel (.xlsx) filtrado por tenant_id e routing_id.
@@ -72,6 +79,9 @@ def exportar_pdvs_por_cluster(tenant_id: int, routing_id: str, output=None):
     # =======================================================
     try:
         conn = get_connection()
+        if schema and schema != "public":
+            with conn.cursor() as _c:
+                _c.execute(f"SET search_path TO {schema}, public")
         df = pd.read_sql(sql, conn, params=(tenant_id, routing_id))
         conn.close()
         logger.debug(f"🔍 Registros retornados: {len(df)}")

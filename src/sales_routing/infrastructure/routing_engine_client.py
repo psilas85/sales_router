@@ -68,6 +68,18 @@ class RoutingEngineClient:
         response.raise_for_status()
         return response.json()
 
+    def criar_agenda_from_rotas(self, payload: dict) -> dict:
+        """Cria uma agenda no routing_engine a partir de rotas já
+        estruturadas (roteirização integrada da Execução Operacional)."""
+        response = requests.post(
+            f"{self.base_url}/internal/agenda/from-rotas",
+            json=payload,
+            headers=self._headers(),
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def execute_prepared_groups_job(self, payload: dict, on_progress=None) -> dict:
         create_data = self.start_prepared_groups_job(payload)
         job_id = create_data.get("job_id")

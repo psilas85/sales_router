@@ -11,6 +11,9 @@ from psycopg2.extras import execute_values
 from datetime import datetime
 from loguru import logger
 from src.database.db_connection import get_connection_context
+from src.sales_routing.infrastructure.operacional_routing_schema import (
+    ensure_operacional_routing_schema,
+)
 
 
 # Lazy migration: adiciona colunas de parcial (até último PDV, sem
@@ -44,6 +47,15 @@ class SalesRoutingDatabaseWriter:
     e snapshots nomeados ("carteiras") no banco de dados.
     Suporta múltiplas execuções imutáveis identificadas por routing_id (UUID).
     """
+
+    def __init__(self, schema: str = "public"):
+        # schema: 'public' (Simulação) ou 'operacional' (Execução
+        # Operacional) — threadado para todas as conexões.
+        self._schema = schema
+
+    def _conn(self):
+        """Conexão já com o search_path do schema (operacional → public)."""
+        return get_connection_context(schema=self._schema)
 
     # =========================================================
     # 1️⃣ Salva simulação operacional (modelo VISITAÇÃO)
@@ -190,7 +202,11 @@ class SalesRoutingDatabaseWriter:
             # =========================================================
             # 💾 Inserções em batch no banco
             # =========================================================
-            with get_connection_context() as conn:
+            with self._conn() as conn:
+                # Execução Operacional: garante o schema operacional de
+                # roteirização (clone idempotente das tabelas).
+                if self._schema == "operacional":
+                    ensure_operacional_routing_schema(conn)
                 _ensure_subcluster_parcial_cols(conn)
                 with conn.cursor() as cur:
                     if subcluster_rows:
@@ -255,7 +271,7 @@ class SalesRoutingDatabaseWriter:
     # 2️⃣ Cria snapshot (mantido sem alteração)
     # =========================================================
     def salvar_snapshot(self, resultados, tenant_id, nome, descricao, criado_por=None, tags=None):
-        with get_connection_context() as conn:
+        with self._conn() as conn:
             with conn.cursor() as cur:
                 try:
                     logger.info(f"💾 Criando snapshot '{nome}' para tenant {tenant_id}...")
@@ -341,7 +357,7 @@ class SalesRoutingDatabaseWriter:
             return
 
         from psycopg2.extras import execute_values
-        with get_connection_context() as conn:
+        with self._conn() as conn:
             with conn.cursor() as cur:
                 try:
                     logger.info(

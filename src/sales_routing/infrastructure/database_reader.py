@@ -42,12 +42,21 @@ class SalesRoutingDatabaseReader:
     fechamento automático de conexões (compatível com PgBouncer).
     """
 
+    def __init__(self, schema: str = "public"):
+        # schema: 'public' (Simulação) ou 'operacional' (Execução
+        # Operacional) — threadado para todas as conexões.
+        self._schema = schema
+
+    def _conn(self):
+        """Conexão já com o search_path do schema (operacional → public)."""
+        return get_connection_context(schema=self._schema)
+
     # =========================================================
     # 1️⃣ Último run concluído
     # =========================================================
     def get_last_run(self) -> Optional[Dict[str, Any]]:
         """Retorna o último run concluído (status='done')."""
-        with get_connection_context() as conn:
+        with self._conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT id, uf, cidade, algo, k_final, params
@@ -64,7 +73,7 @@ class SalesRoutingDatabaseReader:
     # =========================================================
     def get_clusters(self, run_id: int) -> List[ClusterData]:
         """Busca os clusters (setores) de um run específico."""
-        with get_connection_context() as conn:
+        with self._conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT
@@ -98,7 +107,7 @@ class SalesRoutingDatabaseReader:
     # =========================================================
     def get_pdvs(self, run_id: int) -> List[PDVData]:
         """Busca os PDVs mapeados de um run específico."""
-        with get_connection_context() as conn:
+        with self._conn() as conn:
             _ensure_pdvs_routing_columns(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
@@ -142,7 +151,7 @@ class SalesRoutingDatabaseReader:
     # =========================================================
     def get_last_run_by_location(self, uf: str, cidade: Optional[str]):
         """Retorna o último run concluído filtrado por UF e cidade."""
-        with get_connection_context() as conn:
+        with self._conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT id, uf, cidade, algo, k_final, params
@@ -171,7 +180,7 @@ class SalesRoutingDatabaseReader:
         Retorna o histórico de execuções de roteirização (historico_subcluster_jobs)
         para o tenant informado.
         """
-        with get_connection_context() as conn:
+        with self._conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT 
@@ -195,7 +204,7 @@ class SalesRoutingDatabaseReader:
         """
         Busca uma execução de roteirização específica pelo routing_id.
         """
-        with get_connection_context() as conn:
+        with self._conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT 
@@ -220,7 +229,7 @@ class SalesRoutingDatabaseReader:
     # =========================================================
     def list_snapshots(self, tenant_id, uf=None, cidade=None):
         """Lista snapshots do tenant, com filtros opcionais por UF e cidade."""
-        with get_connection_context() as conn:
+        with self._conn() as conn:
             with conn.cursor() as cur:
                 query = """
                     SELECT id, nome, descricao, criado_em, tags, uf, cidade
@@ -258,7 +267,7 @@ class SalesRoutingDatabaseReader:
     # =========================================================
     def get_operational_routes(self, tenant_id: int, routing_id: str, uf: str = None, cidade: str = None):
         """Retorna as rotas operacionais filtradas por tenant_id e routing_id (UF/cidade opcionais)."""
-        with get_connection_context() as conn:
+        with self._conn() as conn:
             with conn.cursor() as cur:
                 sql = """
                     SELECT 
@@ -314,7 +323,7 @@ class SalesRoutingDatabaseReader:
     # =========================================================
     def get_cidades_por_uf(self, tenant_id: int, uf: str) -> list[str]:
         """Retorna lista única de cidades que possuem PDVs clusterizados na UF informada."""
-        with get_connection_context() as conn:
+        with self._conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT DISTINCT p.cidade
@@ -332,7 +341,7 @@ class SalesRoutingDatabaseReader:
         """
         Retorna o run associado exatamente ao clusterization_id informado.
         """
-        with get_connection_context() as conn:
+        with self._conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
                     SELECT id, uf, cidade, algo, k_final, params
