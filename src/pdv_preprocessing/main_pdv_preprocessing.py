@@ -65,6 +65,9 @@ def main():
     parser.add_argument("--arquivo", required=True)
     parser.add_argument("--descricao", required=True)
     parser.add_argument("--usar_google", action="store_true", default=True)
+    # schema de persistência: 'public' (Simulação) ou 'operacional'
+    # (Execução Operacional). Threadado para reader/writer.
+    parser.add_argument("--schema", default="public")
 
     args = parser.parse_args()
 
@@ -132,8 +135,8 @@ def main():
     # --------------------------------------------------------
     emit_progress(10, "Inicializando conexão com banco")
     try:
-        db_reader = DatabaseReader()
-        db_writer = DatabaseWriter()
+        db_reader = DatabaseReader(schema=args.schema)
+        db_writer = DatabaseWriter(schema=args.schema)
     except Exception as e:
         emit_final({
             "status": "error",
@@ -155,7 +158,8 @@ def main():
             tenant_id=tenant_id,
             input_id=input_id,
             descricao=descricao,
-            usar_google=args.usar_google
+            usar_google=args.usar_google,
+            schema=args.schema,
         )
 
         df_validos, df_invalidos, inseridos = use_case.execute(
@@ -223,9 +227,11 @@ def main():
         emit_final({
             "status": "error",
             "erro": str(e),
+            "arquivo": os.path.basename(input_path) if input_path else None,
             "tenant_id": tenant_id,
             "input_id": input_id,
-            "descricao": descricao
+            "descricao": descricao,
+            "mensagem": str(e),
         })
 
 

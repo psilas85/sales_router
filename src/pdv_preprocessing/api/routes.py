@@ -934,12 +934,16 @@ def filtrar_jobs(
     params = [tenant_id]
  
 
+    # criado_em é timestamptz (UTC). O filtro DE/ATÉ é escolhido pelo usuário
+    # no fuso local (America/Sao_Paulo) — converte criado_em p/ o fuso local
+    # antes de comparar. Sem isso, uploads do fim da tarde (após 21h BRT =
+    # 00h UTC do dia seguinte) caem no dia UTC seguinte e somem do filtro.
     if data_inicio_dt:
-        filtros.append("criado_em >= %s")
+        filtros.append("(criado_em AT TIME ZONE 'America/Sao_Paulo') >= %s")
         params.append(datetime.combine(data_inicio_dt, datetime.min.time()))
 
     if data_fim_dt:
-        filtros.append("criado_em < %s")
+        filtros.append("(criado_em AT TIME ZONE 'America/Sao_Paulo') < %s")
         params.append(datetime.combine(data_fim_dt + timedelta(days=1), datetime.min.time()))
 
 
@@ -1448,12 +1452,24 @@ def progresso_job(request: Request, job_id: str):
         # STATUS PADRONIZADO
         # -------------------------
         if job.is_finished:
-            payload = {
-                "job_id": job.id,
-                "status": "done",
-                "progress": 100,
-                "step": "Finalizado"
-            }
+            # O worker captura erros do processamento e RETORNA
+            # {status:"error",...} sem falhar o job RQ — então um job
+            # "finished" pode ter terminado em erro. Detecta pelo result.
+            resultado = job.result if isinstance(job.result, dict) else {}
+            if resultado.get("status") == "error":
+                payload = {
+                    "job_id": job.id,
+                    "status": "error",
+                    "progress": 100,
+                    "step": etapa,
+                }
+            else:
+                payload = {
+                    "job_id": job.id,
+                    "status": "done",
+                    "progress": 100,
+                    "step": "Finalizado",
+                }
             log_progress(payload["status"], payload["progress"], payload["step"])
             return payload
 

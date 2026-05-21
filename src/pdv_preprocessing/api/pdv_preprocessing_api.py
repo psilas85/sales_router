@@ -6,6 +6,7 @@
 
 from fastapi import FastAPI
 from .routes import router as pdv_router
+from .operacional_routes import router as operacional_router
 
 import uvicorn
 
@@ -30,6 +31,10 @@ app = FastAPI(
 # 🔀 Rotas principais
 # ==========================================================
 app.include_router(pdv_router, prefix="/pdv")
+
+# Pipeline da Execução Operacional (schema operacional.*) — endpoints
+# sob /pdv/operacional/*. Aditivo: não afeta as rotas da Simulação.
+app.include_router(operacional_router, prefix="/pdv")
 
 # ==========================================================
 # 🩺 Health check

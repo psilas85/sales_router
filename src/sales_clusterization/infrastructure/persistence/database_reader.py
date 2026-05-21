@@ -11,12 +11,21 @@ from src.sales_clusterization.domain.entities import PDV
 from loguru import logger
 
 
+_SCHEMAS_VALIDOS = ("public", "operacional")
+
+
 def carregar_pdvs(
     tenant_id: int,
     input_id: str,
     uf=None,  # str | List[str] | None
     cidade: Optional[str] = None,
+    schema: str = "public",
 ) -> List[PDV]:
+    # schema da pipeline: 'public' (Simulação) ou 'operacional' (Execução
+    # Operacional). Em operacional, a conexão roda com search_path
+    # operacional, public → `pdvs` resolve em operacional.pdvs.
+    if schema not in _SCHEMAS_VALIDOS:
+        raise ValueError(f"schema inválido: {schema!r}")
 
     base_query = """
         SELECT id, cnpj, bairro, cidade, uf, pdv_lat, pdv_lon
@@ -46,6 +55,9 @@ def carregar_pdvs(
     base_query += ";"
 
     with get_connection() as conn:
+        if schema != "public":
+            with conn.cursor() as _c:
+                _c.execute(f"SET search_path TO {schema}, public")
         with conn.cursor() as cur:
             cur.execute(base_query, tuple(params))
             rows = cur.fetchall()

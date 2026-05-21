@@ -83,9 +83,10 @@ def normalizar_uuid(valor: str | None) -> str | None:
 # 🚀 Função principal do worker
 # ============================================================
 
-def processar_pdv(tenant_id, file_path, descricao):
+def processar_pdv(tenant_id, file_path, descricao, schema="public"):
+    # schema: 'public' (Simulação) ou 'operacional' (Execução Operacional).
     job = get_current_job()
-    writer = DatabaseWriter()
+    writer = DatabaseWriter(schema=schema)
 
     # --------------------------------------------------------
     # Job ID seguro
@@ -102,6 +103,7 @@ def processar_pdv(tenant_id, file_path, descricao):
             "--tenant", str(tenant_id),
             "--arquivo", file_path,
             "--descricao", descricao,
+            "--schema", schema,
         ]
 
         # Progresso inicial
@@ -224,7 +226,17 @@ def processar_pdv(tenant_id, file_path, descricao):
                 )
 
         if job:
-            job.meta.update({"step": "Finalizado", "progress": 100})
+            if resumo.get("status") == "error":
+                job.meta.update({
+                    "step": (
+                        resumo.get("erro")
+                        or resumo.get("mensagem")
+                        or "Erro no processamento"
+                    ),
+                    "progress": 100,
+                })
+            else:
+                job.meta.update({"step": "Finalizado", "progress": 100})
             job.save_meta()
 
         return {

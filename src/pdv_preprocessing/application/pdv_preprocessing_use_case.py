@@ -91,15 +91,22 @@ def atualizar_progresso(atual, total, passo_min, passo_max, step):
 class PDVPreprocessingUseCase:
     STATUS_INPUT_GEOCODING_INVALIDO = "falha_input_geocoding"
 
-    def __init__(self, reader, writer, tenant_id, input_id=None, descricao=None, usar_google=True):
+    def __init__(self, reader, writer, tenant_id, input_id=None, descricao=None,
+                 usar_google=True, schema="public"):
         self.reader = reader
         self.writer = writer
         self.tenant_id = tenant_id
         self.input_id = input_id or str(uuid.uuid4())
         self.descricao = descricao or "PDV Importado"
         self.usar_google = usar_google
+        # Ambiente da pipeline: 'public' (Simulação) ou 'operacional'.
+        self.schema = schema
 
-        self.validator = PDVValidationService(db_reader=reader)
+        # Execução Operacional torna 'numero' obrigatório na validação.
+        self.validator = PDVValidationService(
+            db_reader=reader,
+            numero_obrigatorio=(schema == "operacional"),
+        )
         self.geo_client = GeocodingEngineClient()
         self.geo_service = None
 
@@ -670,8 +677,14 @@ class PDVPreprocessingUseCase:
                     return bairro[:-(len(cidade) + 1)].strip()
                 return bairro
 
-            # 'numero' é opcional — garante a coluna mesmo se ausente no arquivo
+            # 'numero' é opcional por padrão — garante a coluna mesmo se
+            # ausente. Na Execução Operacional a coluna é obrigatória:
+            # falha rápido com mensagem clara em vez de invalidar tudo.
             if "numero" not in df.columns:
+                if self.schema == "operacional":
+                    raise ValueError(
+                        "❌ Coluna 'numero' é obrigatória na Execução Operacional."
+                    )
                 df["numero"] = ""
 
             for i, row in df.iterrows():
@@ -721,6 +734,13 @@ class PDVPreprocessingUseCase:
                     base = f"{base}, {cep_fmt}"
 
                 return f"{base}, Brasil"
+
+            # Planilha sem linhas de dados (ex.: template em branco) —
+            # falha com mensagem clara em vez de quebrar no df.apply abaixo.
+            if df.empty:
+                raise ValueError(
+                    "Planilha sem registros — nenhum PDV encontrado no arquivo."
+                )
 
             df["pdv_endereco_completo"] = df.apply(montar_endereco, axis=1)
 

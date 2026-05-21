@@ -50,3 +50,8 @@ class Setor:
 
     # 🔹 Campo hierárquico (para subdivisão interna)
     subclusters: List[Dict[str, float]] = field(default_factory=list)
+
+    # 🔹 Setorização por consultor (Execução Operacional): o centro do
+    # setor é um consultor cadastrado. None no fluxo da Simulação (kmeans).
+    consultor_id: Optional[str] = None
+    consultor_nome: Optional[str] = None

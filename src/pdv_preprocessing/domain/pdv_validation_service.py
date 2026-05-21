@@ -14,14 +14,20 @@ class PDVValidationService:
     - Evita duplicados no CSV e no banco para o mesmo tenant.
     """
 
-    def __init__(self, db_reader=None):
+    def __init__(self, db_reader=None, numero_obrigatorio: bool = False):
         """
         Pode receber o DatabaseReader opcionalmente
         para verificar duplicidades no banco.
+
+        numero_obrigatorio: na Execução Operacional, 'numero' passa a ser
+        campo obrigatório (PDV sem número vira inválido). Na Simulação
+        (default False), 'numero' segue opcional.
         """
         self.db_reader = db_reader
+        self.numero_obrigatorio = numero_obrigatorio
 
-    # 'numero' é opcional: PDV sem número geocodifica no nível da rua.
+    # 'numero' é opcional por padrão: PDV sem número geocodifica no nível
+    # da rua. A Execução Operacional o torna obrigatório (numero_obrigatorio).
     CAMPOS_OBRIGATORIOS = ["cnpj", "logradouro", "cidade", "uf"]
 
     MOTIVOS_CAMPOS_OBRIGATORIOS = {
@@ -55,9 +61,11 @@ class PDVValidationService:
         cep = re.sub(r"[^0-9]", "", str(cep))
         return cep.zfill(8) if len(cep) in (5, 8) else None
 
-    def _motivo_campos_obrigatorios(self, row: pd.Series) -> str:
+    def _motivo_campos_obrigatorios(
+        self, row: pd.Series, campos: list[str]
+    ) -> str:
         missing_fields = [
-            field for field in self.CAMPOS_OBRIGATORIOS if pd.isna(row.get(field))
+            field for field in campos if pd.isna(row.get(field))
         ]
 
         if not missing_fields:
@@ -94,8 +102,11 @@ class PDVValidationService:
 
         # ------------------------------------------------------------------
         # CAMPOS REALMENTE OBRIGATÓRIOS
+        # 'numero' entra na lista só quando numero_obrigatorio (Operacional).
         # ------------------------------------------------------------------
-        campos_obrigatorios = self.CAMPOS_OBRIGATORIOS
+        campos_obrigatorios = list(self.CAMPOS_OBRIGATORIOS)
+        if self.numero_obrigatorio and "numero" not in campos_obrigatorios:
+            campos_obrigatorios.append("numero")
 
         # Normaliza strings vazias
         df[campos_obrigatorios] = df[campos_obrigatorios].replace("", np.nan)
@@ -114,7 +125,9 @@ class PDVValidationService:
 
         if not registros_invalidos.empty:
             registros_invalidos["motivo_invalidade"] = registros_invalidos.apply(
-                self._motivo_campos_obrigatorios,
+                lambda row: self._motivo_campos_obrigatorios(
+                    row, campos_obrigatorios
+                ),
                 axis=1,
             )
             logger.warning(

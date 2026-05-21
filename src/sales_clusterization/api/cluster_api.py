@@ -8,6 +8,9 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sales_clusterization.api.routes import router as cluster_router
+from sales_clusterization.api.operacional_routes import (
+    router as operacional_router,
+)
 import numpy as np
 import json
 import uvicorn
@@ -82,6 +85,14 @@ app.include_router(
     cluster_router,
     prefix="/cluster",
     tags=["Clusterização"]
+)
+
+# Setorização da Execução Operacional — endpoints sob /cluster/operacional/*.
+# Aditivo: não afeta as rotas da Simulação.
+app.include_router(
+    operacional_router,
+    prefix="/cluster",
+    tags=["Operacional"]
 )
 
 # ============================================================
